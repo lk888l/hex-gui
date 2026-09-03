@@ -6,8 +6,13 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: {
-    port: 1420,
+    port: 5370,
     strictPort: true,
+    watch: {
+      ignored: [
+        "**/src-tauri/target/**",
+      ],
+    },
   },
   build: {
     target: "es2021",
