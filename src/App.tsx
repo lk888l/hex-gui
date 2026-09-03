@@ -25,8 +25,12 @@ import { DfuPanel } from "./components/DfuPanel";
 import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
+import { PpAccuracyPanel } from "./components/PpAccuracyPanel";
+import { AllMotorPositionsPanel } from "./components/AllMotorPositionsPanel";
+import { SixMotorPpTestPanel } from "./components/SixMotorPpTestPanel";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
 import { canDfuApi, hpmDfuApi } from "./dfuApi";
+import { SIX_MOTOR_PP_IDS } from "./sixMotorPpTest";
 import type { MotorInfo } from "./types";
 import "./App.css";
 
@@ -48,7 +52,10 @@ type Tool =
   | "calibrationUpdate"
   | "console"
   | "damiao"
-  | "rollercanControl";
+  | "rollercanControl"
+  | "ppAccuracy"
+  | "sixMotorPpTest"
+  | "allMotorPositions";
 
 const DEVICE_POLL_MS = 700;
 
@@ -73,6 +80,11 @@ export default function App() {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [calibrationUpdateBusy, setCalibrationUpdateBusy] = useState(false);
+  const [ppAccuracyBusy, setPpAccuracyBusy] = useState(false);
+  const [ppAccuracyRunning, setPpAccuracyRunning] = useState(false);
+  const [sixMotorPpBusy, setSixMotorPpBusy] = useState(false);
+  const [sixMotorPpRunning, setSixMotorPpRunning] = useState(false);
+  const [allMotorPositionsBusy, setAllMotorPositionsBusy] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -120,7 +132,7 @@ export default function App() {
   // sidebar. Device Settings still applies exact identity/config gates.
   useEffect(() => {
     if (
-      (tool === "control" || tool === "settings") &&
+      (tool === "control" || tool === "settings" || tool === "ppAccuracy") &&
       selectedNid == null &&
       devices.length > 0
     ) {
@@ -153,10 +165,38 @@ export default function App() {
       message.warning(t("settingsBusyLeave"));
       return;
     }
+    if (tool === "ppAccuracy" && ppAccuracyBusy) {
+      message.warning(t("ppAccuracyBusyLeave"));
+      return;
+    }
+    if (tool === "sixMotorPpTest" && sixMotorPpBusy) {
+      message.warning(t("sixMotorPpBusyLeave"));
+      return;
+    }
+    if (tool === "allMotorPositions" && allMotorPositionsBusy) {
+      message.warning(t("allMotorPositionsBusyLeave"));
+      return;
+    }
     if (tool === "smartknob") {
       await api.smartknobStop().catch(() => {});
     }
     try {
+      if (tool === "ppAccuracy" && ppAccuracyRunning && selectedNid != null) {
+        await api.meowDisable(selectedNid);
+        setPpAccuracyRunning(false);
+      }
+      if (tool === "sixMotorPpTest" && sixMotorPpRunning) {
+        const results = await Promise.allSettled(
+          SIX_MOTOR_PP_IDS.map((nid) => api.meowDisable(nid)),
+        );
+        const failures = results.flatMap((result, index) =>
+          result.status === "rejected"
+            ? [`ID ${SIX_MOTOR_PP_IDS[index]}: ${errMsg(result.reason)}`]
+            : [],
+        );
+        if (failures.length > 0) throw new Error(failures.join("; "));
+        setSixMotorPpRunning(false);
+      }
       if (tool === "dfu") {
         await Promise.all([hpmDfuApi.leave(), canDfuApi.leave()]);
       } else {
@@ -172,7 +212,7 @@ export default function App() {
     setDevices([]);
     setTutorialOpen(false);
     setTool(null);
-  }, [calibrationBusy, calibrationUpdateBusy, dfuBusy, message, settingsBusy, t, tool]);
+  }, [allMotorPositionsBusy, calibrationBusy, calibrationUpdateBusy, dfuBusy, message, ppAccuracyBusy, ppAccuracyRunning, selectedNid, settingsBusy, sixMotorPpBusy, sixMotorPpRunning, t, tool]);
 
   const onToggleLog = useCallback(
     async (nid: number, on: boolean, meowMotor = false) => {
@@ -227,12 +267,21 @@ export default function App() {
     console: { title: t("toolConsole"), desc: t("toolConsoleDesc") },
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
+    ppAccuracy: { title: t("toolPpAccuracy"), desc: t("toolPpAccuracyDesc") },
+    sixMotorPpTest: { title: t("toolSixMotorPp"), desc: t("toolSixMotorPpDesc") },
+    allMotorPositions: {
+      title: t("toolAllMotorPositions"),
+      desc: t("toolAllMotorPositionsDesc"),
+    },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
   const needsHeartbeat =
     tool === "control" ||
     tool === "hopea3" ||
-    tool === "smartknob";
+    tool === "smartknob" ||
+    tool === "ppAccuracy" ||
+    tool === "sixMotorPpTest" ||
+    tool === "allMotorPositions";
   // hopea3 / smartknob / zenoh / arm / canalyzer 都是整屏面板;zenoh/arm 走 Zenoh,
   // canalyzer 自带总线连接,都不使用顶栏的电机 ConnectBar。
   const showSidebar =
@@ -251,7 +300,9 @@ export default function App() {
     tool !== "torqueCalibration" &&
     tool !== "calibrationUpdate" &&
     tool !== "damiao" &&
-    tool !== "rollercanControl";
+    tool !== "rollercanControl" &&
+    tool !== "sixMotorPpTest" &&
+    tool !== "allMotorPositions";
   const showConnectBar =
     tool !== "console" &&
     tool !== "zenoh" &&
@@ -273,6 +324,9 @@ export default function App() {
               (tool === "settings" && settingsBusy) ||
               ((tool === "calibration" || tool === "torqueCalibration") && calibrationBusy)
               || (tool === "calibrationUpdate" && calibrationUpdateBusy)
+              || (tool === "ppAccuracy" && ppAccuracyBusy)
+              || (tool === "sixMotorPpTest" && sixMotorPpBusy)
+              || (tool === "allMotorPositions" && allMotorPositionsBusy)
             }
             onClick={switchTool}
           >
@@ -306,6 +360,9 @@ export default function App() {
                 (tool === "settings" && settingsBusy) ||
                 ((tool === "calibration" || tool === "torqueCalibration") && calibrationBusy)
                 || (tool === "calibrationUpdate" && calibrationUpdateBusy)
+                || (tool === "ppAccuracy" && (ppAccuracyBusy || ppAccuracyRunning))
+                || (tool === "sixMotorPpTest" && (sixMotorPpBusy || sixMotorPpRunning))
+                || (tool === "allMotorPositions" && allMotorPositionsBusy)
               }
             />
           </section>
@@ -319,8 +376,11 @@ export default function App() {
               selectedNid={selectedNid}
               onSelect={setSelectedNid}
               connected={connected}
-              tool={tool as "control" | "settings"}
-              disabled={tool === "settings" && settingsBusy}
+              tool={tool as "control" | "settings" | "ppAccuracy"}
+              disabled={
+                (tool === "settings" && settingsBusy) ||
+                (tool === "ppAccuracy" && (ppAccuracyBusy || ppAccuracyRunning))
+              }
             />
           </Layout.Sider>
         )}
@@ -369,6 +429,38 @@ export default function App() {
               devices={devices}
               onBusyChange={setCalibrationUpdateBusy}
             />
+          ) : tool === "allMotorPositions" ? (
+            <AllMotorPositionsPanel
+              connected={connected}
+              devices={devices}
+              onBusyChange={setAllMotorPositionsBusy}
+            />
+          ) : tool === "sixMotorPpTest" ? (
+            <SixMotorPpTestPanel
+              connected={connected}
+              devices={devices}
+              onBusyChange={setSixMotorPpBusy}
+              onRunningChange={setSixMotorPpRunning}
+            />
+          ) : tool === "ppAccuracy" ? (
+            selected == null ? (
+              <div style={{ paddingTop: 80 }}>
+                <Empty description={connected ? t("selectMotor") : t("connectFirst")} />
+              </div>
+            ) : selected.device_type !== "meow_motor" ? (
+              <Alert type="warning" showIcon message={t("ppAccuracyLatestFirmwareOnly")} />
+            ) : (
+              <PpAccuracyPanel
+                key={selected.node_id}
+                info={selected}
+                connected={connected}
+                logging={logging[selected.node_id] != null}
+                logPath={logging[selected.node_id] ?? null}
+                onToggleLog={(on) => onToggleLog(selected.node_id, on, true)}
+                onBusyChange={setPpAccuracyBusy}
+                onRunningChange={setPpAccuracyRunning}
+              />
+            )
           ) : tool === "settings" ? (
             selected?.device_type === "meow_motor" ? (
               <MeowMotorPanel
@@ -638,6 +730,27 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                     tag={t("tagRollerCanProtocol")}
                     accent="blue"
                     onClick={() => onPick("rollercanControl")}
+                  />
+                  <ToolCard
+                    title={t("toolPpAccuracy")}
+                    desc={t("toolPpAccuracyDesc")}
+                    tag={t("tagPpAccuracy")}
+                    accent="green"
+                    onClick={() => onPick("ppAccuracy")}
+                  />
+                  <ToolCard
+                    title={t("toolSixMotorPp")}
+                    desc={t("toolSixMotorPpDesc")}
+                    tag={t("tagSixMotorPp")}
+                    accent="purple"
+                    onClick={() => onPick("sixMotorPpTest")}
+                  />
+                  <ToolCard
+                    title={t("toolAllMotorPositions")}
+                    desc={t("toolAllMotorPositionsDesc")}
+                    tag={t("tagAllMotorPositions")}
+                    accent="cyan"
+                    onClick={() => onPick("allMotorPositions")}
                   />
                 </div>
               ),

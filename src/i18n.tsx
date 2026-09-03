@@ -423,8 +423,8 @@ const STRINGS = {
   },
   catDamiao: { en: "Other motors", zh: "其他电机" },
   catDamiaoHint: {
-    en: "Expand to choose a vendor-specific motor workspace",
-    zh: "展开后选择厂商专用电机工作区",
+    en: "Expand to choose a specialized motor workspace or batch tool",
+    zh: "展开后选择专用电机工作区或批量工具",
   },
   tagDamiaoProtocol: { en: "DAMIAO CAN 1 Mbps", zh: "达妙 CAN 1 Mbps" },
   toolRollerCanControl: { en: "Unit RollerCAN Motor Control", zh: "Unit RollerCAN 电机控制" },
@@ -433,6 +433,65 @@ const STRINGS = {
     zh: "通过扩展 CAN 帧控制原厂固件的速度、位置、电流与编码器模式。",
   },
   tagRollerCanProtocol: { en: "RollerCAN 29-bit · 1 Mbps", zh: "RollerCAN 29 位 · 1 Mbps" },
+  toolPpAccuracy: { en: "PP Position Accuracy Test", zh: "PP 位置精度测试" },
+  toolPpAccuracyDesc: {
+    en: "Run the latest-firmware motor between two PP targets and measure endpoint encoder error.",
+    zh: "让最新固件电机在两个 PP 目标间往返，并测量端点编码器误差。",
+  },
+  tagPpAccuracy: { en: "PP round trip", zh: "PP 往返" },
+  ppAccuracyLatestFirmwareOnly: {
+    en: "This test accepts latest-firmware Meow Motors only. Select a Meow Motor from the left.",
+    zh: "此测试只支持最新固件的 Meow Motor，请在左侧选择对应电机。",
+  },
+  ppAccuracyBusyLeave: {
+    en: "Wait for the current PP command to finish, then stop or leave the test.",
+    zh: "请等待当前 PP 指令完成，再停止或离开测试。",
+  },
+  toolSixMotorPp: { en: "Six-Motor PP Sequence Test", zh: "六电机 PP 序列测试" },
+  toolSixMotorPpDesc: {
+    en: "Run Meow Motor IDs 1–6 through four PP waypoints and compare all expected and encoder positions.",
+    zh: "让 ID 1–6 的 Meow Motor 循环运行四组 PP 位置，并对比全部预期位置与编码器位置。",
+  },
+  tagSixMotorPp: { en: "6 axes · PP · encoder", zh: "6 轴 · PP · 编码器" },
+  sixMotorPpBusyLeave: {
+    en: "Wait for the current six-motor PP command to finish, then stop or leave the test.",
+    zh: "请等待当前六电机 PP 指令完成，再停止或离开测试。",
+  },
+  toolAllMotorPositions: {
+    en: "All Motor Encoder Positions",
+    zh: "全部电机编码器位置",
+  },
+  toolAllMotorPositionsDesc: {
+    en: "Initialize every discovered CANopen motor in one click and show each encoder position.",
+    zh: "一键初始化所有已发现的 CANopen 电机，并分别显示每台电机的编码器位置。",
+  },
+  tagAllMotorPositions: { en: "Batch init · encoder", zh: "批量初始化 · 编码器" },
+  allMotorPositionsBusyLeave: {
+    en: "Wait for all motor initialization to finish before leaving this tool.",
+    zh: "请等待所有电机初始化完成后再离开此工具。",
+  },
+  allMotorPositionsHint: {
+    en: "Batch initialization and encoder monitor",
+    zh: "批量初始化与编码器监视",
+  },
+  allMotorPositionsHintDetail: {
+    en: "Init all initializes discovered CiA 402 and Meow motors in sequence, then refreshes every encoder position at 4 Hz.",
+    zh: "“全部初始化”会依次初始化发现到的 CiA 402 与 Meow 电机，随后以 4 Hz 刷新每台电机的编码器位置。",
+  },
+  allMotorPositionsNoMotors: {
+    en: "No supported CANopen motors discovered",
+    zh: "尚未发现支持的 CANopen 电机",
+  },
+  allMotorPositionsMotor: { en: "Motor", zh: "电机" },
+  allMotorPositionsProtocol: { en: "Protocol", zh: "协议" },
+  allMotorPositionsInitStatus: { en: "Initialization", zh: "初始化状态" },
+  allMotorPositionsNotRun: { en: "Not initialized", zh: "未初始化" },
+  allMotorPositionsInitializing: { en: "Initializing", zh: "初始化中" },
+  allMotorPositionsInitialized: { en: "Initialized", zh: "已初始化" },
+  allMotorPositionsInitError: { en: "Failed", zh: "失败" },
+  allMotorPositionsEncoder: { en: "Encoder position", zh: "编码器位置" },
+  allMotorPositionsReadError: { en: "Read failed", zh: "读取失败" },
+  allMotorPositionsWaiting: { en: "Waiting for TPDO…", zh: "等待 TPDO…" },
 
   // Tool selector
   toolControl: { en: "Motor Control", zh: "电机控制" },

@@ -19,7 +19,7 @@ export function Sidebar({
   selectedNid: number | null;
   onSelect: (nid: number) => void;
   connected: boolean;
-  tool: "control" | "settings";
+  tool: "control" | "settings" | "ppAccuracy";
   disabled?: boolean;
 }) {
   const { message } = App.useApp();
@@ -51,7 +51,7 @@ export function Sidebar({
           <Typography.Text strong>
             {t("devices")} ({devices.length})
           </Typography.Text>
-          {tool === "control" ? (
+          {tool !== "settings" ? (
             <Button
               size="small"
               disabled={

@@ -382,6 +382,75 @@ export const TUTORIALS: Record<string, Slide[]> = {
   calibration: CALIBRATION_SLIDES,
   torqueCalibration: TORQUE_CALIBRATION_SLIDES,
   calibrationUpdate: placeholderSlides("calibrationUpdate"),
+  ppAccuracy: [
+    {
+      title: { en: "1 · Connect and select", zh: "1 · 连接并选择" },
+      body: {
+        en: "Connect the production CAN-FD link and select one latest-firmware Meow Motor. Clear the mechanical envelope and keep physical power removal ready.",
+        zh: "连接生产 CAN-FD 链路并选择一台最新固件的 Meow Motor。清空机械运动范围，并保持可随时物理断电。",
+      },
+    },
+    {
+      title: { en: "2 · Configure the PP test", zh: "2 · 配置 PP 测试" },
+      body: {
+        en: "Set endpoints A/B, command interval, TPDO period, max torque, profile velocity, acceleration and deceleration. Start applies every parameter before activating PP at A.",
+        zh: "设置 A/B 端点、指令间隔、TPDO 周期、最大力矩、规划速度、加速度和减速度。启动会先应用全部参数，再在 A 点激活 PP。",
+      },
+    },
+    {
+      title: { en: "3 · Read encoder accuracy", zh: "3 · 查看编码器精度" },
+      body: {
+        en: "The large readout is raw Q8.24 encoder position. Immediately before each target switch, the app records encoder minus target and updates last, mean-absolute and maximum-absolute endpoint errors. Stop always requests Disabled.",
+        zh: "大号读数是原始 Q8.24 编码器位置。每次切换目标前，窗口记录“编码器－目标”，并更新末次、平均绝对和最大绝对端点误差。停止时会请求电机失能。",
+      },
+    },
+  ],
+  sixMotorPpTest: [
+    {
+      title: { en: "1 · Connect all six motors", zh: "1 · 连接六台电机" },
+      body: {
+        en: "Connect the CAN-FD bus and wait until latest-firmware Meow Motor IDs 1 through 6 are all online. Clear the full six-axis mechanical envelope and keep physical power removal ready.",
+        zh: "连接 CAN-FD 总线，等待最新固件 Meow Motor 的 ID 1–6 全部在线。清空六轴的完整机械运动范围，并保持可随时物理断电。",
+      },
+    },
+    {
+      title: { en: "2 · Verify the four waypoints", zh: "2 · 核对四组位置" },
+      body: {
+        en: "Confirm every ID column in Initial and Positions 1–3. Defaults use a 10 ms TPDO period (100 Hz) and a 2500 ms command interval. Start initializes all six motors, applies the PP limits, and activates Initial.",
+        zh: "逐列核对初始位置及位置 1–3。默认 TPDO 周期为 10 ms（100 Hz），位置切换间隔为 2500 ms。启动会初始化六台电机、应用 PP 参数并激活初始位置。",
+      },
+    },
+    {
+      title: { en: "3 · Compare expected and encoder positions", zh: "3 · 对比预期与编码器位置" },
+      body: {
+        en: "The six-row encoder table highlights every expected position, actual encoder position, and signed error. The four waypoints repeat continuously; stale or unhealthy feedback stops and disables all six motors.",
+        zh: "六行编码器列表重点显示每台电机的预期位置、实际编码器位置和有符号误差。四组位置持续循环；任一反馈陈旧或状态异常都会停止并失能全部六台电机。",
+      },
+    },
+  ],
+  allMotorPositions: [
+    {
+      title: { en: "1 · Connect and discover", zh: "1 · 连接并发现电机" },
+      body: {
+        en: "Connect the CAN bus and wait for every supported CiA 402 or Meow motor to appear in the table.",
+        zh: "连接 CAN 总线，等待所有受支持的 CiA 402 或 Meow 电机出现在表格中。",
+      },
+    },
+    {
+      title: { en: "2 · Initialize all", zh: "2 · 全部初始化" },
+      body: {
+        en: "Press Init all once. Motors are initialized one by one, and a separate success or failure result is retained for each node.",
+        zh: "点击一次“全部初始化”。电机会逐台初始化，并为每个节点分别保留成功或失败结果。",
+      },
+    },
+    {
+      title: { en: "3 · Read encoder positions", zh: "3 · 查看编码器位置" },
+      body: {
+        en: "After initialization, the final column continuously shows each motor's encoder position in revolutions. Hover a failed status to see its error detail.",
+        zh: "初始化结束后，最后一列会持续显示每台电机以转为单位的编码器位置；将鼠标移到失败状态上可查看错误详情。",
+      },
+    },
+  ],
   damiao: [
     {
       title: { en: "1 · Discover and select a motor", zh: "1 · 自动发现并选择电机" },

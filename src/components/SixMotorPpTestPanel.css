@@ -1,0 +1,26 @@
+.six-motor-pp {
+  width: 100%;
+}
+
+.six-motor-pp__expected,
+.six-motor-pp__encoder {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.six-motor-pp__expected {
+  color: #f4bb56 !important;
+  font-size: 16px;
+  font-weight: 750;
+}
+
+.six-motor-pp__encoder {
+  color: #78e3a2 !important;
+  font-size: 20px;
+  font-weight: 850;
+  text-shadow: 0 0 18px rgba(98, 209, 143, 0.22);
+}
+
+.six-motor-pp__waypoint--active > td {
+  background: rgba(231, 91, 43, 0.09) !important;
+}
