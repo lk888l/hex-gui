@@ -28,6 +28,8 @@ mod motor_factory_backup;
 mod rollercan;
 mod rollercan_control;
 mod sdo_client;
+mod six_motor_mit;
+mod six_motor_pp;
 mod smartknob;
 mod state;
 mod stm32_can_dfu;
@@ -320,6 +322,13 @@ pub fn run() {
             commands::hopea3_reinit_motor,
             commands::hopea3_reset_odom,
             commands::hopea3_get_state,
+            commands::six_motor_mit_start,
+            commands::six_motor_mit_update,
+            commands::six_motor_mit_get_state,
+            commands::six_motor_mit_stop,
+            commands::six_motor_pp_start,
+            commands::six_motor_pp_get_state,
+            commands::six_motor_pp_stop,
             commands::lift_start,
             commands::lift_stop,
             commands::lift_get_state,

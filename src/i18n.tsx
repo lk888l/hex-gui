@@ -447,15 +447,25 @@ const STRINGS = {
     en: "Wait for the current PP command to finish, then stop or leave the test.",
     zh: "请等待当前 PP 指令完成，再停止或离开测试。",
   },
-  toolSixMotorPp: { en: "Six-Motor PP Sequence Test", zh: "六电机 PP 序列测试" },
-  toolSixMotorPpDesc: {
-    en: "Run Meow Motor IDs 1–6 through four PP waypoints and compare all expected and encoder positions.",
-    zh: "让 ID 1–6 的 Meow Motor 循环运行四组 PP 位置，并对比全部预期位置与编码器位置。",
+  toolSixMotorMit: { en: "Six-Motor MIT Repeatability Test", zh: "六电机 MIT 往返精度测试" },
+  toolSixMotorMitDesc: {
+    en: "Stream uncompressed MIT at 500 Hz and move IDs 1–6 to each waypoint one motor at a time.",
+    zh: "以 500 Hz 发送非压缩 MIT，并让 ID 1–6 逐台到达各组位置。",
   },
-  tagSixMotorPp: { en: "6 axes · PP · encoder", zh: "6 轴 · PP · 编码器" },
+  tagSixMotorMit: { en: "6 axes · MIT · gravity", zh: "6 轴 · MIT · 重力补偿" },
+  sixMotorMitBusyLeave: {
+    en: "Wait for the current MIT start/update/stop transaction to finish, then leave the test.",
+    zh: "请等待当前 MIT 启动、更新或停止事务完成，再离开测试。",
+  },
+  toolSixMotorPp: { en: "Six-Motor PP Repeatability Test", zh: "六电机 PP 往返精度测试" },
+  toolSixMotorPpDesc: {
+    en: "Run the four PP waypoints with strict motor 1→6 measured-arrival sequencing.",
+    zh: "使用 PP 位置模式执行四组位置，并严格按 1→6 实测到位后逐台运行。",
+  },
+  tagSixMotorPp: { en: "6 axes · PP · sequential", zh: "6 轴 · PP · 逐台运动" },
   sixMotorPpBusyLeave: {
-    en: "Wait for the current six-motor PP command to finish, then stop or leave the test.",
-    zh: "请等待当前六电机 PP 指令完成，再停止或离开测试。",
+    en: "Wait for the current PP start/stop transaction to finish, then leave the test.",
+    zh: "请等待当前 PP 启动或停止事务完成，再离开测试。",
   },
   toolAllMotorPositions: {
     en: "All Motor Encoder Positions",

@@ -22,6 +22,12 @@ import type {
   RollerCanControlState,
   RollerCanControlTarget,
 } from "./types";
+import type {
+  SixMotorMitRequest,
+  SixMotorMitView,
+  SixMotorPpRequest,
+  SixMotorPpView,
+} from "./types";
 
 export const api = {
   connect: (iface: string, dataBitrate: number, ourNid: number, broadcastHeartbeat: boolean) =>
@@ -192,6 +198,21 @@ export const api = {
   hopea3ReinitMotor: (nid: number) => invoke<void>("hopea3_reinit_motor", { nid }),
   hopea3ResetOdom: () => invoke<void>("hopea3_reset_odom"),
   hopea3GetState: () => invoke<Hopea3State>("hopea3_get_state"),
+
+  // Six-axis arm repeatability test: canonical uncompressed MIT at 500 Hz.
+  sixMotorMitStart: (request: SixMotorMitRequest) =>
+    invoke<SixMotorMitView>("six_motor_mit_start", { request }),
+  sixMotorMitUpdate: (request: SixMotorMitRequest) =>
+    invoke<SixMotorMitView>("six_motor_mit_update", { request }),
+  sixMotorMitGetState: () =>
+    invoke<SixMotorMitView>("six_motor_mit_get_state"),
+  sixMotorMitStop: () => invoke<void>("six_motor_mit_stop"),
+
+  // Six-axis arm repeatability test: firmware Profile Position, one axis at a time.
+  sixMotorPpStart: (request: SixMotorPpRequest) =>
+    invoke<SixMotorPpView>("six_motor_pp_start", { request }),
+  sixMotorPpGetState: () => invoke<SixMotorPpView>("six_motor_pp_get_state"),
+  sixMotorPpStop: () => invoke<void>("six_motor_pp_stop"),
 
   // Lift raw-CAN Robot Application
   liftStart: (nid: number) => invoke<LiftState>("lift_start", { nid }),

@@ -122,6 +122,15 @@ pub struct AppState {
     /// Live init progress for the UI to poll while `hopea3_start` runs. A `std`
     /// mutex: only short, await-free updates happen under it.
     pub hopea3_init: StdMutex<InitProgress>,
+    /// Fixed arm repeatability test for motor IDs 1..=6. The Rust-owned task
+    /// streams shared uncompressed-MIT Pdes/Vdes and gravity-Tff RPDOs at
+    /// 500 Hz and advances axes only after measured arrival. Retained until
+    /// safe disable succeeds.
+    pub six_motor_mit: Mutex<Option<Arc<crate::six_motor_mit::SixMotorMit>>>,
+    /// Sequential Profile Position repeatability test for motor IDs 1..=6.
+    /// All axes hold, but only one axis receives a changing target at a time.
+    /// Retained until confirmed disable succeeds.
+    pub six_motor_pp: Mutex<Option<Arc<crate::six_motor_pp::SixMotorPp>>>,
     /// Direct-CANopen lift debug session. It owns heartbeat/TPDO subscriptions
     /// and the velocity watchdog stream for exactly one lift node.
     pub lift: Mutex<Option<Arc<LiftSession>>>,

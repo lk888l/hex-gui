@@ -405,7 +405,7 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
-  sixMotorPpTest: [
+  sixMotorMitTest: [
     {
       title: { en: "1 · Connect all six motors", zh: "1 · 连接六台电机" },
       body: {
@@ -414,17 +414,40 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
     {
-      title: { en: "2 · Verify the four waypoints", zh: "2 · 核对四组位置" },
+      title: { en: "2 · Verify MIT parameters", zh: "2 · 核对 MIT 参数" },
       body: {
-        en: "Confirm every ID column in Initial and Positions 1–3. Defaults use a 10 ms TPDO period (100 Hz) and a 2500 ms command interval. Start initializes all six motors, applies the PP limits, and activates Initial.",
-        zh: "逐列核对初始位置及位置 1–3。默认 TPDO 周期为 10 ms（100 Hz），位置切换间隔为 2500 ms。启动会初始化六台电机、应用 PP 参数并激活初始位置。",
+        en: "Put the unpowered arm at q = [0, -1.570, 3.140, 0, 0, 0] rad, capture the six park encoders, then verify each encoder direction at a low gravity scale and clamp. Confirm the URDF G(q) mapping, payload mass/COM, constant Tff, Kp, Kd and torque limits. The backend forces uncompressed 0x4102 and streams Pdes/Vdes plus coupled gravity Tff in two 500 Hz shared RPDO frames; gains and limits use verified SDO transactions.",
+        zh: "先将断电机械臂摆到 q = [0, -1.570, 3.140, 0, 0, 0] rad 并捕获六轴基准编码器，再用较低重力比例和夹紧值逐轴确认编码器方向。核对 URDF G(q) 映射、末端负载质量/质心、固定 Tff、Kp、Kd 与力矩限幅。后端强制使用非压缩 0x4102，并用两帧 500 Hz 共享 RPDO 发送 Pdes/Vdes 与耦合重力 Tff；增益和限幅通过带回读校验的 SDO 写入。",
       },
     },
     {
-      title: { en: "3 · Compare expected and encoder positions", zh: "3 · 对比预期与编码器位置" },
+      title: { en: "3 · Observe sequential arrival", zh: "3 · 观察逐台到位" },
       body: {
-        en: "The six-row encoder table highlights every expected position, actual encoder position, and signed error. The four waypoints repeat continuously; stale or unhealthy feedback stops and disables all six motors.",
-        zh: "六行编码器列表重点显示每台电机的预期位置、实际编码器位置和有符号误差。四组位置持续循环；任一反馈陈旧或状态异常都会停止并失能全部六台电机。",
+        en: "Motor 1 moves first. Only after its measured position and velocity remain inside the arrival window does motor 2 start, continuing through motor 6 before the next waypoint. Stale feedback, a fault or a per-axis timeout stops and disables all axes.",
+        zh: "1 号电机先运动；其实际位置与速度在到位窗口内持续稳定后，才启动 2 号，并依次执行到 6 号后进入下一轨迹点。反馈陈旧、故障或单轴超时都会停止并失能全部电机。",
+      },
+    },
+  ],
+  sixMotorPpTest: [
+    {
+      title: { en: "1 · Connect all six motors", zh: "1 · 连接六台电机" },
+      body: {
+        en: "Connect the CAN-FD bus and wait until latest-firmware Meow Motor IDs 1 through 6 are online. Clear the complete arm envelope and keep physical power removal ready.",
+        zh: "连接 CAN-FD 总线，等待最新固件 Meow Motor 的 ID 1–6 全部在线。清空机械臂完整运动范围，并保持可随时物理断电。",
+      },
+    },
+    {
+      title: { en: "2 · Set PP motion and arrival", zh: "2 · 设置 PP 运动与到位条件" },
+      body: {
+        en: "Review the four waypoints retained from the latest repository commit. Set profile velocity/acceleration, torque limit, position and velocity tolerances, settle time, per-axis timeout and waypoint dwell before starting.",
+        zh: "核对从仓库最新提交保留的四组位置；启动前设置规划速度/加速度、力矩限幅、位置与速度容差、稳定时间、单轴超时和轨迹点停留。",
+      },
+    },
+    {
+      title: { en: "3 · Observe strict 1→6 sequencing", zh: "3 · 观察严格 1→6 顺序" },
+      body: {
+        en: "Startup first enables each axis at its live encoder position. Only motor 1 is then given a moving PP target; motor 2 is commanded after motor 1 settles, continuing through motor 6. Any stale feedback, fault or timeout disables all axes.",
+        zh: "启动时先让每个轴在其实时编码器位置进入 PP 保持；随后只给 1 号下发运动目标，1 号稳定到位后才给 2 号下发，依次到 6 号。反馈陈旧、故障或超时都会失能全部轴。",
       },
     },
   ],

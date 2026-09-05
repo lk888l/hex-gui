@@ -21,6 +21,7 @@
   text-shadow: 0 0 18px rgba(98, 209, 143, 0.22);
 }
 
+.six-motor-pp__motor--active > td,
 .six-motor-pp__waypoint--active > td {
   background: rgba(231, 91, 43, 0.09) !important;
 }

@@ -666,6 +666,130 @@ export interface Hopea3State {
   running: boolean;
 }
 
+// ── Six-axis arm repeatability test (canonical uncompressed MIT 0x4102) ──
+export interface SixMotorMitTuning {
+  tff_nm: number;
+  gravity_direction: number;
+  gravity_park_position_rev: number;
+  gravity_park_angle_rad: number;
+  gravity_scale: number;
+  gravity_max_torque_nm: number;
+  kp_nm_per_rad: number;
+  kd_nm_s_per_rad: number;
+  kp_kd_limit_permille: number;
+  max_torque_permille: number;
+}
+
+export interface SixMotorMitRequest {
+  waypoints: number[][];
+  gravity_enabled: boolean;
+  capture_gravity_park_on_start: boolean;
+  gravity_vector_m_per_s2: [number, number, number];
+  tff_slew_rate_nm_per_s: number;
+  payload_mass_kg: number;
+  payload_center_of_mass_m: [number, number, number];
+  max_velocity_rev_per_s: number;
+  acceleration_rev_per_s2: number;
+  deceleration_rev_per_s2: number;
+  arrival_position_tolerance_rev: number;
+  arrival_velocity_tolerance_rev_per_s: number;
+  settle_time_ms: number;
+  movement_timeout_ms: number;
+  waypoint_dwell_ms: number;
+  tuning: SixMotorMitTuning[];
+}
+
+export interface SixMotorMitMotorView extends SixMotorMitTuning {
+  node_id: number;
+  online: boolean;
+  enabled: boolean;
+  active: boolean;
+  sequence_state: string;
+  target_position_rev: number;
+  command_position_rev: number;
+  command_velocity_rev_per_s: number;
+  actual_position_rev: number | null;
+  actual_velocity_rev_per_s: number | null;
+  position_error_rev: number | null;
+  joint_position_rad: number;
+  model_gravity_torque_nm: number;
+  gravity_target_torque_nm: number;
+  gravity_limited: boolean;
+  gravity_torque_nm: number;
+  command_tff_nm: number;
+  wire_tff_nm: number;
+  tff_limit_nm: number;
+  tff_utilization_percent: number;
+  tff_limited: boolean;
+  peak_torque_nm: number;
+  recommended_min_torque_permille: number;
+  kp_raw: number;
+  kd_raw: number;
+  kp_kd_factor: number;
+  feedback_age_ms: number | null;
+  error: string | null;
+}
+
+export interface SixMotorMitView {
+  running: boolean;
+  phase: string;
+  gravity_model: string;
+  gravity_enabled: boolean;
+  active_waypoint_index: number;
+  active_motor_index: number | null;
+  completed_cycles: number;
+  pdo_rate_hz: number;
+  rpdo_cob_id: number;
+  tff_rpdo_cob_id: number;
+  pdo_fields: string[];
+  sdo_fields: string[];
+  motors: SixMotorMitMotorView[];
+  last_error: string | null;
+}
+
+export interface SixMotorPpProfile {
+  velocity_rev_per_s: number;
+  acceleration_rev_per_s2: number;
+  deceleration_rev_per_s2: number;
+}
+
+export interface SixMotorPpRequest {
+  waypoints: number[][];
+  tpdo_event_timer_ms: number;
+  max_torque_permille: number;
+  profile: SixMotorPpProfile;
+  arrival_position_tolerance_rev: number;
+  arrival_velocity_tolerance_rev_per_s: number;
+  settle_time_ms: number;
+  movement_timeout_ms: number;
+  waypoint_dwell_ms: number;
+}
+
+export interface SixMotorPpMotorView {
+  node_id: number;
+  online: boolean;
+  enabled: boolean;
+  active: boolean;
+  sequence_state: string;
+  target_position_rev: number;
+  actual_position_rev: number | null;
+  actual_velocity_rev_per_s: number | null;
+  position_error_rev: number | null;
+  feedback_age_ms: number | null;
+  error: string | null;
+}
+
+export interface SixMotorPpView {
+  running: boolean;
+  phase: string;
+  active_waypoint_index: number;
+  active_motor_index: number | null;
+  completed_cycles: number;
+  pdo_rate_hz: number;
+  motors: SixMotorPpMotorView[];
+  last_error: string | null;
+}
+
 export interface LiftCommissionView {
   available: boolean;
   abi: number;

@@ -164,6 +164,42 @@ pub(crate) async fn stop_torque_calibration(state: &AppState) {
     let _ = state.torque_calibration.stop().await;
 }
 
+/// Keep the session registered until every motor accepted the safe disable so
+/// a failed manual stop/disconnect remains visible and retryable.
+pub(crate) async fn stop_active_six_motor_mit(state: &AppState) -> CmdResult<()> {
+    let app = match state.six_motor_mit.lock().await.clone() {
+        Some(app) => app,
+        None => return Ok(()),
+    };
+    app.shutdown().await.map_err(err)?;
+    let mut guard = state.six_motor_mit.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &app))
+    {
+        guard.take();
+    }
+    Ok(())
+}
+
+/// Keep the sequential PP session registered until every motor has confirmed
+/// Disabled, so disconnect/window close can retry a failed safe stop.
+pub(crate) async fn stop_active_six_motor_pp(state: &AppState) -> CmdResult<()> {
+    let app = match state.six_motor_pp.lock().await.clone() {
+        Some(app) => app,
+        None => return Ok(()),
+    };
+    app.shutdown().await.map_err(err)?;
+    let mut guard = state.six_motor_pp.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &app))
+    {
+        guard.take();
+    }
+    Ok(())
+}
+
 async fn damiao_session(state: &AppState, motor_id: u16) -> CmdResult<Arc<DamiaoSession>> {
     state
         .damiao
@@ -380,6 +416,14 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
     if stop_lift {
         stop_lift_session(state).await?;
     }
+    // Normally stopped by the extension path below. Keep this fallback so a
+    // malformed/stale active marker can never drop a live 500 Hz session.
+    if state.six_motor_mit.lock().await.is_some() {
+        stop_active_six_motor_mit(state).await?;
+    }
+    if state.six_motor_pp.lock().await.is_some() {
+        stop_active_six_motor_pp(state).await?;
+    }
     if let (Some(app), Some(mgr)) = (state.hopea3.lock().await.take(), state.manager().await) {
         app.stop(&mgr).await;
     }
@@ -416,6 +460,8 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
 /// disconnect releases the stock v1.4 manager and physical adapter.
 async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
     let failures = collect_extension_stop_failures(
+        stop_active_six_motor_mit(state),
+        stop_active_six_motor_pp(state),
         stop_active_smartknob(state),
         stop_rollercan_control(state, false),
         stop_damiao_sessions(state),
@@ -443,11 +489,19 @@ async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
 /// fails. Releasing the shared adapter remains the caller's responsibility and
 /// only happens when this returns no failures.
 async fn collect_extension_stop_failures(
+    six_motor_mit_stop: impl std::future::Future<Output = CmdResult<()>>,
+    six_motor_pp_stop: impl std::future::Future<Output = CmdResult<()>>,
     smartknob_stop: impl std::future::Future<Output = CmdResult<()>>,
     rollercan_control_stop: impl std::future::Future<Output = CmdResult<()>>,
     damiao_stop: impl std::future::Future<Output = CmdResult<()>>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
+    if let Err(error) = six_motor_mit_stop.await {
+        failures.push(format!("Six-motor MIT: {error}"));
+    }
+    if let Err(error) = six_motor_pp_stop.await {
+        failures.push(format!("Six-motor PP: {error}"));
+    }
     if let Err(error) = smartknob_stop.await {
         failures.push(format!("SmartKnob: {error}"));
     }
@@ -462,6 +516,22 @@ async fn collect_extension_stop_failures(
 
 /// Best-effort variant used only after an extended window-close request.
 async fn force_stop_extension_runtime_locked(state: &AppState) {
+    if let Some(app) = state.six_motor_mit.lock().await.take() {
+        if let Err(error) = app.shutdown().await {
+            log::warn!(
+                "six-motor MIT disable during forced close failed; remove motor power before handling the arm: {error}"
+            );
+            app.begin_shutdown();
+        }
+    }
+    if let Some(app) = state.six_motor_pp.lock().await.take() {
+        if let Err(error) = app.shutdown().await {
+            log::warn!(
+                "six-motor PP disable during forced close failed; remove motor power before handling the arm: {error}"
+            );
+            app.begin_shutdown();
+        }
+    }
     if let Err(error) = stop_rollercan_control(state, true).await {
         log::warn!(
             "RollerCAN control disable during forced close failed; motor power must be removed before handling it: {error}"
@@ -550,11 +620,21 @@ mod extension_isolation_tests {
     #[tokio::test]
     async fn extension_stop_attempts_every_subsystem_after_an_earlier_failure() {
         let calls = Arc::new(StdMutex::new(Vec::new()));
+        let six_motor_calls = calls.clone();
+        let six_motor_pp_calls = calls.clone();
         let smartknob_calls = calls.clone();
         let rollercan_calls = calls.clone();
         let damiao_calls = calls.clone();
 
         let failures = collect_extension_stop_failures(
+            async move {
+                six_motor_calls.lock().unwrap().push("six-motor-mit");
+                Ok(())
+            },
+            async move {
+                six_motor_pp_calls.lock().unwrap().push("six-motor-pp");
+                Ok(())
+            },
             async move {
                 smartknob_calls.lock().unwrap().push("smartknob");
                 Err("disable confirmation timed out".into())
@@ -572,7 +652,13 @@ mod extension_isolation_tests {
 
         assert_eq!(
             *calls.lock().unwrap(),
-            ["smartknob", "rollercan-control", "damiao"]
+            [
+                "six-motor-mit",
+                "six-motor-pp",
+                "smartknob",
+                "rollercan-control",
+                "damiao"
+            ]
         );
         assert_eq!(failures.len(), 2);
         assert!(failures[0].starts_with("SmartKnob:"));
@@ -1678,6 +1764,19 @@ pub async fn stop_log(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
 /// Initialize the three HopeA3 motors and start the 500 Hz uncompressed-MIT velocity loop.
 #[tauri::command]
 pub async fn hopea3_start(state: State<'_, AppState>) -> CmdResult<()> {
+    // Serialize every application that can own the shared motor bus. A
+    // retained MIT/PP handle may represent a failed disable, so presence (not
+    // only `is_running`) keeps ownership until its own Stop succeeds.
+    let _extension_op = state.extension_op.lock().await;
+    if state.six_motor_mit.lock().await.is_some() {
+        return Err("six-motor MIT test owns the motor bus; stop it first".into());
+    }
+    if state.six_motor_pp.lock().await.is_some() {
+        return Err("six-motor PP test owns the motor bus; stop it first".into());
+    }
+    if state.smartknob.lock().await.is_some() {
+        return Err("SmartKnob owns the motor bus; stop it first".into());
+    }
     let mgr = manager(&state).await?;
     let mut guard = state.hopea3.lock().await;
     if guard.is_some() {
@@ -1809,6 +1908,227 @@ pub async fn hopea3_get_state(state: State<'_, AppState>) -> CmdResult<crate::ho
         Some(app) => app.state(),
         None => crate::hopea3::Hopea3State::default(),
     })
+}
+
+// ───────────── Six-motor arm repeatability / uncompressed MIT ──────────────
+
+/// Initialize IDs 1..=6, map uncompressed MIT Pdes/Vdes and dynamic Tff into
+/// two shared 500 Hz RPDOs, safely hold the measured startup positions, then
+/// start the sequential-axis trajectory loop.
+#[tauri::command]
+pub async fn six_motor_mit_start(
+    state: State<'_, AppState>,
+    request: crate::six_motor_mit::SixMotorMitRequest,
+) -> CmdResult<crate::six_motor_mit::SixMotorMitView> {
+    let _extension_op = state.extension_op.lock().await;
+    mark_extension_runtime_active(&state);
+    let mgr = meow_manager(&state).await?;
+    let bus = feature_bus_locked(&state).await?;
+    let host_node_id = state
+        .calibration_host_node_id()
+        .await
+        .ok_or_else(|| "connection host node ID is unavailable".to_string())?;
+
+    if state.hopea3.lock().await.is_some() {
+        return Err("HopeA3 already owns the motor bus; stop it first".into());
+    }
+    if state.smartknob.lock().await.is_some() {
+        return Err("SmartKnob already owns the motor bus; stop it first".into());
+    }
+    if state.six_motor_pp.lock().await.is_some() {
+        return Err("six-motor PP test already owns the motor bus; stop it first".into());
+    }
+
+    if let Some(existing) = state.six_motor_mit.lock().await.clone() {
+        if existing.is_running() {
+            return Err("six-motor MIT test is already running".into());
+        }
+        existing.shutdown().await.map_err(err)?;
+        let mut guard = state.six_motor_mit.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &existing))
+        {
+            guard.take();
+        }
+    }
+
+    let mut torque_factors = [1.0f32; crate::six_motor_mit::NODE_IDS.len()];
+    for (index, &node_id) in crate::six_motor_mit::NODE_IDS.iter().enumerate() {
+        mgr.identify(node_id)
+            .await
+            .map_err(|error| format!("motor {node_id} identify failed: {error}"))?;
+        torque_factors[index] = meow_calibration::factor_for(&state, &mgr, node_id)
+            .await
+            .map_err(|error| format!("motor {node_id} torque calibration unavailable: {error}"))?
+            as f32;
+    }
+
+    let app = match crate::six_motor_mit::SixMotorMit::start(
+        mgr,
+        bus,
+        host_node_id,
+        torque_factors,
+        request,
+        &state.shutdown_requested,
+    )
+    .await
+    {
+        Ok(app) => app,
+        Err(error) => {
+            let (detail, recovery) = error.into_parts();
+            // Startup can fail after one or more axes have already entered
+            // MIT mode.  Retain the recovery session before reporting the
+            // error so its 500 Hz hold stays owned and Stop can retry the
+            // confirmed-disable sequence.
+            if let Some(recovery) = recovery {
+                *state.six_motor_mit.lock().await = Some(recovery);
+            }
+            return Err(detail);
+        }
+    };
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        if let Err(stop_error) = app.shutdown().await {
+            // Keep ownership of a persistent disable-hold when application
+            // shutdown raced the final startup step and an axis did not
+            // confirm Disabled.  The normal disconnect/close cleanup can
+            // retry this same session instead of orphaning its PDO writer.
+            *state.six_motor_mit.lock().await = Some(app);
+            return Err(format!(
+                "six-motor MIT startup cancelled by application shutdown; safe stop also failed: {stop_error}"
+            ));
+        }
+        return Err("six-motor MIT startup cancelled by application shutdown".into());
+    }
+    let view = app.snapshot();
+    *state.six_motor_mit.lock().await = Some(app);
+    log::info!("six-motor uncompressed-MIT sequence started at 500 Hz");
+    Ok(view)
+}
+
+/// Apply trajectory/waypoint changes immediately and use SDO read/write for
+/// every non-streamed MIT parameter. A partial SDO failure triggers safe stop.
+#[tauri::command]
+pub async fn six_motor_mit_update(
+    state: State<'_, AppState>,
+    request: crate::six_motor_mit::SixMotorMitRequest,
+) -> CmdResult<crate::six_motor_mit::SixMotorMitView> {
+    let app = state
+        .six_motor_mit
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "six-motor MIT test is not running".to_string())?;
+    match app.update(request).await {
+        Ok(view) => Ok(view),
+        Err(update_error) => {
+            app.begin_shutdown();
+            let stop_result = app.shutdown().await;
+            if stop_result.is_ok() {
+                let mut guard = state.six_motor_mit.lock().await;
+                if guard
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &app))
+                {
+                    guard.take();
+                }
+            }
+            let suffix = stop_result
+                .err()
+                .map(|error| format!("; safe stop also failed: {error}"))
+                .unwrap_or_default();
+            Err(format!("{update_error}{suffix}"))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn six_motor_mit_get_state(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::six_motor_mit::SixMotorMitView> {
+    Ok(match state.six_motor_mit.lock().await.as_ref() {
+        Some(app) => app.snapshot(),
+        None => crate::six_motor_mit::SixMotorMitView::idle(),
+    })
+}
+
+#[tauri::command]
+pub async fn six_motor_mit_stop(state: State<'_, AppState>) -> CmdResult<()> {
+    stop_active_six_motor_mit(&state).await?;
+    log::info!("six-motor MIT sequence stopped and all axes disabled");
+    Ok(())
+}
+
+// ───────────── Six-motor arm repeatability / Profile Position ─────────────
+
+#[tauri::command]
+pub async fn six_motor_pp_start(
+    state: State<'_, AppState>,
+    request: crate::six_motor_pp::SixMotorPpRequest,
+) -> CmdResult<crate::six_motor_pp::SixMotorPpView> {
+    let _extension_op = state.extension_op.lock().await;
+    mark_extension_runtime_active(&state);
+    let manager = meow_manager(&state).await?;
+    let host_node_id = state
+        .calibration_host_node_id()
+        .await
+        .ok_or_else(|| "connection host node ID is unavailable".to_string())?;
+    if crate::six_motor_pp::NODE_IDS.contains(&host_node_id) {
+        return Err(format!(
+            "host node ID {host_node_id} conflicts with motor IDs 1..=6; reconnect with a different host node ID"
+        ));
+    }
+    if state.hopea3.lock().await.is_some() {
+        return Err("HopeA3 already owns the motor bus; stop it first".into());
+    }
+    if state.smartknob.lock().await.is_some() {
+        return Err("SmartKnob already owns the motor bus; stop it first".into());
+    }
+    if state.six_motor_mit.lock().await.is_some() {
+        return Err("six-motor MIT test already owns the motor bus; stop it first".into());
+    }
+    if let Some(existing) = state.six_motor_pp.lock().await.clone() {
+        if existing.is_running() {
+            return Err("six-motor PP test is already running".into());
+        }
+        existing.shutdown().await.map_err(err)?;
+        let mut guard = state.six_motor_pp.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &existing))
+        {
+            guard.take();
+        }
+    }
+
+    let app = crate::six_motor_pp::SixMotorPp::start(manager, request, &state.shutdown_requested)
+        .await
+        .map_err(err)?;
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        let _ = app.shutdown().await;
+        return Err("six-motor PP startup cancelled by application shutdown".into());
+    }
+    let view = app.snapshot();
+    *state.six_motor_pp.lock().await = Some(app);
+    log::info!("six-motor sequential PP sequence started");
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn six_motor_pp_get_state(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::six_motor_pp::SixMotorPpView> {
+    Ok(match state.six_motor_pp.lock().await.as_ref() {
+        Some(app) => app.snapshot(),
+        None => crate::six_motor_pp::SixMotorPpView::idle(),
+    })
+}
+
+#[tauri::command]
+pub async fn six_motor_pp_stop(state: State<'_, AppState>) -> CmdResult<()> {
+    stop_active_six_motor_pp(&state).await?;
+    log::info!("six-motor PP sequence stopped and all axes disabled");
+    Ok(())
 }
 
 // ─────────────────────────────── SmartKnob ──────────────────────────────────
@@ -1982,6 +2302,15 @@ pub async fn smartknob_start(
     // it to stop and disable the motor.
     let _extension_op = state.extension_op.lock().await;
     mark_extension_runtime_active(&state);
+    if state.hopea3.lock().await.is_some() {
+        return Err("HopeA3 already owns the motor bus; stop it first".into());
+    }
+    if state.six_motor_mit.lock().await.is_some() {
+        return Err("six-motor MIT test owns the motor bus; stop it first".into());
+    }
+    if state.six_motor_pp.lock().await.is_some() {
+        return Err("six-motor PP test owns the motor bus; stop it first".into());
+    }
     let feature_bus = feature_bus_locked(&state).await?;
     let mgr = manager(&state).await?;
     if request.target.kind == SmartKnobKind::Rollercan {
