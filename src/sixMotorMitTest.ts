@@ -22,6 +22,7 @@ export const SIX_MOTOR_MIT_DEFAULT_PARK_POSITIONS_REV = [
 export const SIX_MOTOR_MIT_DEFAULT_PARK_ANGLES_RAD = [0, -1.57, 3.14, 0, 0, 0] as const;
 export const SIX_MOTOR_MIT_DEFAULT_GRAVITY_SCALES = [0, 0.3, 0.7, 0.7, 0, 0] as const;
 export const SIX_MOTOR_MIT_DEFAULT_GRAVITY_LIMITS_NM = [0.2, 5, 5, 1, 0.2, 0.1] as const;
+export const SIX_MOTOR_MIT_DEFAULT_KP_NM_PER_RAD = [80, 80, 120, 110, 80, 80] as const;
 export const SIX_MOTOR_MIT_DEFAULT_MAX_TORQUE_PERMILLE = [650, 650, 650, 650, 650, 650] as const;
 
 /**
@@ -42,7 +43,7 @@ export const SIX_MOTOR_MIT_DEFAULT_TUNING: Readonly<SixMotorMitTuning> = {
   gravity_park_angle_rad: SIX_MOTOR_MIT_DEFAULT_PARK_ANGLES_RAD[0],
   gravity_scale: SIX_MOTOR_MIT_DEFAULT_GRAVITY_SCALES[0],
   gravity_max_torque_nm: SIX_MOTOR_MIT_DEFAULT_GRAVITY_LIMITS_NM[0],
-  kp_nm_per_rad: 80,
+  kp_nm_per_rad: SIX_MOTOR_MIT_DEFAULT_KP_NM_PER_RAD[0],
   kd_nm_s_per_rad: 15,
   kp_kd_limit_permille: 500,
   max_torque_permille: SIX_MOTOR_MIT_DEFAULT_MAX_TORQUE_PERMILLE[0],
@@ -75,6 +76,7 @@ export function createSixMotorMitDefaultRequest(): SixMotorMitRequest {
       gravity_park_angle_rad: SIX_MOTOR_MIT_DEFAULT_PARK_ANGLES_RAD[index],
       gravity_scale: SIX_MOTOR_MIT_DEFAULT_GRAVITY_SCALES[index],
       gravity_max_torque_nm: SIX_MOTOR_MIT_DEFAULT_GRAVITY_LIMITS_NM[index],
+      kp_nm_per_rad: SIX_MOTOR_MIT_DEFAULT_KP_NM_PER_RAD[index],
       max_torque_permille: SIX_MOTOR_MIT_DEFAULT_MAX_TORQUE_PERMILLE[index],
     })),
   };
