@@ -58,9 +58,26 @@
 }
 
 .hope-limits,
-.hope-motors {
+.hope-motors,
+.hope-speed-plan {
   min-width: 0;
   padding: 16px;
+}
+
+.hope-plan-inputs {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 16px 0;
+}
+
+.hope-plan-inputs .hope-labeled {
+  min-width: 180px;
+}
+
+.hope-speed-plan .zenoh-metric-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .hope-triplet {

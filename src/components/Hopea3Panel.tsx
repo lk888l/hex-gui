@@ -3,6 +3,7 @@ import {
   App as AntdApp,
   Button,
   InputNumber,
+  Select,
   Space,
   Switch,
   Table,
@@ -12,6 +13,7 @@ import {
 import { api, errMsg } from "../api";
 import { useI18n } from "../i18n";
 import { nid2hex } from "../format";
+import { HOPE_DEFAULT_MAX_LINEAR_MPS, hopeSpeedPlan, hopeRampEstimate } from "../hopea3Speed";
 import type { Hopea3Motor, Hopea3State } from "../types";
 import { BasePoseViewer } from "./BasePoseViewer";
 import "./ZenohPanel.css";
@@ -34,12 +36,18 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
   const [starting, setStarting] = useState(false);
   const [initProg, setInitProg] = useState<{ current: number; total: number; attempt: number } | null>(null);
   const [state, setState] = useState<Hopea3State | null>(null);
+  const [reinitNid, setReinitNid] = useState<number | null>(null);
+  const canDrive = connected && running && reinitNid === null;
+  const [referenceSpeed, setReferenceSpeed] = useState(20);
+  const [referenceDirection, setReferenceDirection] = useState<"forward" | "left">("forward");
+  const speedPlan = hopeSpeedPlan(referenceSpeed, referenceDirection);
 
   // Limits + torque (applied on button).
-  const [maxLinear, setMaxLinear] = useState(3);
+  const [maxLinear, setMaxLinear] = useState(HOPE_DEFAULT_MAX_LINEAR_MPS);
   const [maxAngular, setMaxAngular] = useState(3);
   const [accLin, setAccLin] = useState(2);
   const [accAng, setAccAng] = useState(6);
+  const ramp = hopeRampEstimate(referenceSpeed, accLin);
   const [torque, setTorque] = useState<[number, number, number]>([800, 800, 800]);
   const [kd, setKd] = useState<[number, number, number]>([1.0, 1.0, 1.0]);
 
@@ -95,17 +103,28 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
   const start = useCallback(async () => {
     setStarting(true);
+    let started = false;
     try {
       await api.hopea3Start();
+      started = true;
+      // A new backend session starts with defaults. Reapply the visible inputs
+      // before enabling manual controls, including after Stop → Start.
+      await api.hopea3SetLimits(maxLinear, maxAngular);
+      await api.hopea3SetAccelLimits(accLin, accAng);
+      await api.hopea3SetMaxTorque(torque);
+      await api.hopea3SetKd(kd);
+      setState(null);
       setOdomViewVersion((v) => v + 1);
       setRunning(true);
       message.success(t("hopeRunning"));
     } catch (e) {
+      if (started) await api.hopea3Stop().catch(() => {});
+      setRunning(false);
       message.error(`${t("hopeStartFailed")}: ${errMsg(e)}`);
     } finally {
       setStarting(false);
     }
-  }, [message, t]);
+  }, [message, t, maxLinear, maxAngular, accLin, accAng, torque, kd]);
 
   const stop = useCallback(async () => {
     try {
@@ -114,7 +133,6 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       message.error(errMsg(e));
     }
     setRunning(false);
-    setState(null);
   }, [message]);
 
   // If the bus disconnects under us, drop back to the stopped view.
@@ -139,7 +157,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
   // Keyboard key tracking (WASD/QE), only while running and not typing in a field.
   useEffect(() => {
-    if (!running || !keyboardEnabled) {
+    if (!canDrive || !keyboardEnabled) {
       keysDown.current.clear();
       return;
     }
@@ -164,12 +182,12 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       window.removeEventListener("blur", onBlur);
       keysDown.current.clear();
     };
-  }, [running, keyboardEnabled]);
+  }, [canDrive, keyboardEnabled]);
 
   // Manual-input loop: gamepad takes priority over keyboard; releasing all
   // input sends one zero then yields the command back to the pointer controls.
   useEffect(() => {
-    if (!running) return;
+    if (!canDrive) return;
     const h = window.setInterval(() => {
       const gp = readGamepad(manualLinear, manualAngular);
       const kb = keyboardEnabled ? readKeyboard(keysDown.current, manualLinear, manualAngular) : null;
@@ -183,7 +201,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       }
     }, MANUAL_MS);
     return () => window.clearInterval(h);
-  }, [running, keyboardEnabled, manualLinear, manualAngular, cmd, stopMotion]);
+  }, [canDrive, keyboardEnabled, manualLinear, manualAngular, cmd, stopMotion]);
 
   const clearErrors = useCallback(async () => {
     try {
@@ -194,7 +212,6 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
     }
   }, [message, t]);
 
-  const [reinitNid, setReinitNid] = useState<number | null>(null);
   const reinitMotor = useCallback(async (nid: number) => {
     setReinitNid(nid);
     try {
@@ -211,6 +228,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
     try {
       await api.hopea3SetLimits(maxLinear, maxAngular);
       await api.hopea3SetAccelLimits(accLin, accAng);
+      message.success(t("hopeLimitsApplied"));
     } catch (e) {
       message.error(errMsg(e));
     }
@@ -224,15 +242,17 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
     }
   };
   const applyKd = async (next: [number, number, number]) => {
-    setKd(next);
     try {
       await api.hopea3SetKd(next);
+      setKd(next);
     } catch (e) {
       message.error(errMsg(e));
     }
   };
 
-  const canDrive = connected && running;
+  const measuredSpeed = canDrive && state?.feedback_valid
+    ? Math.hypot(state.meas_vx, state.meas_vy) : null;
+  const commandSpeed = canDrive && state ? Math.hypot(state.cmd_vx, state.cmd_vy) : null;
   const startLabel = starting
     ? initProg
       ? `${t("hopeStarting")} ${initProg.current}/${initProg.total}${initProg.attempt > 1 ? ` (#${initProg.attempt})` : ""}`
@@ -244,6 +264,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       <section className="hope-start-panel zenoh-connect-panel">
         <div className="hope-start-panel__copy">
           <Typography.Text strong>{t("hopeStart")}</Typography.Text>
+          <Tag color="blue">{t("hopeUncompressed")}</Tag>
           <Typography.Text type="secondary">
             {connected ? t("hopeStartHint") : t("hopeNeedConnect")}
           </Typography.Text>
@@ -294,14 +315,16 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
           <div className="zenoh-speed-grid">
             <label className="zenoh-field">
-              <span>{t("zSpeedLin")}</span>
-              <InputNumber disabled={!canDrive} min={0} max={maxLinear} step={0.1} value={manualLinear} onChange={(v) => setManualLinear(v ?? 0)} />
+              <span>{t("hopeManualLinear")}</span>
+              <InputNumber disabled={!canDrive} min={0} max={state?.max_linear ?? maxLinear} step={0.1} value={manualLinear} onChange={(v) => setManualLinear(v ?? 0)} />
             </label>
             <label className="zenoh-field">
-              <span>{t("zSpeedAng")}</span>
-              <InputNumber disabled={!canDrive} min={0} max={maxAngular} step={0.1} value={manualAngular} onChange={(v) => setManualAngular(v ?? 0)} />
+              <span>{t("hopeManualAngular")}</span>
+              <InputNumber disabled={!canDrive} min={0} max={state?.max_angular ?? maxAngular} step={0.1} value={manualAngular} onChange={(v) => setManualAngular(v ?? 0)} />
             </label>
           </div>
+
+          <Typography.Text type="secondary">{t("hopeDriveSpeedHint")}</Typography.Text>
 
           <div className="zenoh-keyboard-control">
             <div className="zenoh-keyboard-control__top">
@@ -350,7 +373,28 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
               <h2>{t("zTelemetry")}</h2>
               <Typography.Text type="secondary">{t("hopeMeasTwist")}</Typography.Text>
             </div>
+            <Button size="small" disabled={!state} onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(JSON.stringify({
+                  copied_at: new Date().toISOString(),
+                  session_running: running,
+                  protocol: "uncompressed_mit",
+                  wheel_diameter_mm: 154,
+                  ...state,
+                }, null, 2));
+                message.success(t("hopeSnapshotCopied"));
+              } catch (e) { message.error(errMsg(e)); }
+            }}>{t("hopeCopySnapshot")}</Button>
           </div>
+          <MetricGroup
+            title={t("hopeSpeedTest")}
+            items={[
+              [t("hopeCmdTwist"), `${fmt(commandSpeed)} m/s`],
+              [t("hopeEstimatedSpeed"), measuredSpeed == null ? "—" : `${fmt(measuredSpeed)} m/s · ${fmt(measuredSpeed * 3.6, 2)} km/h`],
+              [t("hopePeakSpeed"), state ? `${fmt(state.peak_speed_mps)} m/s · ${fmt(state.peak_speed_mps * 3.6, 2)} km/h` : "—"],
+            ]}
+          />
+          <Typography.Text type="secondary">{t("hopeSpeedEstimateHint")}</Typography.Text>
           <MetricGroup
             title={t("hopePose")}
             items={[
@@ -370,12 +414,44 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
         </section>
       </div>
 
+      <section className="zenoh-card hope-speed-plan">
+        <div className="zenoh-card__heading">
+          <div>
+            <h2>{t("hopeSpeedPlan")}</h2>
+            <Typography.Text type="secondary">{t("hopeSpeedPlanHint")}</Typography.Text>
+          </div>
+          <Tag>Ø 154 mm</Tag>
+        </div>
+        <div className="hope-plan-inputs">
+          <Labeled label={t("hopeReferenceSpeed")}>
+            <InputNumber min={0} step={0.5} value={referenceSpeed} onChange={(v) => setReferenceSpeed(v ?? 0)} />
+          </Labeled>
+          <Labeled label={t("hopeReferenceDirection")}>
+            <Select value={referenceDirection} onChange={setReferenceDirection} options={[
+              { value: "forward", label: t("hopeReferenceForward") },
+              { value: "left", label: t("hopeReferenceLeft") },
+            ]} />
+          </Labeled>
+          <div>{fmt(speedPlan.kmh, 2)} km/h</div>
+        </div>
+        <MetricGroup title={t("hopeRequiredWheelSpeed")} items={speedPlan.wheels.map((rev, i) => [
+          `M${i + 1}`, `${fmt(rev, 2)} rev/s · ${fmt(rev * 60, 0)} rpm`,
+        ])} />
+        <Typography.Paragraph type="secondary">
+          {t("hopeWheelFormula")} {fmt(speedPlan.wheelRevPerS, 2)} rev/s.
+          {ramp && ` ${t("hopeRampEstimate")}: ${fmt(ramp.seconds, 1)} s / ${fmt(ramp.metres, 1)} m (${accLin} m/s²).`}
+        </Typography.Paragraph>
+        <Typography.Text type="secondary">{t("hopeSpeedDiagnosis")}</Typography.Text>
+      </section>
+
       <section className="hope-lower-grid">
         <div className="zenoh-card hope-limits">
           <div className="zenoh-card__heading">
             <div>
               <h2>{t("hopeLimits")}</h2>
-              <Typography.Text type="secondary">{t("hopeMaxTorque")}</Typography.Text>
+              <Typography.Text type="secondary">
+                {t("hopeAppliedLimits")}: {fmt(state?.max_linear, 1)} m/s · {fmt(state?.max_angular, 1)} rad/s
+              </Typography.Text>
             </div>
             <Button disabled={!canDrive} onClick={applyLimits}>{t("apply")}</Button>
           </div>
@@ -393,6 +469,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
               <InputNumber disabled={!canDrive} min={0} step={0.5} value={accAng} onChange={(v) => setAccAng(v ?? 0)} />
             </Labeled>
           </div>
+          <Typography.Paragraph type="secondary">{t("hopeLimitsHint")}</Typography.Paragraph>
           <Typography.Text type="secondary">{t("hopeMaxTorque")}</Typography.Text>
           <div className="hope-triplet">
             {[0, 1, 2].map((i) => (
@@ -419,6 +496,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
                 disabled={!canDrive}
                 addonBefore={i + 1}
                 min={0}
+                max={state?.motors[i]?.max_kd_si}
                 step={0.05}
                 value={kd[i]}
                 onChange={(v) => {
@@ -482,8 +560,15 @@ function MotorTable({
         },
         { title: t("hopeTarget"), render: (_, m) => fmt(m.target_rev_per_s) },
         { title: t("hopeMeasVel"), render: (_, m) => fmt(m.velocity_rev_per_s) },
+        { title: t("hopeVelocityError"), render: (_, m) => fmt(m.velocity_rev_per_s == null ? null : m.target_rev_per_s - m.velocity_rev_per_s) },
+        { title: t("hopeAppliedKd"), render: (_, m) => fmt(m.applied_kd_si) },
+        { title: t("hopeTorqueDemand"), render: (_, m) => fmt(m.estimated_torque_permille, 0) },
         { title: t("torque"), render: (_, m) => fmt(m.torque_nm) },
-        { title: "‰", dataIndex: "max_torque_permille" },
+        { title: t("hopeTorqueUsage"), render: (_, m) => (
+          <Typography.Text type={m.torque_permille != null && m.max_torque_permille > 0 && Math.abs(m.torque_permille) >= m.max_torque_permille * 0.95 ? "warning" : undefined}>
+            {fmt(m.torque_permille, 0)} / {m.max_torque_permille}
+          </Typography.Text>
+        ) },
         { title: t("driverTemp"), render: (_, m) => fmt(m.driver_temp_c, 1) },
         { title: t("motorTemp"), render: (_, m) => fmt(m.motor_temp_c, 1) },
         {

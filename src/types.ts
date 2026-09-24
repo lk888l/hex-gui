@@ -638,6 +638,10 @@ export interface Hopea3Motor {
   velocity_rev_per_s: number | null;
   torque_nm: number | null;
   max_torque_permille: number;
+  torque_permille: number | null;
+  applied_kd_si: number;
+  estimated_torque_permille: number | null;
+  max_kd_si: number;
   driver_temp_c: number | null;
   motor_temp_c: number | null;
   error: string | null;
@@ -660,6 +664,8 @@ export interface Hopea3State {
   cmd_vx: number;
   cmd_vy: number;
   cmd_wz: number;
+  peak_speed_mps: number;
+  feedback_valid: boolean;
   max_linear: number;
   max_angular: number;
   motors: Hopea3Motor[];

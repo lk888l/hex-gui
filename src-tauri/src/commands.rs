@@ -380,8 +380,8 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
     if stop_lift {
         stop_lift_session(state).await?;
     }
-    if let (Some(app), Some(mgr)) = (state.hopea3.lock().await.take(), state.manager().await) {
-        app.stop(&mgr).await;
+    if let Some(app) = state.hopea3.lock().await.take() {
+        app.stop().await;
     }
     // An active SmartKnob always marks the extension runtime active and is
     // stopped before this function. Retain a fail-safe fallback for malformed
@@ -1678,12 +1678,17 @@ pub async fn stop_log(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
 /// Initialize the three HopeA3 motors and start the 500 Hz uncompressed-MIT velocity loop.
 #[tauri::command]
 pub async fn hopea3_start(state: State<'_, AppState>) -> CmdResult<()> {
-    let mgr = manager(&state).await?;
+    let mgr = meow_manager(&state).await?;
+    // The shared host-PDO frames stream on the same physical bus the managers
+    // were opened on. The CiA402 manager still owns that bus, so borrow it here.
+    let transport_manager = manager(&state).await?;
+    let bus = transport_manager.bus();
+    let timeout = Some(transport_manager.options().sdo_timeout);
     let mut guard = state.hopea3.lock().await;
     if guard.is_some() {
         return Err("HopeA3 already running; stop it first".into());
     }
-    let app = crate::hopea3::Hopea3::start(mgr, &state.hopea3_init)
+    let app = crate::hopea3::Hopea3::start(mgr, bus, timeout, &state.hopea3_init)
         .await
         .map_err(err)?;
     *guard = Some(app);
@@ -1704,8 +1709,7 @@ pub async fn hopea3_init_progress(
 pub async fn hopea3_stop(state: State<'_, AppState>) -> CmdResult<()> {
     let app = state.hopea3.lock().await.take();
     if let Some(app) = app {
-        let mgr = manager(&state).await?;
-        app.stop(&mgr).await;
+        app.stop().await;
         log::info!("HopeA3 stopped");
     }
     Ok(())
@@ -1741,7 +1745,7 @@ pub async fn hopea3_set_max_torque(
 #[tauri::command]
 pub async fn hopea3_set_kd(state: State<'_, AppState>, kd_si: [f64; 3]) -> CmdResult<()> {
     if let Some(app) = state.hopea3.lock().await.as_ref() {
-        app.set_kd(kd_si);
+        app.set_kd(kd_si).await.map_err(err)?;
     }
     Ok(())
 }
@@ -1759,8 +1763,7 @@ pub async fn hopea3_set_limits(
     Ok(())
 }
 
-/// Re-initialize a single HopeA3 motor (e.g. one that faulted) while the chassis
-/// keeps running. The other motors are unaffected.
+/// Stop chassis motion and re-initialize one HopeA3 motor (e.g. after a fault).
 #[tauri::command]
 pub async fn hopea3_reinit_motor(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
     let guard = state.hopea3.lock().await;
@@ -1770,11 +1773,11 @@ pub async fn hopea3_reinit_motor(state: State<'_, AppState>, nid: u8) -> CmdResu
     }
 }
 
-/// Clear CiA402 faults on all three HopeA3 motors (best-effort). Useful before
+/// Clear hex-meow faults on all three HopeA3 motors (best-effort). Useful before
 /// starting if a previous run left them in a heartbeat-lost / fault state.
 #[tauri::command]
 pub async fn hopea3_clear_errors(state: State<'_, AppState>) -> CmdResult<()> {
-    let mgr = manager(&state).await?;
+    let mgr = meow_manager(&state).await?;
     crate::hopea3::clear_errors(&mgr).await;
     Ok(())
 }
