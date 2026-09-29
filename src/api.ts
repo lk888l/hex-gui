@@ -5,6 +5,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ArmInfo, ArmUrdf, AuthenticityDeviceView, AuthenticityOnlineStatus, AuthenticityRegistrationResult, AuthenticityTarget, BaseInfo, BaseLimitsDto, CalibrationUpdatePersistedResult, CalibrationUpdatePrepared, CalibrationUpdatePreview, CalibrationUpdatePreviewRequest, CalibrationUpdateVerifyRequest, CalibrationUpdateWriteRequest, CalibrationUpdateWriteResult, CanAggReply, CanAnalyzerStatus, CanBusHealth, CanFilterSpec, CanSendSpec, CanTraceReply, ConfigGetDto, ConfigSetResult, ConfigValidateResult, ConnectionInfo, ControllerInfo, DeviceSettingsRequest, DeviceSettingsResult, EventsSnapshot, FrictionCalibrationRequest, FrictionCalibrationView, Hopea3InitProgress, Hopea3State, ImuState, KnobConfig, LiftFactoryCalibrationResult, LiftState, LiveState, LogLine, MeowCanSettingsRequest, MeowMotorSnapshot, MeowMotorTarget, MeowProfileLimits, MotorInfo, MotorMode, MotorTarget, RestartResult, TorqueCalibrationRequest, TorqueCalibrationView, ZenohArmState, ZenohBaseState, LiftRobotInfo, ZenohLiftState, EeInfo, RobotNode, ZenohEeState, SceneRobot, ConsoleUrdf, MountEdge, HardwareSnapshot, WifiController, WifiJob, WifiSavedNetwork, WifiScanEntry, WifiStatus, DiscoveredController, ScopeCandidate } from "./types";
 import type {
+  HostCanStatus,
+  LingkongProbe,
+  LingkongSnapshot,
+  LingkongInitialization,
+  LingkongParameterValue,
+  LingkongRebootResult,
   DamiaoConfig,
   DamiaoDiscoveredDevice,
   DamiaoMode,
@@ -24,6 +30,21 @@ import type {
 } from "./types";
 
 export const api = {
+  hostCanInspect: (iface: string) => invoke<HostCanStatus>("host_can_inspect", { iface }),
+  hostCanApply: (iface: string, bitrate: number, password: string) =>
+    invoke<HostCanStatus>("host_can_apply", { iface, bitrate, password }),
+  lingkongStart: (spec: string, bitrate: number) => invoke<void>("lingkong_start", { spec, bitrate }),
+  lingkongStop: () => invoke<void>("lingkong_stop"),
+  lingkongScan: () => invoke<LingkongProbe[]>("lingkong_scan"),
+  lingkongSnapshot: (id: number) => invoke<LingkongSnapshot>("lingkong_snapshot", { id }),
+  lingkongInitialize: (id: number) => invoke<LingkongInitialization>("lingkong_initialize", { id }),
+  lingkongReadParameters: (id: number) => invoke<LingkongParameterValue[]>("lingkong_read_parameters", { id }),
+  lingkongWriteParameter: (id: number, key: string, values: number[]) =>
+    invoke<LingkongParameterValue>("lingkong_write_parameter", { id, key, values }),
+  lingkongSaveSettings: (id: number) => invoke<void>("lingkong_save_settings", { id }),
+  lingkongReboot: (id: number) => invoke<LingkongRebootResult>("lingkong_reboot", { id }),
+  lingkongAction: (id: number, kind: string, value = 0, limit = 0) =>
+    invoke<LingkongSnapshot>("lingkong_action", { id, kind, value, limit }),
   connect: (iface: string, dataBitrate: number, ourNid: number, broadcastHeartbeat: boolean) =>
     invoke<ConnectionInfo>("connect", { iface, dataBitrate, ourNid, broadcastHeartbeat }),
   disconnect: () => invoke<void>("disconnect"),

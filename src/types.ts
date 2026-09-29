@@ -1364,3 +1364,45 @@ export type ScopeCandidate = {
   index: number;
   addrs: string[];
 };
+
+export interface HostCanStatus {
+  iface: string;
+  kind: string;
+  up: boolean;
+  bitrate: number | null;
+  fd_enabled: boolean;
+}
+
+export interface LingkongProbe {
+  id: number;
+  motor_state: number;
+  error_state: number;
+}
+
+export interface LingkongSnapshot extends LingkongProbe {
+  temperature_c: number;
+  voltage_v: number;
+  bus_current_a: number;
+  iq_raw: number;
+  speed_dps: number;
+  encoder: number;
+  angle_deg: number | null;
+}
+
+export interface LingkongParameterValue {
+  key: string;
+  values: number[];
+}
+
+export interface LingkongInitialization {
+  snapshot: LingkongSnapshot;
+  parameters: LingkongParameterValue[];
+  settings_dirty: boolean;
+  reboot_required: boolean;
+}
+
+export interface LingkongRebootResult {
+  next_id: number | null;
+  next_bitrate: number;
+  closed_after_reboot: boolean;
+}

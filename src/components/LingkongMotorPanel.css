@@ -1,0 +1,53 @@
+.lingkong-panel {
+  width: 100%;
+  max-width: 1500px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.lingkong-field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.lingkong-interface-status {
+  margin-top: 12px;
+}
+
+.lingkong-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 2fr);
+  gap: 16px;
+}
+
+.lingkong-device-list,
+.lingkong-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.lingkong-param-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.3fr) minmax(170px, 2fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--ant-color-border-secondary, #eee);
+}
+
+.lingkong-param-row:last-child { border-bottom: 0; }
+
+.lingkong-param-meta { display: block; font-size: 12px; }
+
+.lingkong-param-values { display: flex; flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 900px) {
+  .lingkong-grid { grid-template-columns: 1fr; }
+  .lingkong-param-row { grid-template-columns: 1fr; }
+}

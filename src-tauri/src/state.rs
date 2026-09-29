@@ -150,6 +150,8 @@ pub struct AppState {
     /// It scans the protocol's unambiguous 4-bit feedback ID space and is
     /// stopped together with the physical CAN connection.
     pub damiao_discovery: Mutex<Option<Arc<crate::damiao::DamiaoDiscovery>>>,
+    /// Independent Classic CAN session for the Lingkong V2.36 protocol.
+    pub lingkong: Mutex<Option<Arc<crate::lingkong::LingkongSession>>>,
     /// Stock-firmware Unit RollerCAN control workspace. This stays separate
     /// from `rollercan`, which belongs to the independent SmartKnob firmware.
     /// It is created lazily and borrows the manager-owned CAN bus.

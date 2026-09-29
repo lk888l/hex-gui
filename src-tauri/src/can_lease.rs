@@ -19,6 +19,8 @@ pub enum CanOwner {
     Analyzer,
     DfuDiscovery,
     DfuUpdate,
+    Lingkong,
+    HostConfig,
 }
 
 impl fmt::Display for CanOwner {
@@ -28,6 +30,8 @@ impl fmt::Display for CanOwner {
             Self::Analyzer => "CAN Analyzer",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
+            Self::Lingkong => "Lingkong motor workspace",
+            Self::HostConfig => "host CAN configuration",
         })
     }
 }

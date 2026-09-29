@@ -428,6 +428,12 @@ const STRINGS = {
   },
   tagDamiaoProtocol: { en: "DAMIAO CAN 1 Mbps", zh: "达妙 CAN 1 Mbps" },
   toolRollerCanControl: { en: "Unit RollerCAN Motor Control", zh: "Unit RollerCAN 电机控制" },
+  toolLingkong: { en: "Lingkong MHF Motor Control", zh: "瓴控 MHF 电机控制" },
+  toolLingkongDesc: {
+    en: "Classic CAN V2.36 initialization, parameter setup, motion control and telemetry.",
+    zh: "瓴控 V2.36 标准 CAN 电机初始化、参数设定、运动控制与状态读取。",
+  },
+  tagLingkongProtocol: { en: "Lingkong Classic CAN", zh: "瓴控标准 CAN" },
   toolRollerCanControlDesc: {
     en: "Stock-firmware speed, position, current and encoder control over extended CAN frames.",
     zh: "通过扩展 CAN 帧控制原厂固件的速度、位置、电流与编码器模式。",

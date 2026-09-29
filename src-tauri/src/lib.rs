@@ -22,6 +22,10 @@ mod hpm_dfu;
 mod imu;
 mod lift;
 mod lift_commission;
+mod lingkong;
+mod lingkong_commands;
+mod lingkong_params;
+mod host_can;
 mod logging;
 mod meow_calibration;
 mod motor_factory_backup;
@@ -294,6 +298,18 @@ pub fn run() {
             commands::damiao_set_zero,
             commands::damiao_send_target,
             commands::damiao_stop_stream,
+            lingkong_commands::lingkong_start,
+            lingkong_commands::lingkong_stop,
+            lingkong_commands::lingkong_scan,
+            lingkong_commands::lingkong_snapshot,
+            lingkong_commands::lingkong_initialize,
+            lingkong_commands::lingkong_read_parameters,
+            lingkong_commands::lingkong_write_parameter,
+            lingkong_commands::lingkong_save_settings,
+            lingkong_commands::lingkong_reboot,
+            lingkong_commands::lingkong_action,
+            lingkong_commands::host_can_inspect,
+            lingkong_commands::host_can_apply,
             commands::rollercan_control_list_devices,
             commands::rollercan_control_rescan,
             commands::rollercan_control_attach,

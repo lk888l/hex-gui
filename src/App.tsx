@@ -25,6 +25,7 @@ import { DfuPanel } from "./components/DfuPanel";
 import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
+import { LingkongMotorPanel } from "./components/LingkongMotorPanel";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
 import { canDfuApi, hpmDfuApi } from "./dfuApi";
 import type { MotorInfo } from "./types";
@@ -48,7 +49,8 @@ type Tool =
   | "calibrationUpdate"
   | "console"
   | "damiao"
-  | "rollercanControl";
+  | "rollercanControl"
+  | "lingkong";
 
 const DEVICE_POLL_MS = 700;
 
@@ -227,6 +229,7 @@ export default function App() {
     console: { title: t("toolConsole"), desc: t("toolConsoleDesc") },
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
+    lingkong: { title: t("toolLingkong"), desc: t("toolLingkongDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
   const needsHeartbeat =
@@ -251,7 +254,8 @@ export default function App() {
     tool !== "torqueCalibration" &&
     tool !== "calibrationUpdate" &&
     tool !== "damiao" &&
-    tool !== "rollercanControl";
+    tool !== "rollercanControl" &&
+    tool !== "lingkong";
   const showConnectBar =
     tool !== "console" &&
     tool !== "zenoh" &&
@@ -259,7 +263,8 @@ export default function App() {
     tool !== "liftApi" &&
     tool !== "config" &&
     tool !== "canalyzer" &&
-    tool !== "dfu";
+    tool !== "dfu" &&
+    tool !== "lingkong";
 
   return (
     <Layout className={`app-shell app-shell--${tool}`}>
@@ -347,6 +352,8 @@ export default function App() {
             <DamiaoMotorPanel connected={connected} />
           ) : tool === "rollercanControl" ? (
             <RollerCanControlPanel connected={connected} />
+          ) : tool === "lingkong" ? (
+            <LingkongMotorPanel />
           ) : tool === "dfu" ? (
             <DfuPanel onBusyChange={setDfuBusy} />
           ) : tool === "authenticity" ? (
@@ -638,6 +645,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                     tag={t("tagRollerCanProtocol")}
                     accent="blue"
                     onClick={() => onPick("rollercanControl")}
+                  />
+                  <ToolCard
+                    title={t("toolLingkong")}
+                    desc={t("toolLingkongDesc")}
+                    tag={t("tagLingkongProtocol")}
+                    accent="green"
+                    onClick={() => onPick("lingkong")}
                   />
                 </div>
               ),
