@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ArmInfo, ArmUrdf, AuthenticityDeviceView, AuthenticityOnlineStatus, AuthenticityRegistrationResult, AuthenticityTarget, BaseInfo, BaseLimitsDto, CalibrationUpdatePersistedResult, CalibrationUpdatePrepared, CalibrationUpdatePreview, CalibrationUpdatePreviewRequest, CalibrationUpdateVerifyRequest, CalibrationUpdateWriteRequest, CalibrationUpdateWriteResult, CanAggReply, CanAnalyzerStatus, CanBusHealth, CanFilterSpec, CanSendSpec, CanTraceReply, ConfigGetDto, ConfigSetResult, ConfigValidateResult, ConnectionInfo, ControllerInfo, DeviceSettingsRequest, DeviceSettingsResult, EventsSnapshot, FrictionCalibrationRequest, FrictionCalibrationView, Hopea3InitProgress, Hopea3State, ImuState, KnobConfig, LiftFactoryCalibrationResult, LiftState, LiveState, LogLine, MeowCanSettingsRequest, MeowMotorSnapshot, MeowMotorTarget, MeowProfileLimits, MotorInfo, MotorMode, MotorTarget, RestartResult, TorqueCalibrationRequest, TorqueCalibrationView, ZenohArmState, ZenohBaseState, LiftRobotInfo, ZenohLiftState, EeInfo, RobotNode, ZenohEeState, SceneRobot, ConsoleUrdf, MountEdge, HardwareSnapshot, WifiController, WifiJob, WifiSavedNetwork, WifiScanEntry, WifiStatus, DiscoveredController, ScopeCandidate } from "./types";
 import type {
   DamiaoConfig,
+  DamiaoBitrateState,
   DamiaoDiscoveredDevice,
   DamiaoMode,
   DamiaoState,
@@ -30,8 +31,8 @@ import type {
 } from "./types";
 
 export const api = {
-  connect: (iface: string, dataBitrate: number, ourNid: number, broadcastHeartbeat: boolean) =>
-    invoke<ConnectionInfo>("connect", { iface, dataBitrate, ourNid, broadcastHeartbeat }),
+  connect: (iface: string, dataBitrate: number, ourNid: number, broadcastHeartbeat: boolean, damiaoBitrate?: number) =>
+    invoke<ConnectionInfo>("connect", { iface, dataBitrate, ourNid, broadcastHeartbeat, damiaoBitrate }),
   disconnect: () => invoke<void>("disconnect"),
   isConnected: () => invoke<boolean>("is_connected"),
 
@@ -117,12 +118,19 @@ export const api = {
     invoke<DamiaoState>("damiao_get_state", { motorId }),
   damiaoSetMode: (motorId: number, mode: DamiaoMode) =>
     invoke<DamiaoState>("damiao_set_mode", { motorId, mode }),
+  damiaoGetBitrate: (motorId: number) =>
+    invoke<DamiaoBitrateState>("damiao_get_bitrate", { motorId }),
+  damiaoSetBitrate: (motorId: number, bitrate: number) =>
+    invoke<DamiaoBitrateState>("damiao_set_bitrate", { motorId, bitrate }),
+  damiaoSaveParameters: (motorId: number) =>
+    invoke<void>("damiao_save_parameters", { motorId }),
   damiaoEnable: (motorId: number) => invoke<void>("damiao_enable", { motorId }),
   damiaoDisable: (motorId: number) => invoke<void>("damiao_disable", { motorId }),
   damiaoDisableAll: () => invoke<void>("damiao_disable_all"),
   damiaoClearFault: (motorId: number) =>
     invoke<void>("damiao_clear_fault", { motorId }),
-  damiaoSetZero: (motorId: number) => invoke<void>("damiao_set_zero", { motorId }),
+  damiaoSetZero: (motorId: number) =>
+    invoke<DamiaoState>("damiao_set_zero", { motorId }),
   damiaoSendTarget: (motorId: number, target: DamiaoTarget, repeat: boolean) =>
     invoke<void>("damiao_send_target", { motorId, target, repeat }),
   damiaoStopStream: (motorId: number) =>

@@ -129,6 +129,92 @@ cd src-tauri && cargo run
 (Repeat `npm run build` after frontend changes, since `cargo run` embeds the
 built `dist/` rather than talking to the Vite dev server.)
 
+### DAMIAO standalone app: CAN bitrate
+
+The DM-J4310-2EC app reads and writes the `can_br` register (`0x23`) using
+the DM-J4310-2EC V1.1 manual V1.3 (2026-09-14) and the DM-J3507-2EC manual
+V1.1 (2026-04-13). Supported rates are 125/200/250/500 Kbit/s and
+1/2/2.5/3.2/4/5 Mbit/s. Rates above 1 Mbit/s use CAN FD feedback.
+
+1. Connect the target motor on its own, attach it, and click **Read bitrate**.
+2. Select a new rate and click **Disable & change bitrate**. The app stops
+   periodic targets, requires disabled feedback, then checks the write reply
+   at the old rate. Missing replies leave the result explicitly uncertain.
+3. Disconnect CAN, configure the host for the selected rate, and reconnect.
+   For direct `gs_usb` connections, use the motor bitrate selector in the
+   connection bar. SocketCAN uses the system's existing interface timing.
+4. Attach and read again to verify communication. Click **Disable & save all
+   parameters** if the new rate should survive power loss. This saves all
+   current drive parameters, including the runtime control mode.
+
+For example, to configure Linux `can0` for a motor changed to 500 Kbit/s:
+
+```bash
+sudo ip link set dev can0 down
+sudo ip link set dev can0 type can bitrate 500000 fd off
+sudo ip link set dev can0 up
+```
+
+The app's FD adapter profiles use 1 Mbit/s arbitration and the selected data
+rate. The manuals omit separate arbitration/BRS timing, so verify feedback
+at the new rate before saving. A changed or uncertain rate blocks motor
+commands and discovery until the CAN connection is reopened.
+
+A SocketCAN probe uses the same motor transactions as the app. It disables
+the motor when attaching. Substitute the motor and feedback IDs for your unit:
+
+```bash
+cd src-tauri
+cargo run --example damiao_bitrate_probe -- can0 3 0x23 get
+cargo run --example damiao_bitrate_probe -- can0 3 0x23 set 500000
+```
+
+### DAMIAO standalone app: position zero
+
+Attach the motor and wait for live feedback. Place the output shaft at the
+desired physical reference, then use **Position zero → Set current position
+as zero** and confirm the displayed motor/position. The app stops periodic
+targets, confirms disabled and stationary feedback, and sends the motor's
+documented zero-save command (`FF FF FF FF FF FF FF FE`) to its base CAN ID.
+For motor ID 3 the raw frame is `003#FFFFFFFFFFFFFFFE`.
+
+Success requires fresh disabled feedback and float `p_m` within 0.002 rad of zero; the app
+shows the measured result and keeps the drive disabled. Old motion targets
+and chart history are cleared because their position reference has changed.
+There is no additional save-all-parameters command. If confirmation times
+out, the zero may already have changed: inspect actual feedback before trying
+again. A shaft still moving after disable is rejected before the zero command.
+
+### DAMIAO standalone app: measured output angle
+
+Attaching reads the motor's PMAX, VMAX, and TMAX registers before decoding
+feedback or sending targets. Mapping fields show the values read from the
+motor; they do not change its parameters. These are protocol scales, separate
+from the physical speed and torque limits applied to motion commands.
+
+**Output-shaft single-turn angle** uses float `xout` (0x51), normalized to
+[-π, π) radians / [-180°, 180°) relative to the current zero. The unmodified
+`xout` is also displayed as **Output-shaft cumulative position**.
+**Control position** is the float `p_m` register
+(0x50), which refers the rotor position to the output shaft. Motion targets
+use this control coordinate. Numeric displays, charts, and zero previews all
+use these float positions. The 16-bit feedback position is diagnostic data
+only: a can0 read at `p_m ≈ -17.622 rad` returned `+7.378 rad` through that
+field, confirming a 25 rad wrap at PMAX=12.5. It must not replace a cumulative
+position or verify zero by itself. Position
+registers are read at 5 Hz, independent of the UI polling rate. Missing or
+stale encoder readings show a gap instead of retaining an old angle.
+
+A SocketCAN probe exercises the app's mapping and position reader:
+
+```sh
+cd src-tauri
+cargo run --example damiao_position_probe -- can0 3 0x23
+```
+
+The probe disables the addressed motor and prints ten measured snapshots;
+it does not enable motion, change the zero point, or write drive parameters.
+
 ### Laggy on Linux? Use a Wayland session
 
 If the UI feels sluggish on Linux — especially when the window is large, with

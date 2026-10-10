@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -22,8 +22,24 @@ const ENABLE_COMMAND: u8 = 0xFC;
 const DISABLE_COMMAND: u8 = 0xFD;
 const SET_ZERO_COMMAND: u8 = 0xFE;
 const CLEAR_FAULT_COMMAND: u8 = 0xFB;
+const READ_PARAMETER_COMMAND: u8 = 0x33;
 const WRITE_PARAMETER_COMMAND: u8 = 0x55;
+const SAVE_PARAMETERS_COMMAND: u8 = 0xAA;
 const CONTROL_MODE_REGISTER: u8 = 0x0A;
+const CAN_BITRATE_REGISTER: u8 = 0x23;
+const POSITION_MAPPING_REGISTER: u8 = 0x15;
+const VELOCITY_MAPPING_REGISTER: u8 = 0x16;
+const TORQUE_MAPPING_REGISTER: u8 = 0x17;
+const PRECISE_POSITION_REGISTER: u8 = 0x50;
+const OUTPUT_POSITION_REGISTER: u8 = 0x51;
+const POSITION_READ_PERIOD: Duration = Duration::from_millis(200);
+const POSITION_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const PARAMETER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(800);
+const PARAMETER_SAVE_SETTLE: Duration = Duration::from_millis(30);
+const DOCUMENTED_BITRATES: [u32; 10] = [
+    125_000, 200_000, 250_000, 500_000, 1_000_000, 2_000_000, 2_500_000, 3_200_000, 4_000_000,
+    5_000_000,
+];
 
 const FEEDBACK_FRESH_FOR: Duration = Duration::from_millis(750);
 const DISCOVERY_FRESH_FOR: Duration = Duration::from_millis(2500);
@@ -35,17 +51,56 @@ const STATUS_REQUEST_PERIOD: Duration = Duration::from_millis(100);
 const TARGET_STREAM_PERIOD: Duration = Duration::from_millis(20);
 const MODE_SWITCH_SETTLE: Duration = Duration::from_millis(100);
 const FEEDBACK_RATE_WINDOW: Duration = Duration::from_millis(500);
+#[cfg(test)]
 const DM_J4310_MAPPING_P_MAX_RAD: f32 = 12.5;
+#[cfg(test)]
 const DM_J4310_MAPPING_V_MAX_RAD_S: f32 = 30.0;
+#[cfg(test)]
 const DM_J4310_MAPPING_T_MAX_NM: f32 = 10.0;
 const DM_J4310_PEAK_TORQUE_NM: f32 = 7.0;
 const DM_J4310_MAX_SPEED_RAD_S: f32 = 200.0 * std::f32::consts::TAU / 60.0;
+// Allow a few feedback quantization counts (16-bit position, 12-bit speed)
+// when checking a stationary shaft and the drive's newly saved zero point.
+const ZERO_POSITION_TOLERANCE_RAD: f32 = 0.002;
+const ZERO_VELOCITY_TOLERANCE_RAD_S: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DamiaoMode {
     Mit,
     PositionVelocity,
     Velocity,
+}
+
+/// A value of the volatile CAN bitrate register; `acknowledged` distinguishes
+/// a confirmed value from an uncertain write. Rates above
+/// 1 Mbps select CAN FD feedback; the host interface must be configured and
+/// reopened separately before further motor commands can be sent.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DamiaoBitrateState {
+    pub motor_id: u16,
+    pub bitrate: u32,
+    pub register_code: u32,
+    pub can_fd: bool,
+    pub acknowledged: bool,
+    pub requires_reconnect: bool,
+}
+
+impl DamiaoBitrateState {
+    fn confirmed(motor_id: u16, register_code: u32, requires_reconnect: bool) -> Result<Self> {
+        let bitrate = *DOCUMENTED_BITRATES
+            .get(register_code as usize)
+            .ok_or_else(|| {
+                anyhow!("DAMIAO reported unsupported CAN bitrate code {register_code}")
+            })?;
+        Ok(Self {
+            motor_id,
+            bitrate,
+            register_code,
+            can_fd: bitrate > 1_000_000,
+            acknowledged: true,
+            requires_reconnect,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -91,19 +146,12 @@ impl DamiaoConfig {
             ("VMAX", self.v_max),
             ("TMAX", self.t_max),
         ] {
-            if !value.is_finite() || value <= 0.0 {
+            if !value.is_finite() || value <= 0.0 || !(value * 2.0).is_finite() {
                 bail!("{name} must be a finite positive number");
             }
         }
-        for (name, value, maximum) in [
-            ("PMAX", self.p_max, DM_J4310_MAPPING_P_MAX_RAD),
-            ("VMAX", self.v_max, DM_J4310_MAPPING_V_MAX_RAD_S),
-            ("TMAX", self.t_max, DM_J4310_MAPPING_T_MAX_NM),
-        ] {
-            if value > maximum {
-                bail!("{name} exceeds the DM-J4310-2EC V1.1 supported mapping maximum {maximum}");
-            }
-        }
+        // PMAX / VMAX / TMAX are configurable protocol scales, not the
+        // drive's mechanical limits. The actual scales are read at attach.
         Ok(self)
     }
 }
@@ -142,9 +190,21 @@ pub struct DamiaoState {
     pub online: bool,
     pub enabled: bool,
     pub streaming: bool,
+    pub requires_reconnect: bool,
     pub status_code: u8,
     pub status: String,
+    /// Authoritative control coordinate from float p_m (0x50). This can
+    /// exceed PMAX, unlike the cyclic 16-bit feedback representation.
     pub position_rad: Option<f32>,
+    /// Decoded 16-bit feedback position, retained only for diagnostics.
+    pub feedback_position_rad: Option<f32>,
+    /// Float p_m (0x50): rotor position referred to the output shaft.
+    pub precise_position_rad: Option<f32>,
+    /// Float xout (0x51): measured by the output-shaft encoder itself.
+    pub output_position_rad: Option<f32>,
+    pub position_read_age_ms: Option<u64>,
+    pub position_read_count: u64,
+    pub position_read_error: Option<String>,
     pub velocity_rad_s: Option<f32>,
     pub torque_nm: Option<f32>,
     pub mos_temp_c: Option<u8>,
@@ -171,9 +231,16 @@ impl DamiaoState {
             online: false,
             enabled: false,
             streaming: false,
+            requires_reconnect: false,
             status_code: 0,
             status: "waiting for feedback".into(),
             position_rad: None,
+            feedback_position_rad: None,
+            precise_position_rad: None,
+            output_position_rad: None,
+            position_read_age_ms: None,
+            position_read_count: 0,
+            position_read_error: None,
             velocity_rad_s: None,
             torque_nm: None,
             mos_temp_c: None,
@@ -290,6 +357,19 @@ impl DamiaoDiscovery {
             task.abort();
         }
     }
+
+    /// Await cancellation before a bus timing transaction: an in-progress
+    /// scan must not enqueue another old-rate frame after the register write.
+    pub async fn stop_and_wait(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let tasks: Vec<_> = self.tasks.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 async fn discovery_receive_loop(
@@ -300,7 +380,7 @@ async fn discovery_receive_loop(
     while running.load(Ordering::Acquire) {
         match rx.recv().await {
             Ok(frame) => {
-                if frame.kind() != FrameKind::Data
+                if !is_data_frame(&frame)
                     || frame.data().len() != 8
                     || frame.id() == CanId::Standard(STATUS_REQUEST_ID)
                 {
@@ -435,22 +515,34 @@ fn feedback_identity(data: &[u8]) -> Option<(u16, u8)> {
         return None;
     }
     let status_code = data[0] >> 4;
-    if !matches!(status_code, 0x0 | 0x1 | 0x8..=0xE) {
+    if !valid_status_code(status_code) {
         return None;
     }
     Some((u16::from(data[0] & 0x0F), status_code))
 }
 
 fn is_parameter_reply_for(motor_id: u16, data: &[u8]) -> bool {
-    data.len() == 8
+    data.len() >= 4
         && data[0] == motor_id as u8
         && data[1] == (motor_id >> 8) as u8
-        && matches!(data[2], 0x33 | WRITE_PARAMETER_COMMAND)
+        && matches!(
+            data[2],
+            READ_PARAMETER_COMMAND | WRITE_PARAMETER_COMMAND | SAVE_PARAMETERS_COMMAND
+        )
+}
+
+fn is_data_frame(frame: &CanFrame) -> bool {
+    matches!(frame.kind(), FrameKind::Data | FrameKind::Fd { .. })
+}
+
+fn valid_status_code(code: u8) -> bool {
+    matches!(code, 0x0 | 0x1 | 0x3..=0x5 | 0x8..=0xE)
 }
 
 struct SharedState {
     view: DamiaoState,
     last_feedback: Option<Instant>,
+    last_position_read: Option<Instant>,
     feedback_rate_window_start: Option<Instant>,
     feedback_rate_intervals: u32,
     feedback_rate_hz: Option<f32>,
@@ -466,6 +558,9 @@ pub struct DamiaoSession {
     /// stream loop acquires this before reading its target, so a mode switch
     /// cannot leak one last target encoded with the previous mode.
     control_gate: Arc<AsyncMutex<()>>,
+    /// Once a write may have changed the motor's timing, sending at the old
+    /// host rate is unsafe. A new session on a reconfigured bus clears this.
+    bitrate_requires_reconnect: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
@@ -484,6 +579,7 @@ impl DamiaoSession {
         let state = Arc::new(StdMutex::new(SharedState {
             view: DamiaoState::attached(config),
             last_feedback: None,
+            last_position_read: None,
             feedback_rate_window_start: None,
             feedback_rate_intervals: 0,
             feedback_rate_hz: None,
@@ -491,6 +587,7 @@ impl DamiaoSession {
         let config = Arc::new(StdMutex::new(config));
         let stream_target = Arc::new(StdMutex::new(None));
         let control_gate = Arc::new(AsyncMutex::new(()));
+        let bitrate_requires_reconnect = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
         let session = Arc::new(Self {
@@ -499,21 +596,31 @@ impl DamiaoSession {
             state: state.clone(),
             stream_target: stream_target.clone(),
             control_gate: control_gate.clone(),
+            bitrate_requires_reconnect: bitrate_requires_reconnect.clone(),
             running: running.clone(),
             tasks: StdMutex::new(Vec::new()),
         });
+
+        // Read the drive's scales before any telemetry is decoded or targets
+        // can be sent. UI defaults must never decide a live motor's units.
+        session.sync_mapping_locked().await.map_err(|error| {
+            anyhow!("read DAMIAO position/velocity/torque mapping before attach: {error}")
+        })?;
 
         let receive_task = tokio::spawn(receive_loop(
             rx,
             config.clone(),
             state.clone(),
             running.clone(),
+            bitrate_requires_reconnect.clone(),
         ));
         let refresh_task = tokio::spawn(refresh_loop(
             bus.clone(),
             config.clone(),
             state.clone(),
             running.clone(),
+            control_gate.clone(),
+            bitrate_requires_reconnect.clone(),
         ));
         let stream_task = tokio::spawn(stream_loop(
             bus,
@@ -523,11 +630,12 @@ impl DamiaoSession {
             control_gate,
             running,
         ));
-        session
-            .tasks
-            .lock()
-            .unwrap()
-            .extend([receive_task, refresh_task, stream_task]);
+        session.tasks.lock().unwrap().extend([
+            receive_task,
+            refresh_task,
+            stream_task,
+            tokio::spawn(position_loop(Arc::downgrade(&session))),
+        ]);
 
         // V1.1 firmware is not guaranteed to implement the later 0x7FF/0xCC
         // status query. A disable command is motion-safe and, on legacy
@@ -545,12 +653,25 @@ impl DamiaoSession {
         let age = shared
             .last_feedback
             .map(|last| now.saturating_duration_since(last));
-        let online = age.is_some_and(|value| value <= FEEDBACK_FRESH_FOR);
+        let online =
+            !self.requires_reconnect() && age.is_some_and(|value| value <= FEEDBACK_FRESH_FOR);
         let feedback_rate_hz = shared.feedback_rate_hz;
         shared.view.feedback_age_ms = age.map(|value| value.as_millis() as u64);
         shared.view.online = online;
         shared.view.feedback_rate_hz = if online { feedback_rate_hz } else { None };
         shared.view.streaming = self.stream_target.lock().unwrap().is_some();
+        shared.view.requires_reconnect = self.requires_reconnect();
+        let position_age = shared
+            .last_position_read
+            .map(|last| now.saturating_duration_since(last));
+        shared.view.position_read_age_ms = position_age.map(|value| value.as_millis() as u64);
+        if self.requires_reconnect()
+            || !position_age.is_some_and(|value| value <= FEEDBACK_FRESH_FOR)
+        {
+            shared.view.position_rad = None;
+            shared.view.precise_position_rad = None;
+            shared.view.output_position_rad = None;
+        }
         shared.view.clone()
     }
 
@@ -560,6 +681,7 @@ impl DamiaoSession {
     }
 
     async fn enable_locked(&self) -> Result<()> {
+        self.ensure_communication_ready()?;
         // The tested DM-J4310 firmware requires the runtime control-mode
         // register to be written before enabling. This is intentionally not
         // saved to flash: every enable transaction establishes the selected
@@ -578,22 +700,99 @@ impl DamiaoSession {
     pub async fn disable(&self) -> Result<()> {
         let _guard = self.control_gate.lock().await;
         self.stream_target.lock().unwrap().take();
+        self.ensure_communication_ready()?;
         self.send_special(DISABLE_COMMAND).await
     }
 
     pub async fn clear_fault(&self) -> Result<()> {
         let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
         self.send_special(CLEAR_FAULT_COMMAND).await
     }
 
-    pub async fn set_zero(&self) -> Result<()> {
+    /// Save the current output-shaft position as the drive's zero point.
+    /// The documented 0xFE command saves the zero itself; it must not be
+    /// followed by a save-all-parameters command or an automatic retry.
+    pub async fn set_zero(&self) -> Result<DamiaoState> {
         let _guard = self.control_gate.lock().await;
-        // DAMIAO requires zero saving while disabled.  Make the safe state an
-        // enforced part of the transaction instead of trusting UI ordering.
+        self.ensure_communication_ready()?;
         self.stream_target.lock().unwrap().take();
-        self.send_special(DISABLE_COMMAND).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.send_special(SET_ZERO_COMMAND).await
+        // Confirm a fresh response to disable instead of assuming that a
+        // successful host transmission or a fixed sleep stopped the motor.
+        let disabled = self.confirm_disabled_locked().await?;
+        if disabled.velocity_rad_s.abs() > ZERO_VELOCITY_TOLERANCE_RAD_S {
+            bail!("DAMIAO output shaft is still moving ({:.3} rad/s); wait until it stops before saving zero. The zero-save command was not sent", disabled.velocity_rad_s);
+        }
+
+        let config = self.current_config();
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        // Discard telemetry already queued before sending 0xFE. Only a new
+        // response can verify the motor's position after the zero command.
+        while rx.try_recv()?.is_some() {}
+        // A zero change invalidates both position-register readings. They
+        // will be refreshed under the new reference after this transaction.
+        {
+            let mut shared = self.state.lock().unwrap();
+            shared.last_position_read = None;
+            shared.view.position_rad = None;
+            shared.view.precise_position_rad = None;
+            shared.view.output_position_rad = None;
+            shared.view.position_read_age_ms = None;
+        }
+        self.send_special_to(config.motor_id, SET_ZERO_COMMAND)
+            .await
+            .map_err(|error| {
+                anyhow!("DAMIAO zero-save transmit failed; the saved zero is uncertain: {error}")
+            })?;
+        let result = tokio::time::timeout(PARAMETER_RESPONSE_TIMEOUT, async {
+            let mut status_requests = tokio::time::interval(STATUS_REQUEST_PERIOD);
+            status_requests.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Give the zero command's own feedback time to arrive before
+            // polling. Refresh is otherwise paused by this control gate.
+            status_requests.tick().await;
+            loop {
+                let received = tokio::select! {
+                    received = rx.recv() => received,
+                    _ = status_requests.tick() => {
+                        self.bus.send(CanFrame::new_data(STATUS_REQUEST_ID, &status_request_payload(config.motor_id))?).await?;
+                        continue;
+                    }
+                };
+                let frame = match received {
+                    Ok(frame) => frame,
+                    Err(CanIoError::Lagged { .. }) => continue,
+                    Err(error) => bail!("receive DAMIAO zero confirmation: {error}"),
+                };
+                let Some((can_id, feedback)) = matching_feedback(config, feedback_can_id, &frame)?
+                else {
+                    continue;
+                };
+                if feedback.status_code == 0
+                    && feedback.position_rad.abs() <= ZERO_POSITION_TOLERANCE_RAD
+                    && feedback.velocity_rad_s.abs() <= ZERO_VELOCITY_TOLERANCE_RAD_S
+                {
+                    // The 16-bit field can alias -25 rad (or any multiple
+                    // of 2*PMAX) to zero. Confirm the actual float position.
+                    let positions = self.read_positions_locked().await?;
+                    if positions.position_rad.is_some_and(|position| {
+                        position.abs() <= ZERO_POSITION_TOLERANCE_RAD
+                    }) {
+                        return Ok(self.store_confirmed_feedback(can_id, feedback));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("no disabled, stationary near-zero feedback within {} ms", PARAMETER_RESPONSE_TIMEOUT.as_millis()))
+        .and_then(|result| result);
+        match result {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                let error = anyhow!("DAMIAO zero-save command was sent, but the new zero was not confirmed; the saved zero is uncertain. Check actual feedback before retrying: {error}");
+                self.state.lock().unwrap().view.last_error = Some(error.to_string());
+                Err(error)
+            }
+        }
     }
 
     /// Change the volatile 0x0A control-mode register without detaching the
@@ -602,6 +801,7 @@ impl DamiaoSession {
     /// mode has been written; otherwise the motor remains disabled.
     pub async fn switch_mode(&self, mode: DamiaoMode) -> Result<DamiaoState> {
         let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
         let current = self.current_config();
         if current.mode == mode {
             return Ok(self.snapshot());
@@ -632,6 +832,7 @@ impl DamiaoSession {
 
     pub async fn send_target(&self, target: DamiaoTarget, repeat: bool) -> Result<()> {
         let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
         let config = self.current_config();
         let frame = build_target_frame(config, target)?;
         self.bus.send(frame).await.map_err(|error| anyhow!(error))?;
@@ -653,9 +854,321 @@ impl DamiaoSession {
     pub async fn shutdown(&self) -> Result<()> {
         let _guard = self.control_gate.lock().await;
         self.stream_target.lock().unwrap().take();
+        if self.requires_reconnect() {
+            // A confirmed disable precedes every bitrate write. Teardown
+            // must not send another frame through the host's stale timing.
+            self.force_stop();
+            return Ok(());
+        }
         self.send_special(DISABLE_COMMAND).await?;
         self.force_stop();
         Ok(())
+    }
+
+    pub fn requires_reconnect(&self) -> bool {
+        self.bitrate_requires_reconnect.load(Ordering::Acquire)
+    }
+
+    fn ensure_communication_ready(&self) -> Result<()> {
+        if self.requires_reconnect() {
+            bail!("DAMIAO CAN bitrate changed or is uncertain; reconfigure the host CAN interface and reconnect before sending commands");
+        }
+        Ok(())
+    }
+
+    async fn read_parameter_locked(&self, register: u8) -> Result<[u8; 4]> {
+        let config = self.current_config();
+        let request = [
+            config.motor_id as u8,
+            (config.motor_id >> 8) as u8,
+            READ_PARAMETER_COMMAND,
+            register,
+        ];
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        self.bus
+            .send(CanFrame::new_data(STATUS_REQUEST_ID, &request)?)
+            .await?;
+        let reply = wait_parameter_reply(
+            &mut *rx,
+            feedback_can_id,
+            config.motor_id,
+            READ_PARAMETER_COMMAND,
+            register,
+            None,
+        )
+        .await?;
+        if let CanId::Standard(id) = reply.id() {
+            self.state.lock().unwrap().view.feedback_can_id = Some(id);
+        }
+        Ok(reply.data()[4..8].try_into().unwrap())
+    }
+
+    async fn sync_mapping_locked(&self) -> Result<()> {
+        let p_max = f32::from_le_bytes(
+            self.read_parameter_locked(POSITION_MAPPING_REGISTER)
+                .await?,
+        );
+        let v_max = f32::from_le_bytes(
+            self.read_parameter_locked(VELOCITY_MAPPING_REGISTER)
+                .await?,
+        );
+        let t_max = f32::from_le_bytes(self.read_parameter_locked(TORQUE_MAPPING_REGISTER).await?);
+        let config = DamiaoConfig {
+            p_max,
+            v_max,
+            t_max,
+            ..self.current_config()
+        }
+        .validate()?;
+        *self.config.lock().unwrap() = config;
+        let mut shared = self.state.lock().unwrap();
+        shared.view.p_max = p_max;
+        shared.view.v_max = v_max;
+        shared.view.t_max = t_max;
+        Ok(())
+    }
+
+    /// Query both float position registers without changing motor parameters.
+    /// Read-only polling is bounded so a missing encoder reply cannot hold
+    /// motion/disable operations behind the gate for a full parameter timeout.
+    pub async fn read_positions(&self) -> Result<DamiaoState> {
+        let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
+        self.read_positions_locked().await
+    }
+
+    async fn read_positions_locked(&self) -> Result<DamiaoState> {
+        let result = tokio::time::timeout(POSITION_READ_TIMEOUT, async {
+            let position = f32::from_le_bytes(
+                self.read_parameter_locked(PRECISE_POSITION_REGISTER)
+                    .await?,
+            );
+            let output =
+                f32::from_le_bytes(self.read_parameter_locked(OUTPUT_POSITION_REGISTER).await?);
+            ensure_finite("DAMIAO p_m position", position)?;
+            ensure_finite("DAMIAO xout output-encoder angle", output)?;
+            let mut shared = self.state.lock().unwrap();
+            shared.view.position_rad = Some(position);
+            shared.view.precise_position_rad = Some(position);
+            shared.view.output_position_rad = Some(output);
+            shared.view.position_read_count = shared.view.position_read_count.saturating_add(1);
+            shared.view.position_read_age_ms = Some(0);
+            shared.view.position_read_error = None;
+            shared.last_position_read = Some(Instant::now());
+            Ok::<_, anyhow::Error>(shared.view.clone())
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "DAMIAO position-register read timed out after {} ms",
+                POSITION_READ_TIMEOUT.as_millis()
+            )
+        })
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            let mut shared = self.state.lock().unwrap();
+            shared.view.position_rad = None;
+            shared.view.precise_position_rad = None;
+            shared.view.output_position_rad = None;
+            shared.view.position_read_error = Some(error.to_string());
+        }
+        result
+    }
+
+    /// Read can_br (RID 0x23); accepting the host transmit alone never counts
+    /// as success. The response must come from this motor's feedback CAN ID.
+    pub async fn get_bitrate(&self) -> Result<DamiaoBitrateState> {
+        let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
+        self.read_bitrate_locked().await
+    }
+
+    async fn read_bitrate_locked(&self) -> Result<DamiaoBitrateState> {
+        let config = self.current_config();
+        let command = [
+            config.motor_id as u8,
+            (config.motor_id >> 8) as u8,
+            READ_PARAMETER_COMMAND,
+            CAN_BITRATE_REGISTER,
+        ];
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        let frame = CanFrame::new_data(STATUS_REQUEST_ID, &command)?;
+        self.bus.send(frame).await?;
+        let reply = wait_parameter_reply(
+            &mut *rx,
+            feedback_can_id,
+            config.motor_id,
+            READ_PARAMETER_COMMAND,
+            CAN_BITRATE_REGISTER,
+            None,
+        )
+        .await?;
+        if let CanId::Standard(id) = reply.id() {
+            self.state.lock().unwrap().view.feedback_can_id = Some(id);
+        }
+        let code = u32::from_le_bytes(reply.data()[4..8].try_into().unwrap());
+        DamiaoBitrateState::confirmed(config.motor_id, code, false)
+    }
+
+    /// The drive acknowledges at the old bitrate, then changes timing
+    /// immediately. This writes the volatile register only; saving to flash
+    /// is an explicit separate operation after reconnecting at the new rate.
+    pub async fn set_bitrate(&self, bitrate: u32) -> Result<DamiaoBitrateState> {
+        let register_code = DOCUMENTED_BITRATES
+            .iter()
+            .position(|value| *value == bitrate)
+            .ok_or_else(|| anyhow!("unsupported DAMIAO CAN bitrate {bitrate}"))?
+            as u32;
+        let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
+        let previous = self.read_bitrate_locked().await?;
+        if previous.register_code == register_code {
+            return Ok(previous);
+        }
+
+        self.stream_target.lock().unwrap().take();
+        self.confirm_disabled_locked().await?;
+        let config = self.current_config();
+        let payload = parameter_write_payload(config.motor_id, CAN_BITRATE_REGISTER, register_code);
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        let frame = CanFrame::new_data(STATUS_REQUEST_ID, &payload)?;
+
+        // Even a lost acknowledgement can leave the motor at the new rate.
+        // Set this before transmitting and retain it on every later error.
+        self.bitrate_requires_reconnect
+            .store(true, Ordering::Release);
+        let result = async {
+            self.bus.send(frame).await?;
+            wait_parameter_reply(
+                &mut *rx,
+                feedback_can_id,
+                config.motor_id,
+                WRITE_PARAMETER_COMMAND,
+                CAN_BITRATE_REGISTER,
+                Some(register_code),
+            )
+            .await?;
+            DamiaoBitrateState::confirmed(config.motor_id, register_code, true)
+        }
+        .await;
+        let mut shared = self.state.lock().unwrap();
+        shared.view.enabled = false;
+        shared.view.online = false;
+        shared.view.last_error = Some(match &result {
+            Ok(_) => format!(
+                "Motor CAN bitrate changed to {bitrate} bit/s; reconfigure the host CAN interface and reconnect"
+            ),
+            Err(error) => format!(
+                "CAN bitrate write to {bitrate} bit/s was not confirmed; motor bitrate is uncertain. Reconnect at the old or requested rate: {error}"
+            ),
+        });
+        // A write may have reached the motor even if the transport or reply
+        // failed. Report uncertainty explicitly so the frontend cannot treat
+        // this as a harmless, retryable validation error.
+        let mut outcome = DamiaoBitrateState::confirmed(config.motor_id, register_code, true)?;
+        outcome.acknowledged = result.is_ok();
+        Ok(outcome)
+    }
+
+    /// Saves all current drive parameters, including can_br, to flash. The
+    /// manual specifies disabled-only storage and a maximum 30 ms write;
+    /// the matched storage acknowledgement is required before returning.
+    pub async fn save_parameters(&self) -> Result<()> {
+        let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
+        self.read_bitrate_locked().await?;
+        self.stream_target.lock().unwrap().take();
+        self.confirm_disabled_locked().await?;
+        let config = self.current_config();
+        let command = [
+            config.motor_id as u8,
+            (config.motor_id >> 8) as u8,
+            SAVE_PARAMETERS_COMMAND,
+            1,
+        ];
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        self.bus
+            .send(CanFrame::new_data(STATUS_REQUEST_ID, &command)?)
+            .await?;
+        wait_parameter_reply(
+            &mut *rx,
+            feedback_can_id,
+            config.motor_id,
+            SAVE_PARAMETERS_COMMAND,
+            1,
+            None,
+        )
+        .await?;
+        // Keep refresh/target sends behind the control gate for the manual's
+        // maximum flash-write interval even if firmware acknowledges early.
+        tokio::time::sleep(PARAMETER_SAVE_SETTLE).await;
+        Ok(())
+    }
+
+    async fn parameter_subscription(&self) -> Result<(Option<u16>, Box<dyn can_transport::CanRx>)> {
+        // The configured Master ID can be stale. Once real telemetry or a
+        // parameter reply reveals it, all later replies must match that ID.
+        let observed_id = self.state.lock().unwrap().view.feedback_can_id;
+        if observed_id == Some(STATUS_REQUEST_ID) {
+            bail!("DAMIAO Master ID 0x7FF conflicts with parameter requests; configure a different Master ID");
+        }
+        let filter =
+            observed_id.map_or_else(CanFilter::pass_all_standard, CanFilter::exact_standard);
+        let rx = self
+            .bus
+            .subscribe(filter)
+            .await
+            .map_err(|error| anyhow!("subscribe DAMIAO parameter replies: {error}"))?;
+        Ok((observed_id, rx))
+    }
+
+    async fn confirm_disabled_locked(&self) -> Result<Feedback> {
+        let config = self.current_config();
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        self.send_special(DISABLE_COMMAND).await?;
+        tokio::time::timeout(PARAMETER_RESPONSE_TIMEOUT, async {
+            loop {
+                let frame = match rx.recv().await {
+                    Ok(frame) => frame,
+                    Err(CanIoError::Lagged { .. }) => continue,
+                    Err(error) => bail!("receive DAMIAO disable confirmation: {error}"),
+                };
+                let Some((can_id, feedback)) = matching_feedback(config, feedback_can_id, &frame)?
+                else {
+                    continue;
+                };
+                if feedback.status_code == 0 {
+                    self.store_confirmed_feedback(can_id, feedback);
+                    return Ok(feedback);
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "DAMIAO disable was not confirmed within {} ms; parameters were not modified",
+                PARAMETER_RESPONSE_TIMEOUT.as_millis()
+            )
+        })?
+    }
+
+    fn store_confirmed_feedback(&self, can_id: u16, feedback: Feedback) -> DamiaoState {
+        let streaming = self.stream_target.lock().unwrap().is_some();
+        let requires_reconnect = self.requires_reconnect();
+        let mut shared = self.state.lock().unwrap();
+        apply_feedback(&mut shared.view, can_id, feedback);
+        // The normal receive loop owns rx_count and rate measurement. This
+        // independent transaction subscription still provides measured data
+        // immediately, even before that task processes its copy of the frame.
+        shared.last_feedback = Some(Instant::now());
+        shared.view.feedback_age_ms = Some(0);
+        shared.view.online = !requires_reconnect;
+        shared.view.streaming = streaming;
+        shared.view.requires_reconnect = requires_reconnect;
+        shared.view.feedback_rate_hz = shared.feedback_rate_hz;
+        // Return this exact measured frame while still holding the state
+        // lock; the primary receiver may be processing older queued frames.
+        shared.view.clone()
     }
 
     /// Last-resort local teardown for process exit after the disable frame
@@ -695,16 +1208,39 @@ impl DamiaoSession {
     }
 }
 
+async fn position_loop(session: Weak<DamiaoSession>) {
+    let mut ticker = tokio::time::interval(POSITION_READ_PERIOD);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let Some(session) = session.upgrade() else {
+            break;
+        };
+        if !session.running.load(Ordering::Acquire) {
+            break;
+        }
+        if !session.requires_reconnect() {
+            // A failed read clears the values and records a separate error;
+            // ordinary control feedback remains independently usable.
+            let _ = session.read_positions().await;
+        }
+    }
+}
+
 async fn receive_loop(
     mut rx: Box<dyn can_transport::CanRx>,
     config: Arc<StdMutex<DamiaoConfig>>,
     state: Arc<StdMutex<SharedState>>,
     running: Arc<AtomicBool>,
+    bitrate_requires_reconnect: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Acquire) {
         match rx.recv().await {
             Ok(frame) => {
-                if frame.kind() != FrameKind::Data || frame.data().len() != 8 {
+                if !is_data_frame(&frame)
+                    || frame.data().len() != 8
+                    || bitrate_requires_reconnect.load(Ordering::Acquire)
+                {
                     continue;
                 }
                 // Never mistake a locally echoed 0x7FF status request for a
@@ -713,27 +1249,21 @@ async fn receive_loop(
                     continue;
                 }
                 let config = *config.lock().unwrap();
-                // A runtime mode-write acknowledgement uses the configured
-                // Master ID but is not a normal 8-byte motor feedback packet.
-                if is_control_mode_parameter_reply(config, frame.data()) {
+                // Parameter replies share the telemetry CAN ID and motor ID
+                // byte, but the following bytes have a different meaning.
+                if is_parameter_reply_for(config.motor_id, frame.data()) {
                     continue;
                 }
                 match decode_feedback(config, frame.data()) {
                     Ok(Some(feedback)) => {
                         let mut shared = state.lock().unwrap();
-                        if let CanId::Standard(id) = frame.id() {
-                            shared.view.feedback_can_id = Some(id);
+                        if bitrate_requires_reconnect.load(Ordering::Acquire) {
+                            continue;
                         }
-                        shared.view.enabled = feedback.status_code == 1;
-                        shared.view.status_code = feedback.status_code;
-                        shared.view.status = status_name(feedback.status_code).into();
-                        shared.view.position_rad = Some(feedback.position_rad);
-                        shared.view.velocity_rad_s = Some(feedback.velocity_rad_s);
-                        shared.view.torque_nm = Some(feedback.torque_nm);
-                        shared.view.mos_temp_c = Some(feedback.mos_temp_c);
-                        shared.view.rotor_temp_c = Some(feedback.rotor_temp_c);
+                        if let CanId::Standard(id) = frame.id() {
+                            apply_feedback(&mut shared.view, id, feedback);
+                        }
                         shared.view.rx_count = shared.view.rx_count.saturating_add(1);
-                        shared.view.last_error = None;
                         record_feedback_timing(&mut shared, Instant::now());
                     }
                     Ok(None) => {}
@@ -765,11 +1295,17 @@ async fn refresh_loop(
     config: Arc<StdMutex<DamiaoConfig>>,
     state: Arc<StdMutex<SharedState>>,
     running: Arc<AtomicBool>,
+    control_gate: Arc<AsyncMutex<()>>,
+    bitrate_requires_reconnect: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(STATUS_REQUEST_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while running.load(Ordering::Acquire) {
         ticker.tick().await;
+        let _guard = control_gate.lock().await;
+        if bitrate_requires_reconnect.load(Ordering::Acquire) {
+            continue;
+        }
         let config = *config.lock().unwrap();
         let payload = status_request_payload(config.motor_id);
         let Ok(frame) = CanFrame::new_data(STATUS_REQUEST_ID, &payload) else {
@@ -892,12 +1428,16 @@ fn control_mode_payload(motor_id: u16, mode: DamiaoMode) -> [u8; 8] {
         DamiaoMode::PositionVelocity => 2,
         DamiaoMode::Velocity => 3,
     };
-    let value = mode_value.to_le_bytes();
+    parameter_write_payload(motor_id, CONTROL_MODE_REGISTER, mode_value)
+}
+
+fn parameter_write_payload(motor_id: u16, register: u8, value: u32) -> [u8; 8] {
+    let value = value.to_le_bytes();
     [
         motor_id as u8,
         (motor_id >> 8) as u8,
         WRITE_PARAMETER_COMMAND,
-        CONTROL_MODE_REGISTER,
+        register,
         value[0],
         value[1],
         value[2],
@@ -905,12 +1445,48 @@ fn control_mode_payload(motor_id: u16, mode: DamiaoMode) -> [u8; 8] {
     ]
 }
 
-fn is_control_mode_parameter_reply(config: DamiaoConfig, data: &[u8]) -> bool {
-    data.len() == 8
-        && data[0] == config.motor_id as u8
-        && data[1] == (config.motor_id >> 8) as u8
-        && matches!(data[2], 0x33 | WRITE_PARAMETER_COMMAND)
-        && data[3] == CONTROL_MODE_REGISTER
+async fn wait_parameter_reply(
+    rx: &mut dyn can_transport::CanRx,
+    feedback_can_id: Option<u16>,
+    motor_id: u16,
+    command: u8,
+    register: u8,
+    expected_value: Option<u32>,
+) -> Result<CanFrame> {
+    tokio::time::timeout(PARAMETER_RESPONSE_TIMEOUT, async {
+        loop {
+            let frame = match rx.recv().await {
+                Ok(frame) => frame,
+                Err(CanIoError::Lagged { .. }) => continue,
+                Err(error) => bail!("receive DAMIAO parameter reply: {error}"),
+            };
+            let data = frame.data();
+            if !matches!(frame.id(), CanId::Standard(id)
+                if id != STATUS_REQUEST_ID && feedback_can_id.is_none_or(|expected| expected == id))
+                || !is_data_frame(&frame)
+                || !is_parameter_reply_for(motor_id, data)
+                || data[2] != command
+                || data[3] != register
+            {
+                continue;
+            }
+            if command == SAVE_PARAMETERS_COMMAND {
+                if data.len() == 4 || (data.len() == 8 && data[4..] == [0, 0, 0, 0]) {
+                    return Ok(frame);
+                }
+            } else if data.len() == 8 {
+                let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                if expected_value.is_none_or(|expected| expected == value) {
+                    return Ok(frame);
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!(
+        "DAMIAO command 0x{command:02X}, register 0x{register:02X} was not acknowledged within {} ms",
+        PARAMETER_RESPONSE_TIMEOUT.as_millis()
+    ))?
 }
 
 fn encode_target(config: DamiaoConfig, target: DamiaoTarget) -> Result<[u8; 8]> {
@@ -936,31 +1512,13 @@ fn encode_target(config: DamiaoConfig, target: DamiaoTarget) -> Result<[u8; 8]> 
             if !(-config.p_max..=config.p_max).contains(&position_rad) {
                 bail!("position must be in {}..={}", -config.p_max, config.p_max);
             }
-            // Encode against the model's standard mapping ceilings rather
-            // than a possibly mistyped smaller UI value. A smaller configured
-            // mapping therefore makes a command conservative instead of
-            // turning (for example) 1 Nm into a full-scale 10 Nm request.
-            let position = float_to_uint(
-                position_rad,
-                -DM_J4310_MAPPING_P_MAX_RAD,
-                DM_J4310_MAPPING_P_MAX_RAD,
-                16,
-                "position",
-            )?;
-            let velocity = float_to_uint(
-                velocity_rad_s,
-                -DM_J4310_MAPPING_V_MAX_RAD_S,
-                DM_J4310_MAPPING_V_MAX_RAD_S,
-                12,
-                "velocity",
-            )?;
-            let torque = float_to_uint(
-                torque_nm,
-                -DM_J4310_MAPPING_T_MAX_NM,
-                DM_J4310_MAPPING_T_MAX_NM,
-                12,
-                "torque",
-            )?;
+            // The scales were read from the drive before attaching. Commands
+            // and feedback must use exactly the same mapping in both directions.
+            let position =
+                float_to_uint(position_rad, -config.p_max, config.p_max, 16, "position")?;
+            let velocity =
+                float_to_uint(velocity_rad_s, -config.v_max, config.v_max, 12, "velocity")?;
+            let torque = float_to_uint(torque_nm, -config.t_max, config.t_max, 12, "torque")?;
             let kp = float_to_uint(kp, 0.0, 500.0, 12, "Kp")?;
             let kd = float_to_uint(kd, 0.0, 5.0, 12, "Kd")?;
             Ok([
@@ -1053,7 +1611,7 @@ fn decode_feedback(config: DamiaoConfig, data: &[u8]) -> Result<Option<Feedback>
         return Ok(None);
     }
     let status_code = data[0] >> 4;
-    if !matches!(status_code, 0x0 | 0x1 | 0x8..=0xE) {
+    if !valid_status_code(status_code) {
         bail!("DAMIAO feedback has an invalid status code");
     }
     let position = u16::from_be_bytes([data[1], data[2]]);
@@ -1069,10 +1627,47 @@ fn decode_feedback(config: DamiaoConfig, data: &[u8]) -> Result<Option<Feedback>
     }))
 }
 
+fn matching_feedback(
+    config: DamiaoConfig,
+    feedback_can_id: Option<u16>,
+    frame: &CanFrame,
+) -> Result<Option<(u16, Feedback)>> {
+    let CanId::Standard(can_id) = frame.id() else {
+        return Ok(None);
+    };
+    if can_id == STATUS_REQUEST_ID
+        || feedback_can_id.is_some_and(|expected| expected != can_id)
+        || !is_data_frame(frame)
+        || frame.data().len() != 8
+        || is_parameter_reply_for(config.motor_id, frame.data())
+        // Ignore special-command echoes and unrelated standard CAN payloads.
+        || !valid_status_code(frame.data()[0] >> 4)
+    {
+        return Ok(None);
+    }
+    Ok(decode_feedback(config, frame.data())?.map(|feedback| (can_id, feedback)))
+}
+
+fn apply_feedback(view: &mut DamiaoState, can_id: u16, feedback: Feedback) {
+    view.feedback_can_id = Some(can_id);
+    view.enabled = feedback.status_code == 1;
+    view.status_code = feedback.status_code;
+    view.status = status_name(feedback.status_code).into();
+    view.feedback_position_rad = Some(feedback.position_rad);
+    view.velocity_rad_s = Some(feedback.velocity_rad_s);
+    view.torque_nm = Some(feedback.torque_nm);
+    view.mos_temp_c = Some(feedback.mos_temp_c);
+    view.rotor_temp_c = Some(feedback.rotor_temp_c);
+    view.last_error = None;
+}
+
 fn status_name(code: u8) -> &'static str {
     match code {
         0x0 => "Disabled",
         0x1 => "Enabled",
+        0x3 => "Output-shaft calibration fault",
+        0x4 => "Sensor output fault",
+        0x5 => "Motor encoder calibration fault",
         0x8 => "Over-voltage",
         0x9 => "Under-voltage",
         0xA => "Over-current",
@@ -1086,7 +1681,10 @@ fn status_name(code: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use can_transport::CanCapabilities;
+    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -1120,6 +1718,111 @@ mod tests {
         }
     }
 
+    struct TestRx(mpsc::UnboundedReceiver<CanFrame>);
+
+    #[async_trait::async_trait]
+    impl can_transport::CanRx for TestRx {
+        async fn recv(&mut self) -> std::result::Result<CanFrame, CanIoError> {
+            self.0.recv().await.ok_or(CanIoError::Disconnected)
+        }
+
+        fn try_recv(&mut self) -> std::result::Result<Option<CanFrame>, CanIoError> {
+            match self.0.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(CanIoError::Disconnected),
+            }
+        }
+    }
+
+    /// Each send releases the next batch of simulated motor replies. A new
+    /// subscription only sees future frames, just as on a real CAN bus.
+    #[derive(Default)]
+    struct ScriptedBus {
+        frames: StdMutex<Vec<CanFrame>>,
+        replies: StdMutex<VecDeque<Vec<CanFrame>>>,
+        subscribers: StdMutex<Vec<(CanFilter, mpsc::UnboundedSender<CanFrame>)>>,
+    }
+
+    impl ScriptedBus {
+        fn new(replies: Vec<Vec<CanFrame>>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: StdMutex::new(replies.into()),
+                ..Self::default()
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CanBus for ScriptedBus {
+        async fn send(&self, frame: CanFrame) -> std::result::Result<(), CanIoError> {
+            self.frames.lock().unwrap().push(frame);
+            let replies = self.replies.lock().unwrap().pop_front().unwrap_or_default();
+            let subscribers = self.subscribers.lock().unwrap();
+            for reply in replies {
+                for (filter, sender) in subscribers.iter() {
+                    if filter.matches(&reply) {
+                        let _ = sender.send(reply);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            filter: CanFilter,
+        ) -> std::result::Result<Box<dyn can_transport::CanRx>, CanIoError> {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            self.subscribers.lock().unwrap().push((filter, sender));
+            Ok(Box::new(TestRx(receiver)))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: true,
+                max_dlen: 64,
+            }
+        }
+    }
+
+    fn bitrate_reply(command: u8, code: u32) -> CanFrame {
+        let mut data = parameter_write_payload(1, CAN_BITRATE_REGISTER, code);
+        data[2] = command;
+        CanFrame::new_data(0x23u16, &data).unwrap()
+    }
+
+    fn float_parameter_reply(register: u8, value: f32) -> CanFrame {
+        let mut data = parameter_write_payload(1, register, value.to_bits());
+        data[2] = READ_PARAMETER_COMMAND;
+        CanFrame::new_data(0x23u16, &data).unwrap()
+    }
+
+    fn disabled_reply() -> CanFrame {
+        CanFrame::new_data(0x23u16, &[1, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 25, 26]).unwrap()
+    }
+
+    fn telemetry_reply(status: u8, position_rad: f32, velocity_rad_s: f32) -> CanFrame {
+        let position = float_to_uint(position_rad, -12.5, 12.5, 16, "position").unwrap();
+        let velocity = float_to_uint(velocity_rad_s, -30.0, 30.0, 12, "velocity").unwrap();
+        let torque = float_to_uint(0.0, -10.0, 10.0, 12, "torque").unwrap();
+        let position = position.to_be_bytes();
+        CanFrame::new_data(
+            0x23u16,
+            &[
+                (status << 4) | 1,
+                position[0],
+                position[1],
+                (velocity >> 4) as u8,
+                ((velocity & 0x0F) << 4) as u8 | (torque >> 8) as u8,
+                torque as u8,
+                25,
+                26,
+            ],
+        )
+        .unwrap()
+    }
+
     fn config(mode: DamiaoMode) -> DamiaoConfig {
         DamiaoConfig {
             motor_id: 1,
@@ -1141,6 +1844,7 @@ mod tests {
             state: Arc::new(StdMutex::new(SharedState {
                 view,
                 last_feedback: None,
+                last_position_read: None,
                 feedback_rate_window_start: None,
                 feedback_rate_intervals: 0,
                 feedback_rate_hz: None,
@@ -1153,8 +1857,526 @@ mod tests {
                 kd: 0.0,
             }))),
             control_gate: Arc::new(AsyncMutex::new(())),
+            bitrate_requires_reconnect: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             tasks: StdMutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_mapping_uses_read_only_drive_scales_instead_of_ui_defaults() {
+        let bus = ScriptedBus::new(vec![
+            vec![float_parameter_reply(POSITION_MAPPING_REGISTER, 25.0)],
+            vec![float_parameter_reply(VELOCITY_MAPPING_REGISTER, 50.0)],
+            vec![float_parameter_reply(TORQUE_MAPPING_REGISTER, 20.0)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        session.sync_mapping_locked().await.unwrap();
+        let state = session.snapshot();
+        assert_eq!((state.p_max, state.v_max, state.t_max), (25.0, 50.0, 20.0));
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        for (frame, register) in frames.iter().zip([0x15, 0x16, 0x17]) {
+            assert_eq!(frame.id(), CanId::Standard(STATUS_REQUEST_ID));
+            assert_eq!(frame.data(), [1, 0, READ_PARAMETER_COMMAND, register]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_drive_mapping_cannot_commit_partial_scaling() {
+        let bus = ScriptedBus::new(vec![
+            vec![float_parameter_reply(POSITION_MAPPING_REGISTER, 25.0)],
+            vec![float_parameter_reply(VELOCITY_MAPPING_REGISTER, f32::NAN)],
+            vec![float_parameter_reply(TORQUE_MAPPING_REGISTER, 20.0)],
+        ]);
+        let session = test_session(bus, DamiaoMode::Mit, false);
+        assert!(session.sync_mapping_locked().await.is_err());
+        assert_eq!(session.snapshot().p_max, 12.5);
+        assert_eq!(session.current_config().v_max, 30.0);
+    }
+
+    #[tokio::test]
+    async fn positions_keep_float_control_and_output_encoder_coordinates_distinct() {
+        let bus = ScriptedBus::new(vec![
+            vec![float_parameter_reply(PRECISE_POSITION_REGISTER, 7.344)],
+            vec![
+                float_parameter_reply(POSITION_MAPPING_REGISTER, 12.5),
+                float_parameter_reply(OUTPUT_POSITION_REGISTER, 1.1765633),
+            ],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        let state = session.read_positions().await.unwrap();
+        assert_eq!(state.precise_position_rad, Some(7.344));
+        assert_eq!(state.position_rad, Some(7.344));
+        assert_eq!(state.output_position_rad, Some(1.1765633));
+        assert_eq!(state.position_read_count, 1);
+        assert!(state.position_read_error.is_none());
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(frames[0].data(), [1, 0, READ_PARAMETER_COMMAND, 0x50]);
+        assert_eq!(frames[1].data(), [1, 0, READ_PARAMETER_COMMAND, 0x51]);
+    }
+
+    #[tokio::test]
+    async fn cyclic_feedback_cannot_overwrite_a_multiturn_float_position() {
+        let bus = ScriptedBus::new(vec![
+            vec![float_parameter_reply(
+                PRECISE_POSITION_REGISTER,
+                -17.6222305,
+            )],
+            vec![float_parameter_reply(OUTPUT_POSITION_REGISTER, -17.6239052)],
+        ]);
+        let session = test_session(bus, DamiaoMode::Mit, false);
+        session.read_positions().await.unwrap();
+        // Actual can0 feedback: 03 CB 8D 7F F7 FE 1E 1C. Adapt only
+        // the motor nibble to this fixture's ID; the position is unchanged.
+        let feedback = decode_feedback(
+            config(DamiaoMode::Mit),
+            &[1, 0xCB, 0x8D, 0x7F, 0xF7, 0xFE, 30, 28],
+        )
+        .unwrap()
+        .unwrap();
+        apply_feedback(&mut session.state.lock().unwrap().view, 0x23, feedback);
+        let state = session.snapshot();
+        assert_eq!(state.position_rad, Some(-17.6222305));
+        assert_eq!(state.output_position_rad, Some(-17.6239052));
+        assert!((state.feedback_position_rad.unwrap() - 7.3783093).abs() < 0.001);
+        assert!(
+            (state.feedback_position_rad.unwrap() - state.position_rad.unwrap() - 25.0).abs()
+                < 0.001
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_output_encoder_reply_clears_old_angles_with_bounded_read_time() {
+        let bus = ScriptedBus::new(vec![
+            vec![float_parameter_reply(PRECISE_POSITION_REGISTER, 1.1907268)],
+            vec![],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        session.state.lock().unwrap().view.output_position_rad = Some(0.5);
+        let started = Instant::now();
+        assert!(session.read_positions().await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let state = session.snapshot();
+        assert!(state.output_position_rad.is_none());
+        assert!(state.precise_position_rad.is_none());
+        assert!(state.position_read_error.unwrap().contains("timed out"));
+        assert_eq!(bus.frames.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn old_position_register_values_expire_independently_of_control_feedback() {
+        let session = test_session(ScriptedBus::new(vec![]), DamiaoMode::Mit, false);
+        {
+            let mut shared = session.state.lock().unwrap();
+            shared.last_feedback = Some(Instant::now());
+            shared.last_position_read = Some(Instant::now() - Duration::from_secs(1));
+            shared.view.precise_position_rad = Some(1.2);
+            shared.view.output_position_rad = Some(1.1);
+        }
+        let state = session.snapshot();
+        assert!(state.online);
+        assert!(state.precise_position_rad.is_none());
+        assert!(state.output_position_rad.is_none());
+        assert!(state.position_read_age_ms.unwrap() >= 1000);
+    }
+
+    #[tokio::test]
+    async fn saving_zero_uses_base_motor_id_in_every_mode_and_returns_measured_disabled_state() {
+        for mode in [
+            DamiaoMode::Mit,
+            DamiaoMode::PositionVelocity,
+            DamiaoMode::Velocity,
+        ] {
+            let zero = telemetry_reply(0, 0.0, 0.0);
+            let measured = decode_feedback(config(mode), zero.data()).unwrap().unwrap();
+            let bus = ScriptedBus::new(vec![
+                vec![telemetry_reply(0, 1.2, 0.0)],
+                vec![zero],
+                vec![float_parameter_reply(PRECISE_POSITION_REGISTER, 0.000321)],
+                vec![float_parameter_reply(OUTPUT_POSITION_REGISTER, 0.0001)],
+            ]);
+            let session = test_session(bus.clone(), mode, true);
+            let state = session.set_zero().await.unwrap();
+            assert!(state.online);
+            assert!(!state.enabled && !state.streaming);
+            assert_eq!(state.status, "Disabled");
+            assert_eq!(state.feedback_can_id, Some(0x23));
+            assert_eq!(state.position_rad, Some(0.000321));
+            assert_eq!(state.output_position_rad, Some(0.0001));
+            assert_eq!(state.feedback_position_rad, Some(measured.position_rad));
+            assert_eq!(state.velocity_rad_s, Some(measured.velocity_rad_s));
+            assert_ne!(
+                state.position_rad,
+                Some(0.0),
+                "retain the measured float position, not a synthetic local zero"
+            );
+            let frames = bus.frames.lock().unwrap();
+            assert_eq!(frames.len(), 4);
+            for frame in frames[..2].iter() {
+                assert_eq!(frame.id(), CanId::Standard(1));
+            }
+            assert_eq!(frames[0].data(), special_payload(DISABLE_COMMAND));
+            assert_eq!(frames[1].data(), special_payload(SET_ZERO_COMMAND));
+            assert_eq!(frames[2].data(), [1, 0, READ_PARAMETER_COMMAND, 0x50]);
+            assert_eq!(frames[3].data(), [1, 0, READ_PARAMETER_COMMAND, 0x51]);
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_zero_refuses_a_shaft_still_moving_after_disable() {
+        let bus = ScriptedBus::new(vec![vec![telemetry_reply(0, 1.2, 0.3)]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let error = session.set_zero().await.unwrap_err();
+        assert!(error.to_string().contains("still moving"));
+        assert!(error.to_string().contains("zero-save command was not sent"));
+        assert!(!session.snapshot().streaming);
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data(), special_payload(DISABLE_COMMAND));
+    }
+
+    #[tokio::test]
+    async fn saving_zero_requires_new_disabled_feedback_even_with_a_cached_disabled_zero() {
+        let bus = ScriptedBus::new(vec![vec![]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        {
+            let mut shared = session.state.lock().unwrap();
+            apply_feedback(
+                &mut shared.view,
+                0x23,
+                decode_feedback(config(DamiaoMode::Mit), disabled_reply().data())
+                    .unwrap()
+                    .unwrap(),
+            );
+            shared.last_feedback = Some(Instant::now());
+        }
+        let error = session.set_zero().await.unwrap_err();
+        assert!(error.to_string().contains("disable was not confirmed"));
+        assert!(!session.snapshot().streaming);
+        assert_eq!(bus.frames.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn saving_zero_polls_status_when_the_command_does_not_emit_feedback() {
+        let bus = ScriptedBus::new(vec![
+            vec![telemetry_reply(0, 1.2, 0.0)],
+            vec![],
+            vec![disabled_reply()],
+            vec![float_parameter_reply(PRECISE_POSITION_REGISTER, 0.000321)],
+            vec![float_parameter_reply(OUTPUT_POSITION_REGISTER, 0.0001)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::PositionVelocity, true);
+        let state = session.set_zero().await.unwrap();
+        assert!(state.position_rad.unwrap().abs() <= ZERO_POSITION_TOLERANCE_RAD);
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[1].data(), special_payload(SET_ZERO_COMMAND));
+        assert_eq!(frames[2].id(), CanId::Standard(STATUS_REQUEST_ID));
+        assert_eq!(frames[2].data(), status_request_payload(1));
+    }
+
+    #[tokio::test]
+    async fn wrapped_zero_feedback_is_not_proof_of_a_saved_zero() {
+        let bus = ScriptedBus::new(vec![
+            vec![telemetry_reply(0, 1.2, 0.0)],
+            vec![disabled_reply()],
+            vec![float_parameter_reply(PRECISE_POSITION_REGISTER, -25.0)],
+            vec![float_parameter_reply(OUTPUT_POSITION_REGISTER, -25.0)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        assert!(session
+            .set_zero()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("saved zero is uncertain"));
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.data() == special_payload(SET_ZERO_COMMAND))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_zero_ignores_other_motors_echoes_parameters_motion_and_old_coordinates_without_retrying(
+    ) {
+        let mut other_motor = disabled_reply().data().to_vec();
+        other_motor[0] = 2;
+        let bus = ScriptedBus::new(vec![
+            vec![telemetry_reply(0, 1.2, 0.0)],
+            vec![
+                CanFrame::new_data(0x23u16, &other_motor).unwrap(),
+                CanFrame::new_data(0x24u16, disabled_reply().data()).unwrap(),
+                CanFrame::new_data(STATUS_REQUEST_ID, disabled_reply().data()).unwrap(),
+                CanFrame::new_data(1u16, &special_payload(SET_ZERO_COMMAND)).unwrap(),
+                bitrate_reply(READ_PARAMETER_COMMAND, 4),
+                telemetry_reply(1, 0.0, 0.0),
+                telemetry_reply(0, 1.2, 0.0),
+                telemetry_reply(0, 0.0, 0.3),
+            ],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Velocity, true);
+        let error = session.set_zero().await.unwrap_err();
+        assert!(error.to_string().contains("saved zero is uncertain"));
+        let state = session.snapshot();
+        assert!(!state.streaming && !state.enabled);
+        assert!(
+            state.position_rad.is_none(),
+            "an unconfirmed reference must not display a fabricated coordinate"
+        );
+        assert!(state.feedback_position_rad.unwrap() > 1.0);
+        assert!(state
+            .last_error
+            .unwrap()
+            .contains("saved zero is uncertain"));
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.data() == special_payload(SET_ZERO_COMMAND))
+                .count(),
+            1
+        );
+        assert!(!frames
+            .iter()
+            .any(|frame| frame.data().get(2) == Some(&SAVE_PARAMETERS_COMMAND)));
+    }
+
+    #[test]
+    fn supports_every_documented_classic_and_fd_bitrate_code() {
+        for (code, bitrate) in DOCUMENTED_BITRATES.into_iter().enumerate() {
+            let value = DamiaoBitrateState::confirmed(3, code as u32, false).unwrap();
+            assert_eq!(value.bitrate, bitrate);
+            assert_eq!(value.can_fd, code > 4);
+        }
+        assert!(DamiaoBitrateState::confirmed(3, 10, false).is_err());
+        assert!(DamiaoBitrateState::confirmed(3, u32::MAX, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn discovers_unknown_master_id_and_reads_fd_parameter_reply() {
+        let reply = CanFrame::new_fd(
+            0x23u16,
+            bitrate_reply(READ_PARAMETER_COMMAND, 6).data(),
+            true,
+        )
+        .unwrap();
+        let bus = ScriptedBus::new(vec![vec![reply]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        let value = session.get_bitrate().await.unwrap();
+        assert_eq!(value.bitrate, 2_500_000);
+        assert!(value.can_fd);
+        assert!(value.acknowledged);
+        assert!(!value.requires_reconnect);
+        assert_eq!(session.snapshot().feedback_can_id, Some(0x23));
+        assert_eq!(bus.frames.lock().unwrap()[0].data(), [1, 0, 0x33, 0x23]);
+    }
+
+    #[tokio::test]
+    async fn rejects_echo_and_other_motors_operations_registers_and_values() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let correct = bitrate_reply(WRITE_PARAMETER_COMMAND, 3);
+        let mut wrong_motor = *correct.data().first().unwrap();
+        wrong_motor += 1;
+        let mut wrong_motor_payload = correct.data().to_vec();
+        wrong_motor_payload[0] = wrong_motor;
+        let mut wrong_register_payload = correct.data().to_vec();
+        wrong_register_payload[3] = CONTROL_MODE_REGISTER;
+        for frame in [
+            CanFrame::new_data(STATUS_REQUEST_ID, correct.data()).unwrap(),
+            CanFrame::new_data(0x24u16, correct.data()).unwrap(),
+            CanFrame::new_data(CanId::Extended(0x23), correct.data()).unwrap(),
+            CanFrame::new_data(0x23u16, &wrong_motor_payload).unwrap(),
+            bitrate_reply(READ_PARAMETER_COMMAND, 3),
+            CanFrame::new_data(0x23u16, &wrong_register_payload).unwrap(),
+            bitrate_reply(WRITE_PARAMETER_COMMAND, 4),
+            correct,
+        ] {
+            sender.send(frame).unwrap();
+        }
+        let reply = wait_parameter_reply(
+            &mut TestRx(receiver),
+            Some(0x23),
+            1,
+            WRITE_PARAMETER_COMMAND,
+            CAN_BITRATE_REGISTER,
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, correct);
+    }
+
+    #[tokio::test]
+    async fn setting_the_current_bitrate_only_reads_and_keeps_the_stream() {
+        let bus = ScriptedBus::new(vec![vec![bitrate_reply(READ_PARAMETER_COMMAND, 4)]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let value = session.set_bitrate(1_000_000).await.unwrap();
+        assert!(!value.requires_reconnect);
+        assert!(session.snapshot().streaming);
+        assert!(session.snapshot().enabled);
+        assert_eq!(bus.frames.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bitrate_change_confirms_disabled_writes_once_and_blocks_motion_and_stale_teardown() {
+        let bus = ScriptedBus::new(vec![
+            vec![bitrate_reply(READ_PARAMETER_COMMAND, 4)],
+            vec![disabled_reply()],
+            vec![bitrate_reply(WRITE_PARAMETER_COMMAND, 3)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let value = session.set_bitrate(500_000).await.unwrap();
+        assert!(value.acknowledged && value.requires_reconnect);
+        assert!(session.requires_reconnect());
+        assert!(!session.snapshot().streaming);
+        assert!(!session.snapshot().enabled);
+        assert!(session.snapshot().requires_reconnect);
+        assert!(session.enable().await.is_err());
+        assert!(session
+            .send_target(
+                DamiaoTarget::Mit {
+                    position_rad: 0.0,
+                    velocity_rad_s: 0.0,
+                    torque_nm: 0.0,
+                    kp: 0.0,
+                    kd: 0.0,
+                },
+                true
+            )
+            .await
+            .is_err());
+        session.shutdown().await.unwrap();
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            3,
+            "teardown must not send at the old host rate"
+        );
+        assert_eq!(frames[1].data(), special_payload(DISABLE_COMMAND));
+        assert_eq!(frames[2].data(), [1, 0, 0x55, 0x23, 3, 0, 0, 0]);
+        assert!(!frames
+            .iter()
+            .any(|frame| frame.data().get(2) == Some(&SAVE_PARAMETERS_COMMAND)));
+    }
+
+    #[tokio::test]
+    async fn missing_disable_confirmation_does_not_write_the_bitrate() {
+        let bus = ScriptedBus::new(vec![vec![bitrate_reply(READ_PARAMETER_COMMAND, 4)], vec![]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let error = session.set_bitrate(500_000).await.unwrap_err();
+        assert!(error.to_string().contains("disable was not confirmed"));
+        assert!(!session.requires_reconnect());
+        assert!(!session.snapshot().streaming);
+        assert_eq!(bus.frames.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lost_write_acknowledgement_reports_uncertainty_and_requires_reconnect() {
+        let bus = ScriptedBus::new(vec![
+            vec![bitrate_reply(READ_PARAMETER_COMMAND, 4)],
+            vec![disabled_reply()],
+            vec![bitrate_reply(WRITE_PARAMETER_COMMAND, 4)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        let value = session.set_bitrate(500_000).await.unwrap();
+        assert!(!value.acknowledged);
+        assert!(value.requires_reconnect);
+        assert!(!session.snapshot().online);
+        assert!(session.snapshot().last_error.unwrap().contains("uncertain"));
+        assert!(session.set_bitrate(500_000).await.is_err());
+        assert!(session.save_parameters().await.is_err());
+        session.shutdown().await.unwrap();
+        assert_eq!(bus.frames.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn save_requires_disabled_feedback_and_correlated_storage_acknowledgement() {
+        let bus = ScriptedBus::new(vec![
+            vec![bitrate_reply(READ_PARAMETER_COMMAND, 3)],
+            vec![disabled_reply()],
+            vec![CanFrame::new_data(0x23u16, &[1, 0, 0xAA, 1]).unwrap()],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        session.save_parameters().await.unwrap();
+        assert!(!session.snapshot().streaming);
+        assert!(!session.snapshot().enabled);
+        assert_eq!(bus.frames.lock().unwrap()[2].data(), [1, 0, 0xAA, 1]);
+
+        let bus = ScriptedBus::new(vec![
+            vec![bitrate_reply(READ_PARAMETER_COMMAND, 3)],
+            vec![disabled_reply()],
+            vec![CanFrame::new_data(0x23u16, &[1, 0, 0xAA, 2]).unwrap()],
+        ]);
+        let session = test_session(bus, DamiaoMode::Mit, true);
+        assert!(session
+            .save_parameters()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not acknowledged"));
+    }
+
+    #[tokio::test]
+    async fn parameter_packets_do_not_contaminate_telemetry_or_discovery() {
+        let bus = ScriptedBus::new(vec![vec![
+            bitrate_reply(READ_PARAMETER_COMMAND, 4),
+            bitrate_reply(WRITE_PARAMETER_COMMAND, 3),
+            CanFrame::new_data(0x23u16, &[1, 0, 0xAA, 1, 0, 0, 0, 0]).unwrap(),
+            disabled_reply(),
+        ]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, false);
+        let session_rx = bus.subscribe(CanFilter::pass_all_standard()).await.unwrap();
+        let discovery_rx = bus.subscribe(CanFilter::pass_all_standard()).await.unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let discovery_state = Arc::new(StdMutex::new(DiscoveryState::default()));
+        discovery_state.lock().unwrap().attached.insert(1);
+        let receiver = tokio::spawn(receive_loop(
+            session_rx,
+            session.config.clone(),
+            session.state.clone(),
+            running.clone(),
+            session.bitrate_requires_reconnect.clone(),
+        ));
+        let discovery = tokio::spawn(discovery_receive_loop(
+            discovery_rx,
+            discovery_state.clone(),
+            running,
+        ));
+        bus.send(CanFrame::new_data(1u16, &[0]).unwrap())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(session.snapshot().rx_count, 1);
+        assert_eq!(discovery_state.lock().unwrap().devices[&1].rx_count, 1);
+        receiver.abort();
+        discovery.abort();
+    }
+
+    #[test]
+    fn accepts_documented_j4310_calibration_and_sensor_faults() {
+        for (code, expected) in [
+            (3, "Output-shaft calibration fault"),
+            (4, "Sensor output fault"),
+            (5, "Motor encoder calibration fault"),
+        ] {
+            let mut payload = *disabled_reply().data().first().unwrap();
+            payload |= code << 4;
+            let mut data = disabled_reply().data().to_vec();
+            data[0] = payload;
+            assert_eq!(feedback_identity(&data), Some((1, code)));
+            assert_eq!(
+                decode_feedback(config(DamiaoMode::Mit), &data)
+                    .unwrap()
+                    .unwrap()
+                    .status_code,
+                code
+            );
+            assert_eq!(status_name(code), expected);
         }
     }
 
@@ -1237,11 +2459,8 @@ mod tests {
             control_mode_payload(4, DamiaoMode::PositionVelocity),
             [0x04, 0x00, 0x55, 0x0A, 0x02, 0x00, 0x00, 0x00]
         );
-        assert!(is_control_mode_parameter_reply(
-            DamiaoConfig {
-                motor_id: 4,
-                ..config(DamiaoMode::Velocity)
-            },
+        assert!(is_parameter_reply_for(
+            4,
             &[0x04, 0x00, 0x55, 0x0A, 0x03, 0x00, 0x00, 0x00]
         ));
         assert_eq!(
@@ -1324,11 +2543,11 @@ mod tests {
     }
 
     #[test]
-    fn smaller_declared_mapping_cannot_turn_safe_mit_targets_into_full_scale() {
+    fn mit_targets_use_the_confirmed_drive_mapping_in_both_directions() {
         let small_mapping = DamiaoConfig {
-            p_max: 1.0,
-            v_max: 1.0,
-            t_max: 1.0,
+            p_max: 6.0,
+            v_max: 10.0,
+            t_max: 5.0,
             ..config(DamiaoMode::Mit)
         };
         let bytes = encode_target(
@@ -1349,8 +2568,8 @@ mod tests {
             velocity,
             float_to_uint(
                 1.0,
-                -DM_J4310_MAPPING_V_MAX_RAD_S,
-                DM_J4310_MAPPING_V_MAX_RAD_S,
+                -small_mapping.v_max,
+                small_mapping.v_max,
                 12,
                 "velocity"
             )
@@ -1358,39 +2577,54 @@ mod tests {
         );
         assert_eq!(
             torque,
-            float_to_uint(
-                1.0,
-                -DM_J4310_MAPPING_T_MAX_NM,
-                DM_J4310_MAPPING_T_MAX_NM,
-                12,
-                "torque"
-            )
-            .unwrap()
+            float_to_uint(1.0, -small_mapping.t_max, small_mapping.t_max, 12, "torque").unwrap()
         );
         assert_ne!(velocity, 0x0FFF);
         assert_ne!(torque, 0x0FFF);
+        let feedback = [
+            1,
+            bytes[0],
+            bytes[1],
+            (velocity >> 4) as u8,
+            ((velocity & 0x0F) << 4) as u8 | (torque >> 8) as u8,
+            torque as u8,
+            25,
+            26,
+        ];
+        let decoded = decode_feedback(small_mapping, &feedback).unwrap().unwrap();
+        assert!((decoded.position_rad - 1.0).abs() < 0.001);
+        assert!((decoded.velocity_rad_s - 1.0).abs() < 0.01);
+        assert!((decoded.torque_nm - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn rejects_mapping_values_above_the_supported_model_ranges() {
+    fn configurable_mapping_ranges_allow_larger_than_default_scales() {
         assert!(DamiaoConfig {
             p_max: DM_J4310_MAPPING_P_MAX_RAD + 0.1,
             ..config(DamiaoMode::Mit)
         }
         .validate()
-        .is_err());
+        .is_ok());
         assert!(DamiaoConfig {
             v_max: DM_J4310_MAPPING_V_MAX_RAD_S + 0.1,
             ..config(DamiaoMode::Mit)
         }
         .validate()
-        .is_err());
+        .is_ok());
         assert!(DamiaoConfig {
             t_max: DM_J4310_MAPPING_T_MAX_NM + 0.1,
             ..config(DamiaoMode::Mit)
         }
         .validate()
-        .is_err());
+        .is_ok());
+        for value in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
+            assert!(DamiaoConfig {
+                p_max: value,
+                ..config(DamiaoMode::Mit)
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]

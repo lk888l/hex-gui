@@ -21,8 +21,8 @@ use tauri::State;
 use crate::backend;
 use crate::can_lease::{CanOwner, CanTransportGate};
 use crate::damiao::{
-    DamiaoConfig, DamiaoDiscoveredDevice, DamiaoDiscovery, DamiaoMode, DamiaoSession, DamiaoState,
-    DamiaoTarget,
+    DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoDiscovery, DamiaoMode,
+    DamiaoSession, DamiaoState, DamiaoTarget,
 };
 use crate::diag::{EventsSnapshot, LogLine};
 use crate::dto::{
@@ -217,6 +217,15 @@ async fn damiao_discovery(state: &AppState) -> CmdResult<Arc<DamiaoDiscovery>> {
 }
 
 async fn damiao_discovery_locked(state: &AppState) -> CmdResult<Arc<DamiaoDiscovery>> {
+    if state
+        .damiao
+        .lock()
+        .await
+        .values()
+        .any(|session| session.requires_reconnect())
+    {
+        return Err("DAMIAO bitrate changed or is uncertain; reconnect with matching host timing before scanning".into());
+    }
     let mut guard = state.damiao_discovery.lock().await;
     if let Some(discovery) = guard.as_ref() {
         return Ok(discovery.clone());
@@ -331,6 +340,7 @@ pub async fn connect(
     data_bitrate: u32,
     our_nid: u8,
     broadcast_heartbeat: bool,
+    damiao_bitrate: Option<u32>,
 ) -> CmdResult<ConnectionInfoDto> {
     let mut guard = state.manager.lock().await;
     if guard.is_some() {
@@ -338,9 +348,11 @@ pub async fn connect(
     }
 
     let can_lease = can_gate.try_acquire(CanOwner::Manager)?;
-    let (bus, _hw_ts) = backend::open_bus(&iface, data_bitrate, false, can_lease)
-        .await
-        .map_err(err)?;
+    let (bus, _hw_ts) = match damiao_bitrate {
+        Some(bitrate) => backend::open_damiao_bus(&iface, bitrate, can_lease).await,
+        None => backend::open_bus(&iface, data_bitrate, false, can_lease).await,
+    }
+    .map_err(err)?;
     let backend_name = backend::backend_name(&iface);
     let (link_config, inspection_error) = match bus.link_config().await {
         Ok(config) => (config, None),
@@ -348,7 +360,7 @@ pub async fn connect(
     };
     let opts = Cia402ManagerOptions {
         heartbeat_node_id: our_nid,
-        broadcast_heartbeat,
+        broadcast_heartbeat: broadcast_heartbeat && damiao_bitrate.is_none(),
         // Match the Analyzer SDO tab's proven busy-bus timeout. Normal SDOs
         // still complete immediately; this only widens the failure deadline.
         sdo_timeout: Duration::from_millis(500),
@@ -1416,13 +1428,19 @@ pub async fn get_status(state: State<'_, AppState>, nid: u8) -> CmdResult<LiveSt
 pub async fn damiao_list_devices(
     state: State<'_, AppState>,
 ) -> CmdResult<Vec<DamiaoDiscoveredDevice>> {
-    let discovery = damiao_discovery(&state).await?;
-    let mut devices: BTreeMap<u16, DamiaoDiscoveredDevice> = discovery
-        .snapshot()
+    let _extension_op = state.extension_op.lock().await;
+    let sessions: Vec<Arc<DamiaoSession>> = state.damiao.lock().await.values().cloned().collect();
+    // A bitrate write is acknowledged at the old speed. Keep cached devices
+    // visible while preventing discovery from transmitting at stale timing.
+    let discovered = if sessions.iter().any(|session| session.requires_reconnect()) {
+        Vec::new()
+    } else {
+        damiao_discovery_locked(&state).await?.snapshot()
+    };
+    let mut devices: BTreeMap<u16, DamiaoDiscoveredDevice> = discovered
         .into_iter()
         .map(|device| (device.motor_id, device))
         .collect();
-    let sessions: Vec<Arc<DamiaoSession>> = state.damiao.lock().await.values().cloned().collect();
     for session in sessions {
         let snapshot = session.snapshot();
         devices.insert(
@@ -1457,6 +1475,9 @@ pub async fn damiao_attach(
     mark_extension_runtime_active(&state);
     let bus = feature_bus_locked(&state).await?;
     let mut guard = state.damiao.lock().await;
+    if guard.values().any(|session| session.requires_reconnect()) {
+        return Err("DAMIAO bitrate changed or is uncertain; disconnect and reconnect CAN before attaching another session".into());
+    }
     if guard.contains_key(&config.motor_id) {
         return Err(format!(
             "DAMIAO motor 0x{:X} is already attached",
@@ -1484,7 +1505,11 @@ pub async fn damiao_attach(
 
 #[tauri::command]
 pub async fn damiao_detach(state: State<'_, AppState>, motor_id: u16) -> CmdResult<()> {
+    let _extension_op = state.extension_op.lock().await;
     let session = damiao_session(&state, motor_id).await?;
+    if session.requires_reconnect() {
+        return Err("DAMIAO bitrate changed or is uncertain; disconnect and reconnect CAN instead of detaching the motor".into());
+    }
     session.shutdown().await.map_err(err)?;
     let mut guard = state.damiao.lock().await;
     if guard
@@ -1503,6 +1528,73 @@ pub async fn damiao_detach(state: State<'_, AppState>, motor_id: u16) -> CmdResu
 #[tauri::command]
 pub async fn damiao_get_state(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
     Ok(damiao_session(&state, motor_id).await?.snapshot())
+}
+
+#[tauri::command]
+pub async fn damiao_get_bitrate(
+    state: State<'_, AppState>,
+    motor_id: u16,
+) -> CmdResult<DamiaoBitrateState> {
+    let _extension_op = state.extension_op.lock().await;
+    damiao_session(&state, motor_id)
+        .await?
+        .get_bitrate()
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn damiao_set_bitrate(
+    state: State<'_, AppState>,
+    motor_id: u16,
+    bitrate: u32,
+) -> CmdResult<DamiaoBitrateState> {
+    let _extension_op = state.extension_op.lock().await;
+    let _operation = state.device_settings_operation.acquire().await;
+    let session = damiao_session(&state, motor_id).await?;
+    if state.damiao.lock().await.len() > 1 {
+        return Err(
+            "CAN bitrate changes require a single attached DAMIAO motor; detach other motors first"
+                .into(),
+        );
+    }
+    if state
+        .damiao_discovery
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|discovery| {
+            discovery
+                .snapshot()
+                .iter()
+                .any(|device| device.online && device.motor_id != motor_id)
+        })
+    {
+        return Err("Other DAMIAO motors are online; connect only the motor being configured before changing bitrate".into());
+    }
+    if let Some(discovery) = state.damiao_discovery.lock().await.take() {
+        discovery.stop_and_wait().await;
+    }
+    // Only resume scans after a no-op or a failure known to precede writing.
+    // An uncertain write can already have changed the motor's speed.
+    let result = session.set_bitrate(bitrate).await.map_err(err);
+    if !session.requires_reconnect() {
+        if let Ok(discovery) = damiao_discovery_locked(&state).await {
+            discovery.set_attached(motor_id, true);
+        }
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn damiao_save_parameters(state: State<'_, AppState>, motor_id: u16) -> CmdResult<()> {
+    let _extension_op = state.extension_op.lock().await;
+    let _operation = state.device_settings_operation.acquire().await;
+    damiao_session(&state, motor_id)
+        .await?
+        .save_parameters()
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -1571,7 +1663,9 @@ pub async fn damiao_clear_fault(state: State<'_, AppState>, motor_id: u16) -> Cm
 }
 
 #[tauri::command]
-pub async fn damiao_set_zero(state: State<'_, AppState>, motor_id: u16) -> CmdResult<()> {
+pub async fn damiao_set_zero(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
+    let _extension_op = state.extension_op.lock().await;
+    let _operation = state.device_settings_operation.acquire().await;
     damiao_session(&state, motor_id)
         .await?
         .set_zero()

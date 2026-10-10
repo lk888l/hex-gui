@@ -38,6 +38,7 @@
 }
 
 .damiao-device-list__item.ant-list-item:hover,
+.damiao-device-list__item.ant-list-item:focus-visible,
 .damiao-device-list__item--selected.ant-list-item {
   border-color: rgba(231, 91, 43, 0.62);
   background: rgba(231, 91, 43, 0.1);
@@ -49,6 +50,10 @@
 
 .damiao-device-list__manual {
   margin-top: 8px;
+}
+
+.damiao-discovery-error {
+  margin-bottom: 10px;
 }
 
 .damiao-workspace__detail {
@@ -110,6 +115,68 @@
   margin-top: 8px;
 }
 
+.damiao-bitrate-settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.damiao-bitrate-current {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.damiao-bitrate-current > .ant-typography:nth-child(2) {
+  font-size: 20px;
+}
+
+.damiao-bitrate-actions .ant-select {
+  min-width: 210px;
+}
+
+.damiao-bitrate-hint.ant-typography {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.damiao-bitrate-card .ant-alert {
+  margin-top: 12px;
+}
+
+.damiao-zero-settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.damiao-zero-current {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.damiao-zero-current > .ant-typography:nth-child(2) {
+  font-size: 20px;
+}
+
+.damiao-zero-hint.ant-typography {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.damiao-zero-card .ant-alert {
+  margin-top: 12px;
+}
+
+.damiao-zero-confirm {
+  max-width: min(420px, calc(100vw - 24px));
+}
+
 .damiao-target-editor {
   display: flex;
   flex-direction: column;
@@ -158,5 +225,24 @@
 
   .damiao-telemetry-table .ant-descriptions-item-label {
     width: auto;
+  }
+
+  .damiao-panel .ant-card-head-wrapper {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .damiao-panel .ant-card-extra {
+    margin-inline-start: 0;
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .damiao-panel .ant-card-head-title {
+    white-space: normal;
+  }
+
+  .damiao-bitrate-actions {
+    width: 100%;
   }
 }
