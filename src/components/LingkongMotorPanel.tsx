@@ -6,8 +6,9 @@ import {
 import { api, errMsg } from "../api";
 import { isGsUsbSpec } from "../canProfile";
 import { useI18n } from "../i18n";
-import type { HostCanStatus, LingkongParameterValue, LingkongProbe, LingkongSnapshot } from "../types";
+import type { HostCanStatus, LingkongParameterReadResult, LingkongParameterValue, LingkongProbe, LingkongSnapshot } from "../types";
 import { lingkongParameters, type LingkongParameterDef } from "../lingkongParameters";
+import { lingkongMotorState } from "../lingkongState";
 import "./LingkongMotorPanel.css";
 
 const ERROR_BITS = [
@@ -37,6 +38,7 @@ export function LingkongMotorPanel() {
   const selectedRef = useRef<number | null>(null);
   const [initializedId, setInitializedId] = useState<number | null>(null);
   const [parameters, setParameters] = useState<Record<string, LingkongParameterValue>>({});
+  const [unavailableParameters, setUnavailableParameters] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, number[]>>({});
   const [pendingSave, setPendingSave] = useState(false);
   const [needsReboot, setNeedsReboot] = useState(false);
@@ -48,6 +50,7 @@ export function LingkongMotorPanel() {
   const gsUsb = isGsUsbSpec(spec);
   const ready = !!host?.up && host.bitrate === bitrate && !host.fd_enabled;
   const motorReady = connected && selectedId != null && initializedId === selectedId;
+  const motorState = lingkongMotorState(snapshot?.motor_state);
 
   const copy = zh ? {
     bus: "CAN 接口", inspect: "刷新接口状态", init: "初始化 / 修改 CAN 口",
@@ -72,12 +75,13 @@ export function LingkongMotorPanel() {
     iq: "转矩电流原始值", encoder: "编码器", angle: "多圈角度", state: "电机状态",
     errors: "故障", open: "运行", closed: "关闭", unknownState: "其他状态", none: "无", stale: "状态读取失败",
     socketOnly: "这里的 CAN 口初始化仅适用于 Linux SocketCAN。gs_usb 会在连接时配置为 Classic CAN 1 Mbps。",
-    motorInit: "初始化所选电机", initDone: "电机初始化完成，保持关闭；参数已读取", initRequired: "请先初始化所选电机",
+    motorInit: "初始化所选电机", initDone: "电机初始化完成，保持关闭；可用参数已读取", initRequired: "请先初始化所选电机",
     initFlow: "配置主机 CAN → 连接总线 → 扫描/选择 ID → 初始化电机 → 检查参数 → 运行。初始化会关闭已运行的电机并尝试清除故障；关闭会清除圈数和旧指令，不会自动运行。",
     initState: "初始化状态", initialized: "已初始化（关闭）", notInitialized: "未初始化",
     readParams: "重新读取全部参数", ramParams: "控制参数 · RAM", settingParams: "设定参数 · 保存到 ROM",
     paramNote: "读回后才能编辑。控制参数 0xC1 写入 RAM 后立即生效，断电丢失；设定参数 0x42 暂存后由 0x44 保存到 ROM，重启后新设置生效。写入仅允许电机关闭且无故障。",
     write: "写入并核对", paramCurrent: "当前", range: "范围", readDone: "参数已重新读取", writeDone: "参数写入并读回一致",
+    partialParameters: "部分参数不可用；已读取其余参数", unavailableParameter: "当前固件未返回该参数；禁止写入",
     save: "保存设定到 ROM", saveDone: "ROM 保存成功，请重启电机", reboot: "重启电机", rebootDone: "重启命令已发送；请重新连接并初始化",
     savePending: "有未保存的设定参数", rebootPending: "设定已保存，需重启后生效",
     communicationWarning: "修改 ID、总线类型或 CAN 波特率后，保存并重启会改变后续连接方式。请确认新的 ID 和主机波特率。",
@@ -108,12 +112,13 @@ export function LingkongMotorPanel() {
     iq: "Torque current raw", encoder: "Encoder", angle: "Multiturn angle", state: "Motor state",
     errors: "Faults", open: "Running", closed: "Closed", unknownState: "Other state", none: "None", stale: "Status read failed",
     socketOnly: "Host CAN setup here applies to Linux SocketCAN only. gs_usb is configured for Classic CAN 1 Mbps on connection.",
-    motorInit: "Initialize selected motor", initDone: "Motor initialized and left closed; parameters loaded", initRequired: "Initialize the selected motor first",
+    motorInit: "Initialize selected motor", initDone: "Motor initialized and left closed; available parameters loaded", initRequired: "Initialize the selected motor first",
     initFlow: "Configure host CAN → connect bus → scan/select ID → initialize motor → review parameters → Run. Initialization closes a running motor and attempts to clear faults. Close resets the turn count and prior target; initialization never starts motion.",
     initState: "Initialization", initialized: "Initialized (closed)", notInitialized: "Not initialized",
     readParams: "Read all parameters", ramParams: "Control parameters · RAM", settingParams: "Settings · save to ROM",
     paramNote: "Read back before editing. 0xC1 control writes take effect in RAM and are lost on power off. 0x42 settings are saved to ROM with 0x44 and take effect after reboot. Writes require a closed, fault-free motor.",
     write: "Write and verify", paramCurrent: "Current", range: "Range", readDone: "Parameters refreshed", writeDone: "Parameter written and read back",
+    partialParameters: "Some parameters are unavailable; the remaining values were read", unavailableParameter: "This firmware did not provide this parameter; writing is disabled",
     save: "Save settings to ROM", saveDone: "ROM save confirmed; reboot the motor", reboot: "Reboot motor", rebootDone: "Reboot sent; reconnect and initialize again",
     savePending: "Unsaved setting changes", rebootPending: "Saved settings need a reboot",
     communicationWarning: "Changing the ID, bus type or CAN bitrate changes how this motor is reached after save and reboot. Confirm the new ID and host bitrate.",
@@ -128,6 +133,7 @@ export function LingkongMotorPanel() {
     setSelectedId(id);
     setInitializedId(null);
     setParameters({});
+    setUnavailableParameters([]);
     setDrafts({});
     setPendingSave(false);
     setNeedsReboot(false);
@@ -135,9 +141,11 @@ export function LingkongMotorPanel() {
     setReadError("");
   };
 
-  const acceptParameters = (values: LingkongParameterValue[]) => {
+  const acceptParameters = (result: LingkongParameterReadResult) => {
+    const values = result.parameters;
     setParameters(Object.fromEntries(values.map((value) => [value.key, value])));
     setDrafts(Object.fromEntries(values.map((value) => [value.key, [...value.values]])));
+    setUnavailableParameters(result.unavailable_parameters);
   };
 
   const inspect = useCallback(async () => {
@@ -239,7 +247,7 @@ export function LingkongMotorPanel() {
       if (selectedRef.current === id) {
         setSnapshot(next);
         setReadError("");
-        if (next.error_state !== 0 || (next.motor_state !== 0x00 && next.motor_state !== 0x10)) {
+        if (next.error_state !== 0 || lingkongMotorState(next.motor_state) === "unknown") {
           setInitializedId(null);
         }
       }
@@ -287,12 +295,13 @@ export function LingkongMotorPanel() {
       const result = await api.lingkongInitialize(id);
       if (selectedRef.current === id) {
         setSnapshot(result.snapshot);
-        acceptParameters(result.parameters);
+        acceptParameters(result);
         setInitializedId(id);
         setPendingSave(result.settings_dirty);
         setNeedsReboot(result.reboot_required);
         setReadError("");
-        message.success(copy.initDone);
+        if (result.unavailable_parameters.length) message.warning(`${copy.initDone} · ${copy.partialParameters}`);
+        else message.success(copy.initDone);
       }
     } catch (error) {
       message.error(errMsg(error));
@@ -307,8 +316,10 @@ export function LingkongMotorPanel() {
     busyRef.current = true;
     setBusy(true);
     try {
-      acceptParameters(await api.lingkongReadParameters(selectedId));
-      message.success(copy.readDone);
+      const result = await api.lingkongReadParameters(selectedId);
+      acceptParameters(result);
+      if (result.unavailable_parameters.length) message.warning(copy.partialParameters);
+      else message.success(copy.readDone);
     } catch (error) {
       message.error(errMsg(error));
     } finally {
@@ -318,7 +329,8 @@ export function LingkongMotorPanel() {
   };
 
   const writeParameter = async (def: LingkongParameterDef) => {
-    if (selectedId == null || busyRef.current || !motorReady) return;
+    if (selectedId == null || busyRef.current || !motorReady || !parameters[def.key]
+      || unavailableParameters.includes(def.key)) return;
     const values = drafts[def.key];
     if (!values || values.length !== (def.fields?.length ?? 1)
       || values.some((value) => !Number.isInteger(value) || value < 0 || value > def.max)) return;
@@ -394,6 +406,7 @@ export function LingkongMotorPanel() {
 
   const parameterRow = (def: LingkongParameterDef) => {
     const actual = parameters[def.key]?.values;
+    const unavailable = unavailableParameters.includes(def.key);
     const draft = drafts[def.key];
     const scale = def.scale ?? 1;
     const changed = !!actual && !!draft && draft.some((value, index) => value !== actual[index]);
@@ -404,6 +417,7 @@ export function LingkongMotorPanel() {
         <Typography.Text strong>{zh ? def.zh : def.en}</Typography.Text>
         <Typography.Text type="secondary" className="lingkong-param-meta">{def.address} · {copy.range} 0–{def.max / scale}</Typography.Text>
         <Typography.Text type="secondary" className="lingkong-param-meta">{copy.paramCurrent}: {actual ? actual.map((value) => value / scale).join(" / ") : "—"}</Typography.Text>
+        {unavailable && <Typography.Text type="warning" className="lingkong-param-meta">{copy.unavailableParameter}</Typography.Text>}
         {(zh ? def.noteZh : def.noteEn) && <Typography.Text type="secondary" className="lingkong-param-meta">{zh ? def.noteZh : def.noteEn}</Typography.Text>}
       </div>
       <div className="lingkong-param-values">
@@ -433,6 +447,9 @@ export function LingkongMotorPanel() {
   return (
     <div className="lingkong-panel">
       <Alert type="info" showIcon message={copy.initFlow} description={copy.connectionHint} />
+      {unavailableParameters.length > 0 && <Alert type="warning" showIcon message={copy.partialParameters}
+        description={lingkongParameters.filter((def) => unavailableParameters.includes(def.key))
+          .map((def) => zh ? def.zh : def.en).join(", ")} />}
       <Card title={copy.bus}>
         <Space wrap align="end">
           <label className="lingkong-field">
@@ -491,8 +508,8 @@ export function LingkongMotorPanel() {
         <Card title={copy.status} extra={<Button disabled={!connected || selectedId == null} onClick={() => selectedId != null && void refresh(selectedId, true)}>{copy.refresh}</Button>}>
           {!snapshot ? <Typography.Text type="secondary">{copy.select}</Typography.Text> : <>
             <Space wrap style={{ marginBottom: 12 }}>
-              <Tag color={snapshot.motor_state === 0x00 ? "green" : snapshot.motor_state === 0x10 ? "default" : "orange"}>
-                {snapshot.motor_state === 0x00 ? copy.open : snapshot.motor_state === 0x10 ? copy.closed : `${copy.unknownState} 0x${snapshot.motor_state.toString(16).toUpperCase()}`}
+              <Tag color={motorState === "running" ? "green" : motorState === "closed" ? "default" : "orange"}>
+                {motorState === "running" ? copy.open : motorState === "closed" ? copy.closed : `${copy.unknownState} 0x${snapshot.motor_state.toString(16).toUpperCase()}`}
               </Tag>
               <Tag color={faults.length ? "red" : "green"}>{copy.errors}: {faults.length ? faults.join(", ") : copy.none}</Tag>
             </Space>
@@ -527,7 +544,7 @@ export function LingkongMotorPanel() {
       <Card title={copy.motion}>
         <Alert type="warning" showIcon message={motorReady ? copy.runFirst : copy.initRequired} style={{ marginBottom: 14 }} />
         <Space wrap style={{ marginBottom: 18 }}>
-          <Button disabled={!motorReady || busy || !!readError || pendingSave || needsReboot || snapshot?.motor_state !== 0x10 || snapshot?.error_state !== 0} loading={busy} onClick={() => void action("run")}>{copy.run}</Button>
+          <Button disabled={!motorReady || busy || !!readError || pendingSave || needsReboot || motorState !== "closed" || snapshot?.error_state !== 0} loading={busy} onClick={() => void action("run")}>{copy.run}</Button>
           <Button danger type="primary" disabled={!connected || selectedId == null || busy} loading={busy} onClick={() => void action("stop")}>{copy.stop}</Button>
           <Button danger disabled={!connected || selectedId == null || busy} loading={busy} onClick={() => void action("close")}>{copy.close}</Button>
           <Button disabled={!connected || selectedId == null || busy} loading={busy} onClick={() => void action("clear_fault")}>{copy.clear}</Button>
@@ -547,7 +564,7 @@ export function LingkongMotorPanel() {
             <span>{mode === "velocity" ? copy.velocityLimit : copy.positionLimit}</span>
             <InputNumber value={limit} onChange={setLimit} min={1} max={mode === "velocity" ? 2048 : 65535} precision={0} style={{ width: 160 }} />
           </label>}
-          <Button type="primary" disabled={!motorReady || busy || !!readError || pendingSave || needsReboot || snapshot?.motor_state !== 0x00 || snapshot?.error_state !== 0 || target == null || (mode !== "torque" && limit == null)} loading={busy}
+          <Button type="primary" disabled={!motorReady || busy || !!readError || pendingSave || needsReboot || motorState !== "running" || snapshot?.error_state !== 0 || target == null || (mode !== "torque" && limit == null)} loading={busy}
             onClick={() => void action(mode, target ?? 0, limit ?? 0)}>{copy.send}</Button>
         </div>
         {mode === "torque" && <div style={{ marginTop: 12 }}>

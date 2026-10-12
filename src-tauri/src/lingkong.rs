@@ -1,7 +1,7 @@
 //! Shanghai Lingkong single-motor Classic CAN protocol V2.36.
 //! One independent bus session avoids CANopen discovery traffic on this bus.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +17,27 @@ use crate::lingkong_params::{self, ParameterSpec, ParameterValue, PARAMETERS};
 
 const SCAN_TIMEOUT: Duration = Duration::from_millis(90);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
+const READ_ATTEMPTS: usize = 3;
+const TURNAROUND_DELAY: Duration = Duration::from_millis(2);
+
+// V2.36 documents closed/running as 0x10/0x00. MHF5010 with DHF50 was
+// observed to report 0x20/0x30 after Close/Run with no fault bits. Accept
+// these explicit pairs; the protocol does not define other state values.
+fn running_state_for_closed(state: u8) -> Option<u8> {
+    match state {
+        0x10 => Some(0x00),
+        0x20 => Some(0x30),
+        _ => None,
+    }
+}
+
+fn is_closed_state(state: u8) -> bool {
+    running_state_for_closed(state).is_some()
+}
+
+fn is_running_state(state: u8) -> bool {
+    matches!(state, 0x00 | 0x30)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LingkongProbe {
@@ -43,8 +64,15 @@ pub struct LingkongSnapshot {
 pub struct LingkongInitialization {
     pub snapshot: LingkongSnapshot,
     pub parameters: Vec<ParameterValue>,
+    pub unavailable_parameters: Vec<String>,
     pub settings_dirty: bool,
     pub reboot_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LingkongParameterReadResult {
+    pub parameters: Vec<ParameterValue>,
+    pub unavailable_parameters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,7 +161,8 @@ pub struct LingkongSession {
     bitrate: u32,
     operation: Mutex<()>,
     armed: Mutex<BTreeSet<u8>>,
-    initialized: Mutex<BTreeSet<u8>>,
+    // Expected running state for each initialized drive's confirmed encoding.
+    initialized: Mutex<BTreeMap<u8, u8>>,
     dirty_settings: Mutex<BTreeSet<u8>>,
     reboot_required: Mutex<BTreeSet<u8>>,
     active: AtomicBool,
@@ -170,7 +199,7 @@ impl LingkongSession {
             bitrate,
             operation: Mutex::new(()),
             armed: Mutex::new(BTreeSet::new()),
-            initialized: Mutex::new(BTreeSet::new()),
+            initialized: Mutex::new(BTreeMap::new()),
             dirty_settings: Mutex::new(BTreeSet::new()),
             reboot_required: Mutex::new(BTreeSet::new()),
             active: AtomicBool::new(true),
@@ -211,12 +240,12 @@ impl LingkongSession {
         self.check_active()?;
         self.initialized.lock().await.remove(&id);
         let first = self.required_reply(id, 0x9A).await?;
-        if first[6] == 0x00 {
+        if is_running_state(first[6]) {
             self.armed.lock().await.insert(id);
-        } else if first[6] != 0x10 {
+        } else if !is_closed_state(first[6]) {
             return Err(format!("motor {id} has unknown state 0x{:02X}", first[6]));
         }
-        if first[6] != 0x10 {
+        if !is_closed_state(first[6]) {
             self.close_locked(id).await?;
         }
         if first[7] != 0 {
@@ -225,21 +254,32 @@ impl LingkongSession {
                 .ok_or_else(|| format!("motor {id} did not acknowledge clear fault"))?;
         }
         let status = self.required_reply(id, 0x9A).await?;
-        if status[6] != 0x10 || status[7] != 0 {
-            return Err(format!(
-                "motor {id} is not closed and fault-free (state 0x{:02X}, faults 0x{:02X})",
-                status[6], status[7]
-            ));
+        let expected_running = running_state_for_closed(status[6])
+            .filter(|_| status[7] == 0)
+            .ok_or_else(|| {
+                format!(
+                    "motor {id} is not closed and fault-free (state 0x{:02X}, faults 0x{:02X})",
+                    status[6], status[7]
+                )
+            })?;
+        let reads = self.read_parameters_locked(id).await?;
+        for key in [
+            "setting_driver_id",
+            "setting_bus_type",
+            "setting_can_baudrate",
+        ] {
+            if reads
+                .unavailable_parameters
+                .iter()
+                .any(|value| value == key)
+            {
+                return Err(format!(
+                    "motor {id} did not provide required parameter {key}"
+                ));
+            }
         }
-        let mut parameters = Vec::with_capacity(PARAMETERS.len());
-        for spec in PARAMETERS {
-            let value = self
-                .read_parameter_locked(id, *spec)
-                .await
-                .map_err(|error| format!("reading {} failed: {error}", spec.key))?;
-            parameters.push(value);
-        }
-        let configured_id = parameters
+        let configured_id = reads
+            .parameters
             .iter()
             .find(|parameter| parameter.key == "setting_driver_id")
             .and_then(|parameter| parameter.values.first())
@@ -255,31 +295,43 @@ impl LingkongSession {
             return Err(format!("motor {id} reports Driver ID {configured_id}; verify the effective ID after reboot"));
         }
         let snapshot = self.snapshot_locked(id).await?;
-        if snapshot.motor_state != 0x10 || snapshot.error_state != 0 {
+        if snapshot.motor_state != status[6] || snapshot.error_state != 0 {
             return Err(format!("motor {id} changed state during initialization"));
         }
-        self.initialized.lock().await.insert(id);
+        self.initialized.lock().await.insert(id, expected_running);
         Ok(LingkongInitialization {
             snapshot,
-            parameters,
+            parameters: reads.parameters,
+            unavailable_parameters: reads.unavailable_parameters,
             settings_dirty,
             reboot_required,
         })
     }
 
-    pub async fn read_parameters(&self, id: u8) -> Result<Vec<ParameterValue>, String> {
+    pub async fn read_parameters(&self, id: u8) -> Result<LingkongParameterReadResult, String> {
         validate_id(id)?;
         let _operation = self.operation.lock().await;
         self.check_initialized(id).await?;
-        let mut values = Vec::with_capacity(PARAMETERS.len());
+        self.read_parameters_locked(id).await
+    }
+
+    async fn read_parameters_locked(&self, id: u8) -> Result<LingkongParameterReadResult, String> {
+        let mut parameters = Vec::with_capacity(PARAMETERS.len());
+        let mut unavailable_parameters = Vec::new();
         for spec in PARAMETERS {
-            values.push(
-                self.read_parameter_locked(id, *spec)
-                    .await
-                    .map_err(|error| format!("reading {} failed: {error}", spec.key))?,
-            );
+            match self
+                .read_parameter_if_available_locked(id, *spec)
+                .await
+                .map_err(|error| format!("reading {} failed: {error}", spec.key))?
+            {
+                Some(value) => parameters.push(value),
+                None => unavailable_parameters.push(spec.key.to_string()),
+            }
         }
-        Ok(values)
+        Ok(LingkongParameterReadResult {
+            parameters,
+            unavailable_parameters,
+        })
     }
 
     pub async fn write_parameter(
@@ -294,6 +346,9 @@ impl LingkongSession {
         let _operation = self.operation.lock().await;
         self.check_initialized(id).await?;
         self.require_closed_and_clear(id).await?;
+        // Do not write a parameter whose selector this firmware does not
+        // return, even if a caller bypasses the disabled frontend control.
+        self.read_parameter_locked(id, spec).await?;
         if spec.key == "setting_driver_id" {
             let next_id = values[0] as u8;
             if next_id != 0
@@ -311,7 +366,10 @@ impl LingkongSession {
             // prove the staged setting was rejected. Keep Run blocked.
             self.dirty_settings.lock().await.insert(id);
         }
-        let ack = self.exchange_parameter(id, request, spec).await?;
+        let ack = self
+            .exchange_parameter(id, request, spec)
+            .await?
+            .ok_or_else(|| format!("motor {id} returned an empty write reply for {}", spec.key))?;
         let acknowledged = spec.decode(ack, true)?;
         if acknowledged.values != values {
             return Err(format!(
@@ -419,8 +477,23 @@ impl LingkongSession {
         id: u8,
         spec: ParameterSpec,
     ) -> Result<ParameterValue, String> {
+        self.read_parameter_if_available_locked(id, spec)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "motor {id} did not provide parameter {} (empty reply)",
+                    spec.key
+                )
+            })
+    }
+
+    async fn read_parameter_if_available_locked(
+        &self,
+        id: u8,
+        spec: ParameterSpec,
+    ) -> Result<Option<ParameterValue>, String> {
         let reply = self.exchange_parameter(id, spec.read_frame(), spec).await?;
-        spec.decode(reply, false)
+        reply.map(|frame| spec.decode(frame, false)).transpose()
     }
 
     async fn exchange_parameter(
@@ -428,33 +501,47 @@ impl LingkongSession {
         id: u8,
         request: [u8; 8],
         spec: ParameterSpec,
-    ) -> Result<[u8; 8], String> {
-        self.exchange_matching(id, request, REPLY_TIMEOUT, |reply| {
+    ) -> Result<Option<[u8; 8]>, String> {
+        let matches = |reply: &[u8; 8]| {
             reply[0] == request[0]
-                && reply[1] == request[1]
-                && (!spec.is_setting() || request[1] != 0x05 || reply[2] == request[2])
-        })
-        .await?
-        .ok_or_else(|| format!("motor {id} did not reply to {}", spec.key))
-    }
-
-    async fn check_initialized(&self, id: u8) -> Result<(), String> {
-        self.check_active()?;
-        if self.initialized.lock().await.contains(&id) {
-            Ok(())
+                && (reply[1..].iter().all(|value| *value == 0)
+                    || (reply[1] == request[1]
+                        && (!spec.is_setting() || request[1] != 0x05 || reply[2] == request[2])))
+        };
+        let reply = if matches!(request[0], 0xC0 | 0x40) {
+            self.exchange_read_matching(id, request, REPLY_TIMEOUT, matches)
+                .await?
         } else {
-            Err(format!(
-                "initialize motor {id} before using controls or parameters"
-            ))
+            // A lost write acknowledgement never triggers another write.
+            self.exchange_matching(id, request, REPLY_TIMEOUT, matches)
+                .await?
+        }
+        .ok_or_else(|| format!("motor {id} did not reply to {}", spec.key))?;
+        // This firmware returns just the opcode for unavailable selectors.
+        // A valid zero value still includes the parameter selector/address.
+        if reply[1..].iter().all(|value| *value == 0) {
+            Ok(None)
+        } else {
+            Ok(Some(reply))
         }
     }
 
-    async fn require_closed_and_clear(&self, id: u8) -> Result<(), String> {
+    async fn check_initialized(&self, id: u8) -> Result<u8, String> {
+        self.check_active()?;
+        self.initialized
+            .lock()
+            .await
+            .get(&id)
+            .copied()
+            .ok_or_else(|| format!("initialize motor {id} before using controls or parameters"))
+    }
+
+    /// Returns the expected state after Run for this drive's closed state.
+    async fn require_closed_and_clear(&self, id: u8) -> Result<u8, String> {
         let status = self.required_reply(id, 0x9A).await?;
-        if status[6] == 0x10 && status[7] == 0 {
-            Ok(())
-        } else {
-            Err("close the motor and clear all faults before changing parameters".into())
+        match running_state_for_closed(status[6]) {
+            Some(running_state) if status[7] == 0 => Ok(running_state),
+            _ => Err("close the motor and clear all faults before changing parameters".into()),
         }
     }
 
@@ -465,19 +552,21 @@ impl LingkongSession {
         let data = action.payload();
         match action {
             Action::Run => {
-                self.check_initialized(id).await?;
+                let expected_running = self.check_initialized(id).await?;
                 if self.dirty_settings.lock().await.contains(&id)
                     || self.reboot_required.lock().await.contains(&id)
                 {
                     return Err("save settings and reboot the motor before Run".into());
                 }
-                self.require_closed_and_clear(id).await?;
-                self.send(id, data).await?;
+                if self.require_closed_and_clear(id).await? != expected_running {
+                    return Err("motor state encoding changed; initialize the motor again".into());
+                }
                 // A lost reply does not prove the drive rejected Run. Keep the
-                // ID in the safe-close set as soon as submission succeeds.
+                // ID in the safe-close set throughout command submission.
                 self.armed.lock().await.insert(id);
+                self.send_with_echo(id, data).await?;
                 let status = self.required_reply(id, 0x9A).await?;
-                if status[6] != 0x00 || status[7] != 0 {
+                if status[6] != expected_running || status[7] != 0 {
                     return Err(format!(
                         "motor did not confirm the running state (state 0x{:02X})",
                         status[6]
@@ -488,9 +577,9 @@ impl LingkongSession {
                 self.close_locked(id).await?;
             }
             Action::Stop => {
-                self.send(id, data).await?;
                 // Stop leaves the motor enabled; close it on disconnect.
                 self.armed.lock().await.insert(id);
+                self.send_with_echo(id, data).await?;
                 self.required_reply(id, 0x9A).await?;
             }
             Action::ClearFault => {
@@ -507,12 +596,12 @@ impl LingkongSession {
                 }
             }
             Action::Torque { .. } | Action::Velocity { .. } | Action::Position { .. } => {
-                self.check_initialized(id).await?;
+                let expected_running = self.check_initialized(id).await?;
                 if !self.armed.lock().await.contains(&id) {
                     return Err("press Run before sending a motion target".into());
                 }
                 let status = self.required_reply(id, 0x9A).await?;
-                if status[6] != 0x00 || status[7] != 0 {
+                if status[6] != expected_running || status[7] != 0 {
                     return Err("motor is not running and fault-free".into());
                 }
                 self.exchange(id, data, REPLY_TIMEOUT)
@@ -560,9 +649,9 @@ impl LingkongSession {
     }
 
     async fn close_locked(&self, id: u8) -> Result<(), String> {
-        self.send(id, Action::Close.payload()).await?;
+        self.send_with_echo(id, Action::Close.payload()).await?;
         let status = self.required_reply(id, 0x9A).await?;
-        if status[6] != 0x10 {
+        if !is_closed_state(status[6]) {
             return Err("motor did not confirm the closed state".into());
         }
         self.armed.lock().await.remove(&id);
@@ -579,9 +668,40 @@ impl LingkongSession {
     }
 
     async fn required_reply(&self, id: u8, opcode: u8) -> Result<[u8; 8], String> {
-        self.exchange(id, [opcode, 0, 0, 0, 0, 0, 0, 0], REPLY_TIMEOUT)
-            .await?
-            .ok_or_else(|| format!("motor {id} did not reply to 0x{opcode:02X}"))
+        self.exchange_read_matching(id, [opcode, 0, 0, 0, 0, 0, 0, 0], REPLY_TIMEOUT, |reply| {
+            reply[0] == opcode
+        })
+        .await?
+        .ok_or_else(|| format!("motor {id} did not reply to 0x{opcode:02X}"))
+    }
+
+    async fn send_with_echo(&self, id: u8, data: [u8; 8]) -> Result<(), String> {
+        let reply = self
+            .exchange_matching(id, data, REPLY_TIMEOUT, |reply| *reply == data)
+            .await?;
+        if reply.is_none() {
+            // The caller must still confirm the resulting state with 0x9A.
+            log::warn!(
+                "Lingkong ID {id} missed 0x{:02X} echo; checking motor state",
+                data[0]
+            );
+        }
+        Ok(())
+    }
+
+    async fn exchange_read_matching(
+        &self,
+        id: u8,
+        data: [u8; 8],
+        timeout: Duration,
+        matches: impl Fn(&[u8; 8]) -> bool,
+    ) -> Result<Option<[u8; 8]>, String> {
+        for _ in 0..READ_ATTEMPTS {
+            if let Some(reply) = self.exchange_matching(id, data, timeout, &matches).await? {
+                return Ok(Some(reply));
+            }
+        }
+        Ok(None)
     }
 
     async fn send(&self, id: u8, data: [u8; 8]) -> Result<(), String> {
@@ -616,6 +736,9 @@ impl LingkongSession {
             .subscribe(CanFilter::exact_standard(can_id))
             .await
             .map_err(|error| error.to_string())?;
+        // Requests and replies use the same CAN ID. Give the drive time to
+        // finish its previous transmission before starting the next one.
+        tokio::time::sleep(TURNAROUND_DELAY).await;
         self.send(id, data).await?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -676,7 +799,380 @@ fn decode_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_snapshot, Action};
+    use super::*;
+    use can_transport::{CanCapabilities, CanRx};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::mpsc;
+
+    struct MockRx(mpsc::UnboundedReceiver<CanFrame>);
+
+    #[async_trait::async_trait]
+    impl CanRx for MockRx {
+        async fn recv(&mut self) -> Result<CanFrame, CanIoError> {
+            self.0.recv().await.ok_or(CanIoError::Disconnected)
+        }
+
+        fn try_recv(&mut self) -> Result<Option<CanFrame>, CanIoError> {
+            match self.0.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(_) => Err(CanIoError::Disconnected),
+            }
+        }
+    }
+
+    struct MockBus {
+        state: StdMutex<u8>,
+        faults: StdMutex<u8>,
+        closed_state: u8,
+        running_state: u8,
+        sent: StdMutex<Vec<u8>>,
+        replies: StdMutex<Vec<mpsc::UnboundedSender<CanFrame>>>,
+        unavailable_settings: StdMutex<BTreeSet<u8>>,
+        command_busy: Arc<AtomicBool>,
+        early_queries: AtomicUsize,
+        lost_status_replies: AtomicUsize,
+        lost_parameter_replies: AtomicUsize,
+        lose_close_echo: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CanBus for MockBus {
+        async fn send(&self, frame: CanFrame) -> Result<(), CanIoError> {
+            assert_eq!(frame.id().raw(), 0x141);
+            let mut reply: [u8; 8] = frame.data().try_into().unwrap();
+            self.sent.lock().unwrap().push(reply[0]);
+            if self.command_busy.load(Ordering::Acquire) {
+                self.early_queries.fetch_add(1, Ordering::AcqRel);
+                return Ok(());
+            }
+            let loss_counter = match reply[0] {
+                0x9A => Some(&self.lost_status_replies),
+                0xC0 | 0x40 => Some(&self.lost_parameter_replies),
+                _ => None,
+            };
+            if loss_counter.is_some_and(|counter| {
+                counter
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_sub(1)
+                    })
+                    .is_ok()
+            }) {
+                return Ok(());
+            }
+            match reply[0] {
+                0x80 => *self.state.lock().unwrap() = self.closed_state,
+                0x88 => *self.state.lock().unwrap() = self.running_state,
+                0x9A | 0x9B => {
+                    reply[1] = 25;
+                    reply[2..4].copy_from_slice(&2400u16.to_le_bytes());
+                    reply[6] = *self.state.lock().unwrap();
+                    reply[7] = *self.faults.lock().unwrap();
+                }
+                0x40 if reply[1] == 0x05
+                    && self
+                        .unavailable_settings
+                        .lock()
+                        .unwrap()
+                        .contains(&reply[2]) =>
+                {
+                    reply[1..].fill(0);
+                }
+                _ => {}
+            }
+            let frame = CanFrame::new_data(0x141u16, &reply).unwrap();
+            if matches!(reply[0], 0x80 | 0x81 | 0x88) {
+                let senders = self.replies.lock().unwrap().clone();
+                let busy = self.command_busy.clone();
+                let drop_echo =
+                    reply[0] == 0x80 && self.lose_close_echo.swap(false, Ordering::AcqRel);
+                busy.store(true, Ordering::Release);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(8)).await;
+                    busy.store(false, Ordering::Release);
+                    if !drop_echo {
+                        for sender in senders {
+                            let _ = sender.send(frame);
+                        }
+                    }
+                });
+                return Ok(());
+            }
+            self.replies
+                .lock()
+                .unwrap()
+                .retain(|tx| tx.send(frame).is_ok());
+            Ok(())
+        }
+
+        async fn subscribe(&self, _: CanFilter) -> Result<Box<dyn CanRx>, CanIoError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.replies.lock().unwrap().push(tx);
+            Ok(Box::new(MockRx(rx)))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: false,
+                max_dlen: 8,
+            }
+        }
+    }
+
+    fn test_session(initial: u8, closed: u8, running: u8) -> (Arc<MockBus>, LingkongSession) {
+        let bus = Arc::new(MockBus {
+            state: StdMutex::new(initial),
+            faults: StdMutex::new(0),
+            closed_state: closed,
+            running_state: running,
+            sent: StdMutex::new(Vec::new()),
+            replies: StdMutex::new(Vec::new()),
+            unavailable_settings: StdMutex::new(BTreeSet::new()),
+            command_busy: Arc::new(AtomicBool::new(false)),
+            early_queries: AtomicUsize::new(0),
+            lost_status_replies: AtomicUsize::new(0),
+            lost_parameter_replies: AtomicUsize::new(0),
+            lose_close_echo: AtomicBool::new(false),
+        });
+        let session = LingkongSession {
+            bus: bus.clone(),
+            bitrate: 1_000_000,
+            operation: Mutex::new(()),
+            armed: Mutex::new(BTreeSet::new()),
+            initialized: Mutex::new(BTreeMap::new()),
+            dirty_settings: Mutex::new(BTreeSet::new()),
+            reboot_required: Mutex::new(BTreeSet::new()),
+            active: AtomicBool::new(true),
+        };
+        (bus, session)
+    }
+
+    #[tokio::test]
+    async fn documented_and_mhf_states_support_initialization_motion_and_disconnect() {
+        for (initial, closed, running) in [
+            (0x00, 0x10, 0x00),
+            (0x10, 0x10, 0x00),
+            (0x20, 0x20, 0x30),
+            (0x30, 0x20, 0x30),
+        ] {
+            let (bus, session) = test_session(initial, closed, running);
+            let result = session.initialize(1).await.unwrap();
+            assert_eq!(result.snapshot.motor_state, closed);
+            assert_eq!(result.parameters.len(), PARAMETERS.len());
+            assert_eq!(session.initialized.lock().await.get(&1), Some(&running));
+            assert!(!session.armed.lock().await.contains(&1));
+            assert!(!bus.sent.lock().unwrap().contains(&0x88));
+            assert!(!bus.sent.lock().unwrap().contains(&0xA1));
+
+            session
+                .write_parameter(1, "ram_torque_limit", vec![0])
+                .await
+                .unwrap();
+            let snapshot = session.action(1, Action::Run).await.unwrap();
+            assert_eq!(snapshot.motor_state, running);
+            for action in [
+                Action::Torque { iq_raw: 0 },
+                Action::Velocity {
+                    speed_dps: 0.0,
+                    iq_limit: 100,
+                },
+                Action::Position {
+                    angle_deg: 0.0,
+                    max_speed_dps: 120,
+                },
+            ] {
+                let snapshot = session.action(1, action).await.unwrap();
+                assert_eq!(snapshot.motor_state, running);
+                assert!(bus.sent.lock().unwrap().contains(&action.payload()[0]));
+            }
+            assert_eq!(
+                session.action(1, Action::Stop).await.unwrap().motor_state,
+                running
+            );
+            assert_eq!(
+                session.action(1, Action::Close).await.unwrap().motor_state,
+                closed
+            );
+            assert!(!session.armed.lock().await.contains(&1));
+            session.action(1, Action::Run).await.unwrap();
+            session.shutdown().await.unwrap();
+            assert_eq!(*bus.state.lock().unwrap(), closed);
+            assert!(!session.active.load(Ordering::Acquire));
+            assert!(session.armed.lock().await.is_empty());
+            assert_eq!(bus.early_queries.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_setting_replies_leave_parameters_unavailable_without_blocking_initialization() {
+        let (bus, session) = test_session(0x30, 0x20, 0x30);
+        bus.unavailable_settings
+            .lock()
+            .unwrap()
+            .extend([0xE0, 0xE2, 0xE4, 0xEA, 0xEC]);
+        let result = session.initialize(1).await.unwrap();
+        assert_eq!(result.snapshot.motor_state, 0x20);
+        assert_eq!(result.parameters.len(), 15);
+        assert_eq!(
+            result.unavailable_parameters,
+            vec![
+                "setting_max_power",
+                "setting_max_speed",
+                "setting_max_angle",
+                "setting_current_ramp",
+                "setting_speed_ramp",
+            ]
+        );
+        assert!(result
+            .parameters
+            .iter()
+            .all(|value| !result.unavailable_parameters.contains(&value.key)));
+        // A zero value with the correct selector remains a readable value.
+        assert_eq!(
+            result
+                .parameters
+                .iter()
+                .find(|value| value.key == "ram_angle_limit")
+                .unwrap()
+                .values,
+            vec![0]
+        );
+        let refresh = session.read_parameters(1).await.unwrap();
+        assert_eq!(
+            refresh.unavailable_parameters,
+            result.unavailable_parameters
+        );
+        assert_eq!(refresh.parameters.len(), 15);
+        bus.sent.lock().unwrap().clear();
+        assert!(session
+            .write_parameter(1, "setting_max_power", vec![100])
+            .await
+            .is_err());
+        assert!(!bus.sent.lock().unwrap().contains(&0x42));
+        assert!(!session.dirty_settings.lock().await.contains(&1));
+        assert_eq!(
+            session.action(1, Action::Run).await.unwrap().motor_state,
+            0x30
+        );
+        session.shutdown().await.unwrap();
+        assert_eq!(bus.early_queries.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_required_identity_parameter_still_blocks_initialization() {
+        let (bus, session) = test_session(0x20, 0x20, 0x30);
+        bus.unavailable_settings.lock().unwrap().insert(0x0A);
+        assert!(session
+            .initialize(1)
+            .await
+            .unwrap_err()
+            .contains("required parameter setting_driver_id"));
+        assert!(session.initialized.lock().await.is_empty());
+        assert!(!bus.sent.lock().unwrap().contains(&0x88));
+    }
+
+    #[tokio::test]
+    async fn status_and_parameter_reads_retry_transient_reply_loss() {
+        let (bus, session) = test_session(0x20, 0x20, 0x30);
+        bus.lost_status_replies.store(2, Ordering::Release);
+        bus.lost_parameter_replies.store(2, Ordering::Release);
+        let result = session.initialize(1).await.unwrap();
+        assert_eq!(result.parameters.len(), PARAMETERS.len());
+        assert_eq!(
+            bus.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|code| **code == 0xC0)
+                .count(),
+            10
+        );
+        assert_eq!(bus.early_queries.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_failure_keeps_session_until_closed_state_can_be_confirmed() {
+        let (bus, session) = test_session(0x20, 0x20, 0x30);
+        session.initialize(1).await.unwrap();
+        session.action(1, Action::Run).await.unwrap();
+        bus.lost_status_replies
+            .store(READ_ATTEMPTS, Ordering::Release);
+        assert!(session.shutdown().await.is_err());
+        assert!(session.active.load(Ordering::Acquire));
+        assert!(session.armed.lock().await.contains(&1));
+        session.shutdown().await.unwrap();
+        assert!(!session.active.load(Ordering::Acquire));
+        assert!(session.armed.lock().await.is_empty());
+        assert_eq!(*bus.state.lock().unwrap(), 0x20);
+    }
+
+    #[tokio::test]
+    async fn missing_close_echo_still_requires_confirmed_closed_state() {
+        let (bus, session) = test_session(0x20, 0x20, 0x30);
+        session.initialize(1).await.unwrap();
+        session.action(1, Action::Run).await.unwrap();
+        bus.lose_close_echo.store(true, Ordering::Release);
+        session.shutdown().await.unwrap();
+        assert_eq!(*bus.state.lock().unwrap(), 0x20);
+        assert_eq!(bus.early_queries.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn mhf_motion_and_parameter_writes_still_require_initialization_and_clear_faults() {
+        let (bus, session) = test_session(0x30, 0x20, 0x30);
+        let target = Action::Torque { iq_raw: 0 };
+        assert!(session.action(1, target).await.is_err());
+        assert!(bus.sent.lock().unwrap().is_empty());
+
+        session.initialize(1).await.unwrap();
+        assert!(session.action(1, target).await.is_err());
+        assert!(!bus.sent.lock().unwrap().contains(&0xA1));
+
+        session.action(1, Action::Run).await.unwrap();
+        *bus.faults.lock().unwrap() = 0x01;
+        assert!(session.action(1, target).await.is_err());
+        assert!(!bus.sent.lock().unwrap().contains(&0xA1));
+        session.action(1, Action::Close).await.unwrap();
+        bus.sent.lock().unwrap().clear();
+        assert!(session.action(1, Action::Run).await.is_err());
+        assert!(session
+            .write_parameter(1, "ram_torque_limit", vec![0])
+            .await
+            .is_err());
+        assert!(!bus.sent.lock().unwrap().contains(&0x88));
+        assert!(!bus.sent.lock().unwrap().contains(&0xC1));
+        assert!(session.initialize(1).await.is_err());
+        assert!(!session.initialized.lock().await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn unknown_states_remain_blocked() {
+        for state in [0x01, 0x11, 0x21, 0x31, 0xFF] {
+            let (bus, session) = test_session(state, 0x20, 0x30);
+            assert!(session.initialize(1).await.is_err());
+            assert!(!session.initialized.lock().await.contains_key(&1));
+            assert_eq!(*bus.sent.lock().unwrap(), vec![0x9A]);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_a_mismatched_state_pair_and_keeps_motor_tracked_for_close() {
+        for (closed, running) in [(0x10, 0x30), (0x20, 0x00)] {
+            let (bus, session) = test_session(closed, closed, running);
+            session.initialize(1).await.unwrap();
+            assert!(session.action(1, Action::Run).await.is_err());
+            assert!(session.armed.lock().await.contains(&1));
+            assert!(session
+                .action(1, Action::Torque { iq_raw: 0 })
+                .await
+                .is_err());
+            assert!(!bus.sent.lock().unwrap().contains(&0xA1));
+            session.shutdown().await.unwrap();
+            assert_eq!(*bus.state.lock().unwrap(), closed);
+            assert!(session.armed.lock().await.is_empty());
+        }
+    }
 
     #[test]
     fn v236_velocity_and_position_use_little_endian_scaled_values() {

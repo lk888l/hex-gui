@@ -1394,9 +1394,13 @@ export interface LingkongParameterValue {
   values: number[];
 }
 
-export interface LingkongInitialization {
-  snapshot: LingkongSnapshot;
+export interface LingkongParameterReadResult {
   parameters: LingkongParameterValue[];
+  unavailable_parameters: string[];
+}
+
+export interface LingkongInitialization extends LingkongParameterReadResult {
+  snapshot: LingkongSnapshot;
   settings_dirty: boolean;
   reboot_required: boolean;
 }

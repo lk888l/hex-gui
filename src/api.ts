@@ -10,6 +10,7 @@ import type {
   LingkongSnapshot,
   LingkongInitialization,
   LingkongParameterValue,
+  LingkongParameterReadResult,
   LingkongRebootResult,
   DamiaoConfig,
   DamiaoDiscoveredDevice,
@@ -38,7 +39,7 @@ export const api = {
   lingkongScan: () => invoke<LingkongProbe[]>("lingkong_scan"),
   lingkongSnapshot: (id: number) => invoke<LingkongSnapshot>("lingkong_snapshot", { id }),
   lingkongInitialize: (id: number) => invoke<LingkongInitialization>("lingkong_initialize", { id }),
-  lingkongReadParameters: (id: number) => invoke<LingkongParameterValue[]>("lingkong_read_parameters", { id }),
+  lingkongReadParameters: (id: number) => invoke<LingkongParameterReadResult>("lingkong_read_parameters", { id }),
   lingkongWriteParameter: (id: number, key: string, values: number[]) =>
     invoke<LingkongParameterValue>("lingkong_write_parameter", { id, key, values }),
   lingkongSaveSettings: (id: number) => invoke<void>("lingkong_save_settings", { id }),

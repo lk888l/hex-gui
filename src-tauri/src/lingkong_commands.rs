@@ -6,8 +6,8 @@ use tauri::State;
 use crate::can_lease::{CanOwner, CanTransportGate};
 use crate::host_can::{self, HostCanStatus};
 use crate::lingkong::{
-    Action, LingkongInitialization, LingkongProbe, LingkongRebootResult, LingkongSession,
-    LingkongSnapshot,
+    Action, LingkongInitialization, LingkongParameterReadResult, LingkongProbe,
+    LingkongRebootResult, LingkongSession, LingkongSnapshot,
 };
 use crate::lingkong_params::ParameterValue;
 use crate::state::AppState;
@@ -110,7 +110,7 @@ pub async fn lingkong_initialize(
 pub async fn lingkong_read_parameters(
     state: State<'_, AppState>,
     id: u8,
-) -> Result<Vec<ParameterValue>, String> {
+) -> Result<LingkongParameterReadResult, String> {
     session(&state).await?.read_parameters(id).await
 }
 
