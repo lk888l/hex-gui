@@ -25,6 +25,7 @@ const CLEAR_FAULT_COMMAND: u8 = 0xFB;
 const READ_PARAMETER_COMMAND: u8 = 0x33;
 const WRITE_PARAMETER_COMMAND: u8 = 0x55;
 const SAVE_PARAMETERS_COMMAND: u8 = 0xAA;
+const MOTOR_ID_REGISTER: u8 = 0x08;
 const CONTROL_MODE_REGISTER: u8 = 0x0A;
 const CAN_BITRATE_REGISTER: u8 = 0x23;
 const POSITION_MAPPING_REGISTER: u8 = 0x15;
@@ -101,6 +102,18 @@ impl DamiaoBitrateState {
             requires_reconnect,
         })
     }
+}
+
+/// A verified address change can survive a later Flash-save failure. Return
+/// both facts so the caller always keeps controlling the confirmed address.
+#[derive(Debug, Clone, Serialize)]
+pub struct DamiaoIdChangeResult {
+    pub previous_motor_id: u16,
+    pub requested_motor_id: u16,
+    pub verified: bool,
+    pub saved: bool,
+    pub error: Option<String>,
+    pub state: DamiaoState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -284,6 +297,7 @@ struct DiscoveryState {
 /// legacy-probed, which prevents discovery from interrupting active control.
 pub struct DamiaoDiscovery {
     state: Arc<StdMutex<DiscoveryState>>,
+    scan_gate: Arc<AsyncMutex<()>>,
     running: Arc<AtomicBool>,
     request_safe_sweep: Arc<AtomicBool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
@@ -298,15 +312,23 @@ impl DamiaoDiscovery {
         let state = Arc::new(StdMutex::new(DiscoveryState::default()));
         let running = Arc::new(AtomicBool::new(true));
         let request_safe_sweep = Arc::new(AtomicBool::new(false));
+        let scan_gate = Arc::new(AsyncMutex::new(()));
         let discovery = Arc::new(Self {
             state: state.clone(),
+            scan_gate: scan_gate.clone(),
             running: running.clone(),
             request_safe_sweep: request_safe_sweep.clone(),
             tasks: StdMutex::new(Vec::new()),
         });
 
         let receive_task = tokio::spawn(discovery_receive_loop(rx, state.clone(), running.clone()));
-        let scan_task = tokio::spawn(discovery_scan_loop(bus, state, running, request_safe_sweep));
+        let scan_task = tokio::spawn(discovery_scan_loop(
+            bus,
+            state,
+            running,
+            request_safe_sweep,
+            scan_gate,
+        ));
         discovery
             .tasks
             .lock()
@@ -344,6 +366,33 @@ impl DamiaoDiscovery {
             state.attached.insert(motor_id);
         } else {
             state.attached.remove(&motor_id);
+        }
+    }
+
+    /// Wait for any in-flight probe and hold discovery sends during an ID
+    /// transaction, including the migration of the attached-session map.
+    pub async fn suspend_scanning(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.scan_gate.clone().lock_owned().await
+    }
+
+    pub fn rename_attached(&self, previous_motor_id: u16, snapshot: &DamiaoState) {
+        let mut shared = self.state.lock().unwrap();
+        shared.attached.remove(&previous_motor_id);
+        shared.devices.remove(&previous_motor_id);
+        shared.pending = None;
+        shared.attached.insert(snapshot.motor_id);
+        if snapshot.online {
+            if let Some(feedback_can_id) = snapshot.feedback_can_id {
+                shared.devices.insert(
+                    snapshot.motor_id,
+                    DiscoveredEntry {
+                        feedback_can_id,
+                        status_code: snapshot.status_code,
+                        last_feedback: Instant::now(),
+                        rx_count: snapshot.rx_count,
+                    },
+                );
+            }
         }
     }
 
@@ -389,7 +438,10 @@ async fn discovery_receive_loop(
                 let Some((motor_id, status_code)) = feedback_identity(frame.data()) else {
                     continue;
                 };
-                if is_parameter_reply_for(motor_id, frame.data()) {
+                let parameter_motor_id = u16::from_le_bytes([frame.data()[0], frame.data()[1]]);
+                if parameter_motor_id <= 0xFF
+                    && is_parameter_reply_for(parameter_motor_id, frame.data())
+                {
                     continue;
                 }
                 let CanId::Standard(feedback_can_id) = frame.id() else {
@@ -413,6 +465,7 @@ async fn discovery_scan_loop(
     state: Arc<StdMutex<DiscoveryState>>,
     running: Arc<AtomicBool>,
     request_safe_sweep: Arc<AtomicBool>,
+    scan_gate: Arc<AsyncMutex<()>>,
 ) {
     let mut ticker = tokio::time::interval(DISCOVERY_STEP);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -421,6 +474,7 @@ async fn discovery_scan_loop(
     let mut force_safe_sweep = true;
     while running.load(Ordering::Acquire) {
         ticker.tick().await;
+        let _scan_guard = scan_gate.lock().await;
         if motor_id == 0 && request_safe_sweep.swap(false, Ordering::AcqRel) {
             force_safe_sweep = true;
         }
@@ -430,7 +484,7 @@ async fn discovery_scan_loop(
             let stale_or_unknown = shared.devices.get(&motor_id).map_or(true, |entry| {
                 Instant::now().saturating_duration_since(entry.last_feedback) > DISCOVERY_FRESH_FOR
             });
-            !shared.attached.contains(&motor_id)
+            !shared.attached.iter().any(|id| id & 0x0F == motor_id)
                 && stale_or_unknown
                 && (force_safe_sweep || sweep % LEGACY_DISCOVERY_EVERY_SWEEPS == 0)
         };
@@ -474,6 +528,14 @@ fn record_discovery_feedback(
     status_code: u8,
     now: Instant,
 ) -> bool {
+    // Attached exceptional IDs still report only their low nibble. Keep
+    // their telemetry under the full configured ID after an address change.
+    let motor_id = shared
+        .attached
+        .iter()
+        .copied()
+        .find(|id| id & 0x0F == motor_id)
+        .unwrap_or(motor_id);
     let expected = shared.pending.is_some_and(|probe| {
         probe.motor_id == motor_id
             && now.saturating_duration_since(probe.sent_at) <= DISCOVERY_RESPONSE_WINDOW
@@ -558,9 +620,9 @@ pub struct DamiaoSession {
     /// stream loop acquires this before reading its target, so a mode switch
     /// cannot leak one last target encoded with the previous mode.
     control_gate: Arc<AsyncMutex<()>>,
-    /// Once a write may have changed the motor's timing, sending at the old
-    /// host rate is unsafe. A new session on a reconfigured bus clears this.
-    bitrate_requires_reconnect: Arc<AtomicBool>,
+    /// Block traffic when a bitrate or address write leaves communication
+    /// uncertain. Reopening the bus and attaching again clears this.
+    communication_requires_reconnect: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
@@ -587,7 +649,7 @@ impl DamiaoSession {
         let config = Arc::new(StdMutex::new(config));
         let stream_target = Arc::new(StdMutex::new(None));
         let control_gate = Arc::new(AsyncMutex::new(()));
-        let bitrate_requires_reconnect = Arc::new(AtomicBool::new(false));
+        let communication_requires_reconnect = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
         let session = Arc::new(Self {
@@ -596,7 +658,7 @@ impl DamiaoSession {
             state: state.clone(),
             stream_target: stream_target.clone(),
             control_gate: control_gate.clone(),
-            bitrate_requires_reconnect: bitrate_requires_reconnect.clone(),
+            communication_requires_reconnect: communication_requires_reconnect.clone(),
             running: running.clone(),
             tasks: StdMutex::new(Vec::new()),
         });
@@ -612,7 +674,7 @@ impl DamiaoSession {
             config.clone(),
             state.clone(),
             running.clone(),
-            bitrate_requires_reconnect.clone(),
+            communication_requires_reconnect.clone(),
         ));
         let refresh_task = tokio::spawn(refresh_loop(
             bus.clone(),
@@ -620,7 +682,7 @@ impl DamiaoSession {
             state.clone(),
             running.clone(),
             control_gate.clone(),
-            bitrate_requires_reconnect.clone(),
+            communication_requires_reconnect.clone(),
         ));
         let stream_task = tokio::spawn(stream_loop(
             bus,
@@ -866,21 +928,27 @@ impl DamiaoSession {
     }
 
     pub fn requires_reconnect(&self) -> bool {
-        self.bitrate_requires_reconnect.load(Ordering::Acquire)
+        self.communication_requires_reconnect
+            .load(Ordering::Acquire)
     }
 
     fn ensure_communication_ready(&self) -> Result<()> {
         if self.requires_reconnect() {
-            bail!("DAMIAO CAN bitrate changed or is uncertain; reconfigure the host CAN interface and reconnect before sending commands");
+            bail!("DAMIAO communication changed or is uncertain; reconnect and verify the motor ID and CAN bitrate before sending commands");
         }
         Ok(())
     }
 
     async fn read_parameter_locked(&self, register: u8) -> Result<[u8; 4]> {
         let config = self.current_config();
+        self.read_parameter_at_locked(config.motor_id, register)
+            .await
+    }
+
+    async fn read_parameter_at_locked(&self, motor_id: u16, register: u8) -> Result<[u8; 4]> {
         let request = [
-            config.motor_id as u8,
-            (config.motor_id >> 8) as u8,
+            motor_id as u8,
+            (motor_id >> 8) as u8,
             READ_PARAMETER_COMMAND,
             register,
         ];
@@ -891,7 +959,7 @@ impl DamiaoSession {
         let reply = wait_parameter_reply(
             &mut *rx,
             feedback_can_id,
-            config.motor_id,
+            motor_id,
             READ_PARAMETER_COMMAND,
             register,
             None,
@@ -1035,7 +1103,7 @@ impl DamiaoSession {
 
         // Even a lost acknowledgement can leave the motor at the new rate.
         // Set this before transmitting and retain it on every later error.
-        self.bitrate_requires_reconnect
+        self.communication_requires_reconnect
             .store(true, Ordering::Release);
         let result = async {
             self.bus.send(frame).await?;
@@ -1079,6 +1147,10 @@ impl DamiaoSession {
         self.read_bitrate_locked().await?;
         self.stream_target.lock().unwrap().take();
         self.confirm_disabled_locked().await?;
+        self.save_parameters_locked().await
+    }
+
+    async fn save_parameters_locked(&self) -> Result<()> {
         let config = self.current_config();
         let command = [
             config.motor_id as u8,
@@ -1102,7 +1174,168 @@ impl DamiaoSession {
         // Keep refresh/target sends behind the control gate for the manual's
         // maximum flash-write interval even if firmware acknowledges early.
         tokio::time::sleep(PARAMETER_SAVE_SETTLE).await;
+        self.state.lock().unwrap().view.last_error = None;
         Ok(())
+    }
+
+    /// Change ESC_ID (RID 0x08), leaving the feedback Master ID unchanged.
+    /// Read the new address back even when its write acknowledgement is lost;
+    /// an unverified write blocks all session traffic instead of retrying it.
+    pub async fn set_motor_id(
+        &self,
+        new_motor_id: u16,
+        save: bool,
+    ) -> Result<DamiaoIdChangeResult> {
+        let _guard = self.control_gate.lock().await;
+        self.ensure_communication_ready()?;
+        let current = self.current_config();
+        let next = DamiaoConfig {
+            motor_id: new_motor_id,
+            ..current
+        }
+        .validate()?;
+        let actual_id = u32::from_le_bytes(self.read_parameter_locked(MOTOR_ID_REGISTER).await?);
+        if actual_id != u32::from(current.motor_id) {
+            bail!("DAMIAO ESC_ID readback {actual_id:#X} does not match attached motor {:#X}; ID was not modified", current.motor_id);
+        }
+        let mut outcome = DamiaoIdChangeResult {
+            previous_motor_id: current.motor_id,
+            requested_motor_id: new_motor_id,
+            verified: true,
+            saved: false,
+            error: None,
+            state: self.snapshot(),
+        };
+        if new_motor_id == current.motor_id {
+            return Ok(outcome);
+        }
+
+        self.ensure_motor_id_available_locked(new_motor_id).await?;
+        self.stream_target.lock().unwrap().take();
+        self.confirm_disabled_locked().await?;
+        let payload =
+            parameter_write_payload(current.motor_id, MOTOR_ID_REGISTER, u32::from(new_motor_id));
+        let (feedback_can_id, mut rx) = self.parameter_subscription().await?;
+        let frame = CanFrame::new_data(STATUS_REQUEST_ID, &payload)?;
+        self.communication_requires_reconnect
+            .store(true, Ordering::Release);
+        let verification = async {
+            self.bus.send(frame).await?;
+            // Firmware may use either the old or already-updated ESC_ID in
+            // its write reply. Neither alone proves routing at the new ID.
+            let _ = tokio::time::timeout(
+                PARAMETER_RESPONSE_TIMEOUT,
+                receive_parameter_reply(
+                    &mut *rx,
+                    feedback_can_id,
+                    &[current.motor_id, new_motor_id],
+                    WRITE_PARAMETER_COMMAND,
+                    MOTOR_ID_REGISTER,
+                    Some(u32::from(new_motor_id)),
+                ),
+            )
+            .await;
+            let readback = u32::from_le_bytes(
+                self.read_parameter_at_locked(new_motor_id, MOTOR_ID_REGISTER)
+                    .await?,
+            );
+            if readback != u32::from(new_motor_id) {
+                bail!("ESC_ID readback was {readback:#X}, expected {new_motor_id:#X}");
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = verification {
+            let error = format!("Motor ID write {:#X} → {new_motor_id:#X} was not verified; the ID may already have changed. Reconnect and check the old and requested IDs before retrying: {error}", current.motor_id);
+            let mut shared = self.state.lock().unwrap();
+            shared.last_feedback = None;
+            shared.view.enabled = false;
+            shared.view.last_error = Some(error.clone());
+            drop(shared);
+            outcome.verified = false;
+            outcome.error = Some(error);
+            outcome.state = self.snapshot();
+            return Ok(outcome);
+        }
+
+        // Commit the new identity before releasing the control gate, even
+        // if confirming disabled feedback or saving Flash subsequently fails.
+        *self.config.lock().unwrap() = next;
+        {
+            let mut shared = self.state.lock().unwrap();
+            let feedback_can_id = shared.view.feedback_can_id;
+            let rx_count = shared.view.rx_count;
+            shared.view = DamiaoState::attached(next);
+            shared.view.feedback_can_id = feedback_can_id;
+            shared.view.rx_count = rx_count;
+            shared.last_feedback = None;
+            shared.last_position_read = None;
+            shared.feedback_rate_window_start = None;
+            shared.feedback_rate_intervals = 0;
+            shared.feedback_rate_hz = None;
+        }
+        self.communication_requires_reconnect
+            .store(false, Ordering::Release);
+        let finish = async {
+            self.confirm_disabled_locked().await?;
+            if save {
+                self.save_parameters_locked().await?;
+                outcome.saved = true;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = finish {
+            let error = format!(
+                "Motor ID {new_motor_id:#X} is verified, but {}: {error}",
+                if save {
+                    "Flash storage was not confirmed"
+                } else {
+                    "disabled feedback was not confirmed"
+                }
+            );
+            self.state.lock().unwrap().view.last_error = Some(error.clone());
+            outcome.error = Some(error);
+        }
+        outcome.state = self.snapshot();
+        Ok(outcome)
+    }
+
+    async fn ensure_motor_id_available_locked(&self, motor_id: u16) -> Result<()> {
+        // A motor not yet found by discovery can occupy the requested ID.
+        // Query its ESC_ID without disabling or otherwise modifying it.
+        let mut rx = self.bus.subscribe(CanFilter::pass_all_standard()).await?;
+        self.bus
+            .send(CanFrame::new_data(
+                STATUS_REQUEST_ID,
+                &[
+                    motor_id as u8,
+                    (motor_id >> 8) as u8,
+                    READ_PARAMETER_COMMAND,
+                    MOTOR_ID_REGISTER,
+                ],
+            )?)
+            .await?;
+        match tokio::time::timeout(
+            PARAMETER_RESPONSE_TIMEOUT,
+            receive_parameter_reply(
+                &mut *rx,
+                None,
+                &[motor_id],
+                READ_PARAMETER_COMMAND,
+                MOTOR_ID_REGISTER,
+                None,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                bail!("DAMIAO motor ID {motor_id:#X} is already in use; ID was not modified")
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(()),
+        }
     }
 
     async fn parameter_subscription(&self) -> Result<(Option<u16>, Box<dyn can_transport::CanRx>)> {
@@ -1232,14 +1465,14 @@ async fn receive_loop(
     config: Arc<StdMutex<DamiaoConfig>>,
     state: Arc<StdMutex<SharedState>>,
     running: Arc<AtomicBool>,
-    bitrate_requires_reconnect: Arc<AtomicBool>,
+    communication_requires_reconnect: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Acquire) {
         match rx.recv().await {
             Ok(frame) => {
                 if !is_data_frame(&frame)
                     || frame.data().len() != 8
-                    || bitrate_requires_reconnect.load(Ordering::Acquire)
+                    || communication_requires_reconnect.load(Ordering::Acquire)
                 {
                     continue;
                 }
@@ -1257,7 +1490,9 @@ async fn receive_loop(
                 match decode_feedback(config, frame.data()) {
                     Ok(Some(feedback)) => {
                         let mut shared = state.lock().unwrap();
-                        if bitrate_requires_reconnect.load(Ordering::Acquire) {
+                        if communication_requires_reconnect.load(Ordering::Acquire)
+                            || config.motor_id != shared.view.motor_id
+                        {
                             continue;
                         }
                         if let CanId::Standard(id) = frame.id() {
@@ -1296,14 +1531,14 @@ async fn refresh_loop(
     state: Arc<StdMutex<SharedState>>,
     running: Arc<AtomicBool>,
     control_gate: Arc<AsyncMutex<()>>,
-    bitrate_requires_reconnect: Arc<AtomicBool>,
+    communication_requires_reconnect: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(STATUS_REQUEST_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while running.load(Ordering::Acquire) {
         ticker.tick().await;
         let _guard = control_gate.lock().await;
-        if bitrate_requires_reconnect.load(Ordering::Acquire) {
+        if communication_requires_reconnect.load(Ordering::Acquire) {
             continue;
         }
         let config = *config.lock().unwrap();
@@ -1453,40 +1688,51 @@ async fn wait_parameter_reply(
     register: u8,
     expected_value: Option<u32>,
 ) -> Result<CanFrame> {
-    tokio::time::timeout(PARAMETER_RESPONSE_TIMEOUT, async {
-        loop {
-            let frame = match rx.recv().await {
-                Ok(frame) => frame,
-                Err(CanIoError::Lagged { .. }) => continue,
-                Err(error) => bail!("receive DAMIAO parameter reply: {error}"),
-            };
-            let data = frame.data();
-            if !matches!(frame.id(), CanId::Standard(id)
-                if id != STATUS_REQUEST_ID && feedback_can_id.is_none_or(|expected| expected == id))
-                || !is_data_frame(&frame)
-                || !is_parameter_reply_for(motor_id, data)
-                || data[2] != command
-                || data[3] != register
-            {
-                continue;
-            }
-            if command == SAVE_PARAMETERS_COMMAND {
-                if data.len() == 4 || (data.len() == 8 && data[4..] == [0, 0, 0, 0]) {
-                    return Ok(frame);
-                }
-            } else if data.len() == 8 {
-                let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                if expected_value.is_none_or(|expected| expected == value) {
-                    return Ok(frame);
-                }
-            }
-        }
-    })
+    tokio::time::timeout(PARAMETER_RESPONSE_TIMEOUT, receive_parameter_reply(
+        rx, feedback_can_id, &[motor_id], command, register, expected_value,
+    ))
     .await
     .map_err(|_| anyhow!(
         "DAMIAO command 0x{command:02X}, register 0x{register:02X} was not acknowledged within {} ms",
         PARAMETER_RESPONSE_TIMEOUT.as_millis()
     ))?
+}
+
+async fn receive_parameter_reply(
+    rx: &mut dyn can_transport::CanRx,
+    feedback_can_id: Option<u16>,
+    motor_ids: &[u16],
+    command: u8,
+    register: u8,
+    expected_value: Option<u32>,
+) -> Result<CanFrame> {
+    loop {
+        let frame = match rx.recv().await {
+            Ok(frame) => frame,
+            Err(CanIoError::Lagged { .. }) => continue,
+            Err(error) => bail!("receive DAMIAO parameter reply: {error}"),
+        };
+        let data = frame.data();
+        if !matches!(frame.id(), CanId::Standard(id)
+                if id != STATUS_REQUEST_ID && feedback_can_id.is_none_or(|expected| expected == id))
+            || !is_data_frame(&frame)
+            || !motor_ids.iter().any(|id| is_parameter_reply_for(*id, data))
+            || data[2] != command
+            || data[3] != register
+        {
+            continue;
+        }
+        if command == SAVE_PARAMETERS_COMMAND {
+            if data.len() == 4 || (data.len() == 8 && data[4..] == [0, 0, 0, 0]) {
+                return Ok(frame);
+            }
+        } else if data.len() == 8 {
+            let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
+            if expected_value.is_none_or(|expected| expected == value) {
+                return Ok(frame);
+            }
+        }
+    }
 }
 
 fn encode_target(config: DamiaoConfig, target: DamiaoTarget) -> Result<[u8; 8]> {
@@ -1802,6 +2048,22 @@ mod tests {
         CanFrame::new_data(0x23u16, &[1, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 25, 26]).unwrap()
     }
 
+    fn id_reply(motor_id: u16, command: u8, value: u32) -> CanFrame {
+        let mut data = parameter_write_payload(motor_id, MOTOR_ID_REGISTER, value);
+        data[2] = command;
+        CanFrame::new_data(0x23u16, &data).unwrap()
+    }
+
+    fn disabled_reply_for(motor_id: u16) -> CanFrame {
+        let mut data = disabled_reply().data().to_vec();
+        data[0] = motor_id as u8 & 0x0F;
+        CanFrame::new_data(0x23u16, &data).unwrap()
+    }
+
+    fn save_reply_for(motor_id: u16) -> CanFrame {
+        CanFrame::new_data(0x23u16, &[motor_id as u8, (motor_id >> 8) as u8, 0xAA, 1]).unwrap()
+    }
+
     fn telemetry_reply(status: u8, position_rad: f32, velocity_rad_s: f32) -> CanFrame {
         let position = float_to_uint(position_rad, -12.5, 12.5, 16, "position").unwrap();
         let velocity = float_to_uint(velocity_rad_s, -30.0, 30.0, 12, "velocity").unwrap();
@@ -1857,10 +2119,290 @@ mod tests {
                 kd: 0.0,
             }))),
             control_gate: Arc::new(AsyncMutex::new(())),
-            bitrate_requires_reconnect: Arc::new(AtomicBool::new(false)),
+            communication_requires_reconnect: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             tasks: StdMutex::new(Vec::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn id_changes_verify_new_routing_keep_master_id_and_optionally_save_in_every_mode() {
+        for (mode, new_id, ack_id, save) in [
+            (DamiaoMode::Mit, 2, 1, true),
+            (DamiaoMode::PositionVelocity, 0, 0, false),
+            (DamiaoMode::Velocity, 0x11, 0x11, true),
+        ] {
+            let mut replies = vec![
+                vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+                vec![], // The requested ID is unoccupied.
+                vec![disabled_reply()],
+                vec![id_reply(ack_id, WRITE_PARAMETER_COMMAND, u32::from(new_id))],
+                vec![id_reply(new_id, READ_PARAMETER_COMMAND, u32::from(new_id))],
+                vec![disabled_reply_for(new_id)],
+            ];
+            if save {
+                replies.push(vec![save_reply_for(new_id)]);
+            }
+            let bus = ScriptedBus::new(replies);
+            let session = test_session(bus.clone(), mode, true);
+            let result = session.set_motor_id(new_id, save).await.unwrap();
+            assert!(result.verified);
+            assert_eq!(result.saved, save);
+            assert!(result.error.is_none());
+            assert_eq!(result.state.motor_id, new_id);
+            assert_eq!(result.state.master_id, 0);
+            assert_eq!(result.state.feedback_can_id, Some(0x23));
+            assert!(result.state.online);
+            assert!(
+                !result.state.enabled
+                    && !result.state.streaming
+                    && !result.state.requires_reconnect
+            );
+            let frames = bus.frames.lock().unwrap().clone();
+            assert_eq!(frames[0].data(), [1, 0, 0x33, 8]);
+            assert_eq!(frames[1].data(), [new_id as u8, 0, 0x33, 8]);
+            assert_eq!(frames[2].id(), CanId::Standard(1));
+            assert_eq!(frames[3].id(), CanId::Standard(0x7FF));
+            assert_eq!(frames[3].data(), [1, 0, 0x55, 8, new_id as u8, 0, 0, 0]);
+            assert_eq!(frames[4].data(), [new_id as u8, 0, 0x33, 8]);
+            assert_eq!(frames[5].id(), CanId::Standard(new_id));
+            assert_eq!(frames.len(), if save { 7 } else { 6 });
+            if save {
+                assert_eq!(frames[6].data(), [new_id as u8, 0, 0xAA, 1]);
+            }
+
+            let target = match mode {
+                DamiaoMode::Mit => DamiaoTarget::Mit {
+                    position_rad: 0.0,
+                    velocity_rad_s: 0.0,
+                    torque_nm: 0.0,
+                    kp: 0.0,
+                    kd: 0.0,
+                },
+                DamiaoMode::PositionVelocity => DamiaoTarget::PositionVelocity {
+                    position_rad: 0.0,
+                    velocity_rad_s: 0.0,
+                },
+                DamiaoMode::Velocity => DamiaoTarget::Velocity {
+                    velocity_rad_s: 0.0,
+                },
+            };
+            session.send_target(target, false).await.unwrap();
+            session.shutdown().await.unwrap();
+            let frames = bus.frames.lock().unwrap();
+            assert_eq!(
+                frames[frames.len() - 2].id(),
+                CanId::Standard(control_id(new_id, mode).unwrap())
+            );
+            assert_eq!(frames.last().unwrap().id(), CanId::Standard(new_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn id_change_rejects_invalid_same_occupied_and_mismatched_addresses_before_writing() {
+        let bus = ScriptedBus::new(vec![]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        assert!(session.set_motor_id(0x100, true).await.is_err());
+        assert!(bus.frames.lock().unwrap().is_empty());
+
+        let bus = ScriptedBus::new(vec![vec![id_reply(1, READ_PARAMETER_COMMAND, 1)]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let result = session.set_motor_id(1, true).await.unwrap();
+        assert!(result.verified && !result.saved);
+        assert!(result.state.enabled && result.state.streaming);
+        assert_eq!(bus.frames.lock().unwrap().len(), 1);
+
+        let bus = ScriptedBus::new(vec![
+            vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+            vec![
+                CanFrame::new_data(0x24u16, id_reply(2, READ_PARAMETER_COMMAND, 2).data()).unwrap(),
+            ],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        assert!(session
+            .set_motor_id(2, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already in use"));
+        assert_eq!(bus.frames.lock().unwrap().len(), 2);
+        assert_eq!(session.snapshot().motor_id, 1);
+        assert!(!session.requires_reconnect());
+
+        let bus = ScriptedBus::new(vec![vec![id_reply(1, READ_PARAMETER_COMMAND, 3)]]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        assert!(session
+            .set_motor_id(2, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        assert_eq!(bus.frames.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn id_change_requires_fresh_disabled_feedback_before_writing() {
+        let bus = ScriptedBus::new(vec![
+            vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+            vec![],
+            vec![telemetry_reply(1, 0.0, 0.0), disabled_reply_for(2)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        assert!(session
+            .set_motor_id(2, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disable was not confirmed"));
+        assert!(!session.snapshot().streaming);
+        assert!(!session.requires_reconnect());
+        assert_eq!(bus.frames.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn id_readback_recovers_a_lost_write_reply_without_repeating_the_write() {
+        let bus = ScriptedBus::new(vec![
+            vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+            vec![],
+            vec![disabled_reply()],
+            vec![],
+            vec![id_reply(2, READ_PARAMETER_COMMAND, 2)],
+            vec![disabled_reply_for(2)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let result = session.set_motor_id(2, false).await.unwrap();
+        assert!(result.verified && result.error.is_none());
+        assert_eq!(result.state.motor_id, 2);
+        assert!(!session.requires_reconnect());
+        assert_eq!(
+            bus.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| frame.data().get(2) == Some(&WRITE_PARAMETER_COMMAND))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn id_write_acknowledgement_without_valid_readback_blocks_commands_and_stale_teardown() {
+        for readback in [vec![], vec![id_reply(2, READ_PARAMETER_COMMAND, 3)]] {
+            let bus = ScriptedBus::new(vec![
+                vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+                vec![],
+                vec![disabled_reply()],
+                vec![id_reply(1, WRITE_PARAMETER_COMMAND, 2)],
+                readback,
+            ]);
+            let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+            let result = session.set_motor_id(2, true).await.unwrap();
+            assert!(!result.verified && !result.saved);
+            assert!(result.state.requires_reconnect);
+            assert!(!result.state.online && !result.state.streaming);
+            assert_eq!(result.state.motor_id, 1);
+            assert!(result.error.unwrap().contains("may already have changed"));
+            assert!(session.enable().await.is_err());
+            assert!(session.disable().await.is_err());
+            assert!(session.save_parameters().await.is_err());
+            assert!(session.set_motor_id(2, true).await.is_err());
+            assert!(session
+                .send_target(
+                    DamiaoTarget::Mit {
+                        position_rad: 0.0,
+                        velocity_rad_s: 0.0,
+                        torque_nm: 0.0,
+                        kp: 0.0,
+                        kd: 0.0,
+                    },
+                    true
+                )
+                .await
+                .is_err());
+            session.shutdown().await.unwrap();
+            assert_eq!(bus.frames.lock().unwrap().len(), 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn id_save_failure_retains_verified_new_address_and_allows_saving_without_rewriting_id() {
+        let mut bitrate = parameter_write_payload(2, CAN_BITRATE_REGISTER, 4);
+        bitrate[2] = READ_PARAMETER_COMMAND;
+        let bus = ScriptedBus::new(vec![
+            vec![id_reply(1, READ_PARAMETER_COMMAND, 1)],
+            vec![],
+            vec![disabled_reply()],
+            vec![id_reply(1, WRITE_PARAMETER_COMMAND, 2)],
+            vec![id_reply(2, READ_PARAMETER_COMMAND, 2)],
+            vec![disabled_reply_for(2)],
+            vec![],
+            vec![CanFrame::new_data(0x23u16, &bitrate).unwrap()],
+            vec![disabled_reply_for(2)],
+            vec![save_reply_for(2)],
+        ]);
+        let session = test_session(bus.clone(), DamiaoMode::Mit, true);
+        let result = session.set_motor_id(2, true).await.unwrap();
+        assert!(result.verified && !result.saved);
+        assert_eq!(result.state.motor_id, 2);
+        assert!(!result.state.requires_reconnect);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("Flash storage was not confirmed"));
+        session.save_parameters().await.unwrap();
+        assert!(session.snapshot().last_error.is_none());
+        let frames = bus.frames.lock().unwrap();
+        assert_eq!(frames.len(), 10);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.data().get(2) == Some(&WRITE_PARAMETER_COMMAND))
+                .count(),
+            1
+        );
+        assert_eq!(frames[9].data(), [2, 0, 0xAA, 1]);
+    }
+
+    #[tokio::test]
+    async fn discovery_migrates_an_attached_id_without_old_entries_or_probe_interference() {
+        let shared = Arc::new(StdMutex::new(DiscoveryState::default()));
+        shared.lock().unwrap().attached.insert(1);
+        record_discovery_feedback(&mut shared.lock().unwrap(), 1, 0x23, 0, Instant::now());
+        let discovery = DamiaoDiscovery {
+            state: shared.clone(),
+            scan_gate: Arc::new(AsyncMutex::new(())),
+            running: Arc::new(AtomicBool::new(false)),
+            request_safe_sweep: Arc::new(AtomicBool::new(false)),
+            tasks: StdMutex::new(Vec::new()),
+        };
+        let session = test_session(ScriptedBus::new(vec![]), DamiaoMode::Mit, false);
+        let mut snapshot = session.snapshot();
+        snapshot.motor_id = 0x12;
+        snapshot.online = true;
+        snapshot.feedback_can_id = Some(0x23);
+        discovery.rename_attached(1, &snapshot);
+        assert!(!record_discovery_feedback(
+            &mut shared.lock().unwrap(),
+            1,
+            0x23,
+            0,
+            Instant::now()
+        ));
+        assert!(record_discovery_feedback(
+            &mut shared.lock().unwrap(),
+            2,
+            0x23,
+            0,
+            Instant::now()
+        ));
+        let devices = discovery.snapshot();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].motor_id, 0x12);
+        assert!(devices[0].attached && devices[0].online);
+        let guard = discovery.suspend_scanning().await;
+        assert!(discovery.scan_gate.try_lock().is_err());
+        drop(guard);
+        assert!(discovery.scan_gate.try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -2340,7 +2882,7 @@ mod tests {
             session.config.clone(),
             session.state.clone(),
             running.clone(),
-            session.bitrate_requires_reconnect.clone(),
+            session.communication_requires_reconnect.clone(),
         ));
         let discovery = tokio::spawn(discovery_receive_loop(
             discovery_rx,

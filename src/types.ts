@@ -86,6 +86,15 @@ export interface DamiaoBitrateState {
   requires_reconnect: boolean;
 }
 
+export interface DamiaoIdChangeResult {
+  previous_motor_id: number;
+  requested_motor_id: number;
+  verified: boolean;
+  saved: boolean;
+  error: string | null;
+  state: DamiaoState;
+}
+
 // Unit RollerCAN stock motor-control firmware (CAN 2.0B, 29-bit, 1 Mbps).
 // The independent RollerCAN SmartKnob firmware remains represented by the
 // SmartKnob types further below.

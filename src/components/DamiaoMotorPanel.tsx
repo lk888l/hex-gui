@@ -24,7 +24,7 @@ import {
 import { api, errMsg } from "../api";
 import { useI18n } from "../i18n";
 import { useDamiaoTelemetry } from "../useDamiaoTelemetry";
-import type { DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoMode, DamiaoState, DamiaoTarget } from "../types";
+import type { DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoIdChangeResult, DamiaoMode, DamiaoState, DamiaoTarget } from "../types";
 import { DamiaoLiveChart } from "./DamiaoLiveChart";
 import "./DamiaoMotorPanel.css";
 
@@ -48,7 +48,9 @@ export function DamiaoMotorPanel({ connected, onBusyChange }: { connected: boole
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [listBusy, setListBusy] = useState<"rescan" | "disable" | null>(null);
   const [detailBusy, setDetailBusy] = useState(false);
+  const [lastIdChange, setLastIdChange] = useState<DamiaoIdChangeResult | null>(null);
   const listBusyRef = useRef(false);
+  const deviceVersion = useRef(0);
 
   useEffect(() => {
     onBusyChange?.(detailBusy || listBusy != null);
@@ -61,22 +63,25 @@ export function DamiaoMotorPanel({ connected, onBusyChange }: { connected: boole
       setDevices([]);
       return;
     }
+    const version = deviceVersion.current;
     const next = await api.damiaoListDevices();
-    setDevices(next);
+    if (version === deviceVersion.current) setDevices(next);
   }, [connected]);
 
   useEffect(() => {
     if (!connected) {
       setDevices([]);
       setSelectedMotorId(null);
+      setLastIdChange(null);
       return;
     }
     let alive = true;
     let timer: number | undefined;
     const tick = async () => {
       try {
+        const version = deviceVersion.current;
         const next = await api.damiaoListDevices();
-        if (alive) {
+        if (alive && version === deviceVersion.current) {
           setDevices(next);
           setDiscoveryError(null);
         }
@@ -100,6 +105,27 @@ export function DamiaoMotorPanel({ connected, onBusyChange }: { connected: boole
   }, [devices, manual, selectedMotorId]);
 
   const selectedDevice = devices.find((device) => device.motor_id === selectedMotorId);
+  const motorIdChanged = useCallback((result: DamiaoIdChangeResult, migrate = true) => {
+    setLastIdChange(result);
+    if (!result.verified || !migrate) return;
+    deviceVersion.current += 1;
+    const next = result.state;
+    setDevices((previous) => [
+      ...previous.filter((device) => device.motor_id !== result.previous_motor_id && device.motor_id !== next.motor_id),
+      {
+        motor_id: next.motor_id,
+        feedback_can_id: next.feedback_can_id,
+        online: next.online,
+        attached: next.attached,
+        status_code: next.status_code,
+        status: next.status,
+        feedback_age_ms: next.feedback_age_ms,
+        rx_count: next.rx_count,
+      },
+    ].sort((a, b) => a.motor_id - b.motor_id));
+    setSelectedMotorId(next.motor_id);
+    setManual(false);
+  }, []);
   const attachedCount = devices.filter((device) => device.attached).length;
   const copy = zh
     ? {
@@ -237,9 +263,11 @@ export function DamiaoMotorPanel({ connected, onBusyChange }: { connected: boole
       </aside>
       <section className="damiao-workspace__detail">
         <DamiaoMotorDetail
-          key={manual ? `manual-${manualKey}` : `motor-${selectedDevice?.motor_id ?? "default"}`}
+          key={manual ? `manual-${manualKey}` : `motor-${selectedMotorId ?? "default"}`}
           connected={connected}
           initialDevice={manual ? undefined : selectedDevice}
+          initialIdChange={lastIdChange?.state.motor_id === selectedDevice?.motor_id ? lastIdChange : null}
+          onMotorIdChanged={motorIdChanged}
           onDevicesChanged={refreshDevices}
           onBusyChange={setDetailBusy}
         />
@@ -251,11 +279,15 @@ export function DamiaoMotorPanel({ connected, onBusyChange }: { connected: boole
 function DamiaoMotorDetail({
   connected,
   initialDevice,
+  initialIdChange,
+  onMotorIdChanged,
   onDevicesChanged,
   onBusyChange,
 }: {
   connected: boolean;
   initialDevice?: DamiaoDiscoveredDevice;
+  initialIdChange: DamiaoIdChangeResult | null;
+  onMotorIdChanged: (result: DamiaoIdChangeResult, migrate?: boolean) => void;
   onDevicesChanged: () => Promise<void>;
   onBusyChange: (busy: boolean) => void;
 }) {
@@ -266,14 +298,18 @@ function DamiaoMotorDetail({
   const initialMotorId = initialDevice?.motor_id ?? 1;
   const [motorId, setMotorId] = useState(formatCanId(initialMotorId));
   const [masterId, setMasterId] = useState(formatCanId(initialDevice?.feedback_can_id ?? 0));
-  const [mode, setMode] = useState<DamiaoMode>("Mit");
+  const [mode, setMode] = useState<DamiaoMode>(initialIdChange?.state.mode ?? "Mit");
   const [pMax, setPMax] = useState(MAPPING_P_MAX_RAD);
   const [vMax, setVMax] = useState(MAPPING_V_MAX_RAD_S);
   const [tMax, setTMax] = useState(MAPPING_T_MAX_NM);
-  const [state, setState] = useState<DamiaoState | null>(null);
+  const [state, setState] = useState<DamiaoState | null>(initialDevice?.attached ? initialIdChange?.state ?? null : null);
   const [detachedLocally, setDetachedLocally] = useState(false);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  const [newMotorId, setNewMotorId] = useState("");
+  const [saveId, setSaveId] = useState(true);
+  const [idError, setIdError] = useState<string | null>(null);
+  const [idOutcome, setIdOutcome] = useState<DamiaoIdChangeResult | null>(initialIdChange);
   const [bitrateState, setBitrateState] = useState<DamiaoBitrateState | null>(null);
   const [newBitrate, setNewBitrate] = useState(1_000_000);
   const [bitrateError, setBitrateError] = useState<string | null>(null);
@@ -468,9 +504,11 @@ function DamiaoMotorDetail({
       setBitrateOutcome(null);
       setZeroOutcome(null);
       setZeroError(null);
+      setIdOutcome(null);
+      setIdError(null);
       return;
     }
-    if (latest == null || !attached) return;
+    if (latest == null || !attached || busy || latest.motor_id !== attachedMotorId) return;
     setState(latest);
     setMotorId(formatCanId(latest.motor_id));
     setMasterId(formatCanId(latest.master_id));
@@ -478,7 +516,7 @@ function DamiaoMotorDetail({
     setPMax(latest.p_max);
     setVMax(latest.v_max);
     setTMax(latest.t_max);
-  }, [attached, connected, latest]);
+  }, [attached, attachedMotorId, busy, connected, latest]);
 
   const run = useCallback(
     async (success: string, action: () => Promise<unknown>) => {
@@ -539,6 +577,8 @@ function DamiaoMotorDetail({
         setBitrateError(null);
         setZeroOutcome(null);
         setZeroError(null);
+        setIdOutcome(null);
+        setIdError(null);
         await onDevicesChanged().catch(() => {});
       });
     } catch {
@@ -581,6 +621,114 @@ function DamiaoMotorDetail({
       // Error was surfaced by `run`.
     }
   };
+
+  const changeMotorId = async () => {
+    if (!controlsReady || attachedMotorId == null || busyRef.current) return;
+    let requestedId: number;
+    try {
+      requestedId = parseCanId(newMotorId, 0xff, zh ? "新电机 ID" : "New motor ID");
+      if (requestedId === attachedMotorId) {
+        message.info(zh ? "新 ID 与当前 ID 相同，无需修改" : "The motor already uses this ID");
+        return;
+      }
+    } catch (error) {
+      setIdError(errMsg(error));
+      return;
+    }
+    try {
+      await run("", async () => {
+        setIdError(null);
+        setIdOutcome(null);
+        const result = await api.damiaoSetMotorId(attachedMotorId, requestedId, saveId);
+        setState(result.state);
+        setMotorId(formatCanId(result.state.motor_id));
+        setIdOutcome(result);
+        setBitrateState(null);
+        setRepeat(false);
+        resetHistory(result.state);
+        onMotorIdChanged(result);
+        if (result.error) {
+          message.warning(zh ? "请查看电机 ID 修改结果" : "Review the motor ID change result");
+        } else {
+          message.success(zh
+            ? `电机 ID 已改为 ${formatCanId(result.state.motor_id)}${result.saved ? "，已保存到 Flash" : "（未保存到 Flash）"}`
+            : `Motor ID changed to ${formatCanId(result.state.motor_id)}${result.saved ? "; saved to Flash" : "; not saved to Flash"}`);
+        }
+        await onDevicesChanged().catch(() => {});
+      });
+    } catch (error) {
+      setIdError(errMsg(error));
+    }
+  };
+
+  const saveParameters = async () => {
+    if (!controlsReady || attachedMotorId == null) return;
+    await action(async () => {
+      await api.damiaoSaveParameters(attachedMotorId);
+      if (idOutcome?.verified && idOutcome.state.motor_id === attachedMotorId) {
+        const result = { ...idOutcome, saved: true, error: null, state: await api.damiaoGetState(attachedMotorId) };
+        setIdOutcome(result);
+        onMotorIdChanged(result, false);
+      }
+    }, zh ? "电机已失能，当前全部参数已保存到 Flash" : "Motor disabled; all current parameters saved to Flash");
+  };
+
+  const idPanel = (
+    <Card size="small" className="damiao-id-card" title={zh ? "电机 ID" : "Motor ID"}>
+      <div className="damiao-id-settings">
+        <div className="damiao-id-current">
+          <Typography.Text type="secondary">{zh ? "当前电机 ID" : "Current motor ID"}</Typography.Text>
+          <Typography.Text strong className="damiao-tabular">{attachedMotorId != null ? formatCanId(attachedMotorId) : "—"}</Typography.Text>
+          <Typography.Text type="secondary">{zh ? "反馈 Master ID" : "Feedback Master ID"}: {state?.feedback_can_id != null ? formatCanId(state.feedback_can_id) : "—"}</Typography.Text>
+        </div>
+        <Space wrap align="end">
+          <Field label={zh ? "新电机 ID" : "New motor ID"}>
+            <Input value={newMotorId} placeholder={zh ? "如 2 或 0x02" : "e.g. 2 or 0x02"} disabled={!controlsReady || busy} onChange={(event) => setNewMotorId(event.target.value)} style={{ width: 180 }} />
+          </Field>
+          <Space>
+            <Switch checked={saveId} disabled={!controlsReady || busy} onChange={setSaveId} />
+            <Typography.Text>{zh ? "保存到 Flash" : "Save to Flash"}</Typography.Text>
+          </Space>
+          <Button type="primary" disabled={!controlsReady || busy || !newMotorId.trim()} onClick={() => void changeMotorId()}>
+            {zh ? "失能并修改 ID" : "Disable & change ID"}
+          </Button>
+          {idOutcome?.verified && !idOutcome.saved && (
+            <Button disabled={!controlsReady || busy} onClick={() => void saveParameters()}>
+              {zh ? "失能并保存全部参数" : "Disable & save all parameters"}
+            </Button>
+          )}
+        </Space>
+      </div>
+      <Typography.Paragraph className="damiao-id-hint" type="secondary">
+        {zh
+          ? "支持十进制或 0x 开头的十六进制，范围 0x00–0xFF；手册建议使用 0x00–0x0F。修改会停止定时目标、确认失能，并校验新 ID，随后自动切换当前连接。反馈 Master ID 保持当前值。"
+          : "Enter decimal or 0x-prefixed hexadecimal, 0x00–0xFF; the manual recommends 0x00–0x0F. Changing stops periodic targets, confirms disabled feedback, verifies the new ID and updates the connection. Feedback Master ID keeps its current value."}
+      </Typography.Paragraph>
+      <Typography.Paragraph className="damiao-id-hint" type="secondary">
+        {zh
+          ? "保存到 Flash 后断电仍保留新 ID。保存会写入当前全部参数（包含运行时控制模式），请勿频繁保存。应用检查已发现电机的 ID 冲突，并查询目标 ID 是否占用；尚未响应的设备仍可能无法检测，首次配置建议单独连接目标电机。"
+          : "Saving to Flash keeps the new ID after power loss and writes all current parameters, including the runtime control mode. Avoid frequent saves. The app checks discovered ID conflicts and queries the requested address; unresponsive devices may escape detection, so configure a motor on its own initially."}
+      </Typography.Paragraph>
+      {idError && <Alert type="error" showIcon message={zh ? "ID 修改未完成" : "ID change not completed"} description={idError} />}
+      {idOutcome && (
+        <Alert
+          type={idOutcome.error || !idOutcome.saved ? "warning" : "success"}
+          showIcon
+          message={idOutcome.verified
+            ? zh ? `新 ID ${formatCanId(idOutcome.state.motor_id)} 已验证${idOutcome.saved ? "，已保存到 Flash" : "，未确认保存到 Flash"}` : `New ID ${formatCanId(idOutcome.state.motor_id)} verified${idOutcome.saved ? "; saved to Flash" : "; Flash storage not confirmed"}`
+            : zh ? "电机实际 ID 尚未确认，请重新连接后检查" : "Actual motor ID is uncertain; reconnect and check"}
+          description={idOutcome.verified
+            ? idOutcome.error ?? (idOutcome.saved ? undefined : zh ? "新 ID 已生效。可使用“失能并保存全部参数”保存；未保存时断电可能恢复原 ID。" : "The new ID is active. Use Disable & save all parameters to persist it; power loss can restore the previous ID until saved.")
+            : <Space direction="vertical" size={4}>
+                <Typography.Text>{zh
+                  ? `请在顶部断开并重新连接 CAN，检查原 ID ${formatCanId(idOutcome.previous_motor_id)} 和目标 ID ${formatCanId(idOutcome.requested_motor_id)}。通信确认前控制保持锁定。`
+                  : `Disconnect and reconnect CAN above, then check previous ID ${formatCanId(idOutcome.previous_motor_id)} and requested ID ${formatCanId(idOutcome.requested_motor_id)}. Controls stay locked until communication is verified.`}</Typography.Text>
+                <Typography.Text>{idOutcome.error}</Typography.Text>
+              </Space>}
+        />
+      )}
+    </Card>
+  );
 
   const readBitrate = async () => {
     if (attachedMotorId == null || requiresReconnect) return;
@@ -727,7 +875,7 @@ function DamiaoMotorDetail({
           </Typography.Text>
           <Typography.Text type="secondary">
             {requiresReconnect
-              ? zh ? "主机需按目标波特率重新连接后再读取" : "Reconnect the host at the target bitrate before reading"
+              ? zh ? "重新连接并确认电机 ID 与波特率后再读取" : "Reconnect and verify the motor ID and bitrate before reading"
               : bitrateState
               ? `${zh ? "已读取" : "Read"} · ${zh ? "代码" : "code"} ${bitrateState.register_code}`
               : zh ? "挂载后读取电机，再选择新速率" : "Attach and read the motor before choosing a new rate"}
@@ -748,7 +896,7 @@ function DamiaoMotorDetail({
           <Button type="primary" disabled={!controlsReady || busy || !bitrateState || newBitrate === bitrateState.bitrate} onClick={() => void changeBitrate()}>
             {zh ? "失能并切换波特率" : "Disable & change bitrate"}
           </Button>
-          <Button disabled={!controlsReady || busy || !bitrateState} onClick={() => attachedMotorId != null && action(() => api.damiaoSaveParameters(attachedMotorId), zh ? "电机已失能，当前全部参数已保存到 Flash" : "Motor disabled; all current parameters saved to Flash")}>
+          <Button disabled={!controlsReady || busy || !bitrateState} onClick={() => void saveParameters()}>
             {zh ? "失能并保存全部参数" : "Disable & save all parameters"}
           </Button>
         </Space>
@@ -980,7 +1128,7 @@ function DamiaoMotorDetail({
         </Space>
       </div>
 
-      {!motionReady && <Alert type="info" showIcon message={requiresReconnect ? zh ? "波特率已切换，请先重新连接 CAN 并读取确认。" : "Bitrate changed; reconnect CAN and read to verify first." : copy.targetLocked} />}
+      {!motionReady && <Alert type="info" showIcon message={requiresReconnect ? zh ? "电机 ID 或波特率已变化或尚未确认，请先重新连接 CAN 并检查通信。" : "Motor ID or bitrate changed or is uncertain; reconnect CAN and verify communication first." : copy.targetLocked} />}
       <Space wrap className="damiao-target-actions">
         <Button type="primary" disabled={!motionReady || busy} onClick={() => attachedMotorId != null && action(() => api.damiaoSendTarget(attachedMotorId, target(), targetRepeats), copy.sendOk)}>
           {copy.send}
@@ -1038,6 +1186,8 @@ function DamiaoMotorDetail({
           { key: "connection", label: copy.connection, extra: attached ? <Tag color="green">{copy.connected}</Tag> : undefined, children: connectionPanel },
         ]}
       />
+
+        {idPanel}
 
         {zeroPanel}
 

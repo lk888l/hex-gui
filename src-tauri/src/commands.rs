@@ -21,8 +21,8 @@ use tauri::State;
 use crate::backend;
 use crate::can_lease::{CanOwner, CanTransportGate};
 use crate::damiao::{
-    DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoDiscovery, DamiaoMode,
-    DamiaoSession, DamiaoState, DamiaoTarget,
+    DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoDiscovery,
+    DamiaoIdChangeResult, DamiaoMode, DamiaoSession, DamiaoState, DamiaoTarget,
 };
 use crate::diag::{EventsSnapshot, LogLine};
 use crate::dto::{
@@ -224,7 +224,7 @@ async fn damiao_discovery_locked(state: &AppState) -> CmdResult<Arc<DamiaoDiscov
         .values()
         .any(|session| session.requires_reconnect())
     {
-        return Err("DAMIAO bitrate changed or is uncertain; reconnect with matching host timing before scanning".into());
+        return Err("DAMIAO motor ID or bitrate changed or is uncertain; reconnect and verify communication before scanning".into());
     }
     let mut guard = state.damiao_discovery.lock().await;
     if let Some(discovery) = guard.as_ref() {
@@ -1476,7 +1476,7 @@ pub async fn damiao_attach(
     let bus = feature_bus_locked(&state).await?;
     let mut guard = state.damiao.lock().await;
     if guard.values().any(|session| session.requires_reconnect()) {
-        return Err("DAMIAO bitrate changed or is uncertain; disconnect and reconnect CAN before attaching another session".into());
+        return Err("DAMIAO motor ID or bitrate changed or is uncertain; disconnect and reconnect CAN before attaching another session".into());
     }
     if guard.contains_key(&config.motor_id) {
         return Err(format!(
@@ -1508,7 +1508,7 @@ pub async fn damiao_detach(state: State<'_, AppState>, motor_id: u16) -> CmdResu
     let _extension_op = state.extension_op.lock().await;
     let session = damiao_session(&state, motor_id).await?;
     if session.requires_reconnect() {
-        return Err("DAMIAO bitrate changed or is uncertain; disconnect and reconnect CAN instead of detaching the motor".into());
+        return Err("DAMIAO motor ID or bitrate changed or is uncertain; disconnect and reconnect CAN instead of detaching the motor".into());
     }
     session.shutdown().await.map_err(err)?;
     let mut guard = state.damiao.lock().await;
@@ -1528,6 +1528,115 @@ pub async fn damiao_detach(state: State<'_, AppState>, motor_id: u16) -> CmdResu
 #[tauri::command]
 pub async fn damiao_get_state(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
     Ok(damiao_session(&state, motor_id).await?.snapshot())
+}
+
+fn validate_damiao_id_change(
+    motor_id: u16,
+    new_motor_id: u16,
+    devices: &[DamiaoDiscoveredDevice],
+) -> CmdResult<()> {
+    if new_motor_id > 0xFF {
+        return Err(
+            "DAMIAO motor CAN ID must be in 0x000..=0x0FF; IDs below 0x10 are recommended".into(),
+        );
+    }
+    if let Some(device) = devices.iter().find(|device| {
+        device.motor_id != motor_id
+            && (device.attached || device.online)
+            && device.motor_id & 0x0F == new_motor_id & 0x0F
+    }) {
+        return Err(format!(
+            "DAMIAO motor ID 0x{new_motor_id:X} conflicts with motor 0x{:X}: V1.1 feedback carries only the low 4 ID bits; ID was not modified",
+            device.motor_id,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod damiao_id_tests {
+    use super::*;
+
+    #[test]
+    fn id_conflicts_include_offline_attached_sessions_and_low_nibble_aliases() {
+        let mut device = DamiaoDiscoveredDevice {
+            motor_id: 2,
+            feedback_can_id: Some(0x24),
+            online: false,
+            attached: true,
+            status_code: 0,
+            status: "disabled".into(),
+            feedback_age_ms: None,
+            rx_count: 0,
+        };
+        assert!(validate_damiao_id_change(1, 2, &[device.clone()]).is_err());
+        assert!(validate_damiao_id_change(1, 0x12, &[device.clone()]).is_err());
+        device.attached = false;
+        device.online = true;
+        assert!(validate_damiao_id_change(1, 2, &[device.clone()]).is_err());
+        assert!(validate_damiao_id_change(2, 0x12, &[device.clone()]).is_ok());
+        device.online = false;
+        assert!(validate_damiao_id_change(1, 2, &[device]).is_ok());
+        assert!(validate_damiao_id_change(1, 0x100, &[]).is_err());
+    }
+}
+
+#[tauri::command]
+pub async fn damiao_set_motor_id(
+    state: State<'_, AppState>,
+    motor_id: u16,
+    new_motor_id: u16,
+    save: bool,
+) -> CmdResult<DamiaoIdChangeResult> {
+    let _extension_op = state.extension_op.lock().await;
+    let _operation = state.device_settings_operation.acquire().await;
+    let session = damiao_session(&state, motor_id).await?;
+    let sessions: Vec<_> = state.damiao.lock().await.values().cloned().collect();
+    if sessions.iter().any(|session| session.requires_reconnect()) {
+        return Err("DAMIAO communication is uncertain; reconnect and verify motor IDs and bitrate before changing an ID".into());
+    }
+    let discovery = state.damiao_discovery.lock().await.clone();
+    let _scan_guard = match &discovery {
+        Some(discovery) => Some(discovery.suspend_scanning().await),
+        None => None,
+    };
+    let mut devices = discovery
+        .as_ref()
+        .map_or_else(Vec::new, |discovery| discovery.snapshot());
+    devices.extend(sessions.iter().map(|session| {
+        let snapshot = session.snapshot();
+        DamiaoDiscoveredDevice {
+            motor_id: snapshot.motor_id,
+            feedback_can_id: snapshot.feedback_can_id,
+            online: snapshot.online,
+            attached: true,
+            status_code: snapshot.status_code,
+            status: snapshot.status,
+            feedback_age_ms: snapshot.feedback_age_ms,
+            rx_count: snapshot.rx_count,
+        }
+    }));
+    validate_damiao_id_change(motor_id, new_motor_id, &devices)?;
+    let result = session
+        .set_motor_id(new_motor_id, save)
+        .await
+        .map_err(err)?;
+    if result.verified && result.state.motor_id != motor_id {
+        // Keep the same live session, receive tasks and bus ownership. No
+        // detach command may be sent to the now-vacant old motor address.
+        let mut guard = state.damiao.lock().await;
+        guard.remove(&motor_id);
+        guard.insert(result.state.motor_id, session);
+        drop(guard);
+        if let Some(discovery) = &discovery {
+            discovery.rename_attached(motor_id, &result.state);
+        }
+    } else if result.state.requires_reconnect {
+        if let Some(discovery) = state.damiao_discovery.lock().await.take() {
+            discovery.stop_and_wait().await;
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]

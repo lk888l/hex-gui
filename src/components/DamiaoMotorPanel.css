@@ -115,6 +115,7 @@
   margin-top: 8px;
 }
 
+.damiao-id-settings,
 .damiao-bitrate-settings {
   display: flex;
   flex-wrap: wrap;
@@ -123,12 +124,14 @@
   justify-content: space-between;
 }
 
+.damiao-id-current,
 .damiao-bitrate-current {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
+.damiao-id-current > .ant-typography:nth-child(2),
 .damiao-bitrate-current > .ant-typography:nth-child(2) {
   font-size: 20px;
 }
@@ -137,11 +140,13 @@
   min-width: 210px;
 }
 
+.damiao-id-hint.ant-typography,
 .damiao-bitrate-hint.ant-typography {
   margin-top: 12px;
   margin-bottom: 0;
 }
 
+.damiao-id-card .ant-alert,
 .damiao-bitrate-card .ant-alert {
   margin-top: 12px;
 }

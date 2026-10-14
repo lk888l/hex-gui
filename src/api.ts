@@ -8,6 +8,7 @@ import type {
   DamiaoConfig,
   DamiaoBitrateState,
   DamiaoDiscoveredDevice,
+  DamiaoIdChangeResult,
   DamiaoMode,
   DamiaoState,
   DamiaoTarget,
@@ -116,6 +117,8 @@ export const api = {
   damiaoDetach: (motorId: number) => invoke<void>("damiao_detach", { motorId }),
   damiaoGetState: (motorId: number) =>
     invoke<DamiaoState>("damiao_get_state", { motorId }),
+  damiaoSetMotorId: (motorId: number, newMotorId: number, save: boolean) =>
+    invoke<DamiaoIdChangeResult>("damiao_set_motor_id", { motorId, newMotorId, save }),
   damiaoSetMode: (motorId: number, mode: DamiaoMode) =>
     invoke<DamiaoState>("damiao_set_mode", { motorId, mode }),
   damiaoGetBitrate: (motorId: number) =>

@@ -129,6 +129,37 @@ cd src-tauri && cargo run
 (Repeat `npm run build` after frontend changes, since `cargo run` embeds the
 built `dist/` rather than talking to the Vite dev server.)
 
+### DAMIAO standalone app: motor ID
+
+Attach the motor, enter a decimal or `0x`-prefixed hexadecimal ID under
+**Motor ID**, and click **Disable & change ID**. The app writes the uint32
+`ESC_ID` register (`0x08`) using the DM-J4310-2EC V1.1 manual V1.3
+(2026-09-14), stops periodic targets, requires fresh disabled feedback,
+and reads the register back at the new address before updating the selected
+motor and its live session. The feedback `MST_ID` is preserved. Supported
+IDs are `0x00`–`0xFF`; the manual recommends `0x00`–`0x0F`.
+
+**Save to Flash** is enabled by default. After confirming disabled feedback
+at the new address, the app sends the disabled-only storage command and
+waits for its acknowledgement and the manual's 30 ms Flash-write interval.
+Storage saves all current parameters, including the runtime control mode.
+Turn the switch off for a temporary ID change. A Flash-save failure keeps
+the verified new address active; **Disable & save all parameters** retries
+storage without rewriting the ID.
+
+The app rejects collisions with attached or discovered online motors,
+including IDs with identical low four bits, and queries the requested
+address for an undiscovered motor before writing. A device that does not
+respond can still evade detection; configure the motor on its own initially.
+Discovery probes pause during the transaction. A missing write reply can
+be recovered by readback at the new address. If readback cannot verify the
+change, the app blocks traffic for that session and stops discovery until
+CAN is reopened; check both the previous and requested IDs before retrying.
+
+For example, changing motor 1 to ID 2 writes
+`7FF#0100550802000000`, verifies with `7FF#02003308`, then saves with
+`7FF#0200AA01` when persistence is selected. The motor stays disabled.
+
 ### DAMIAO standalone app: CAN bitrate
 
 The DM-J4310-2EC app reads and writes the `can_br` register (`0x23`) using

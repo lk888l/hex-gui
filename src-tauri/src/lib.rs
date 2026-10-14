@@ -288,6 +288,7 @@ pub fn run() {
             commands::damiao_attach,
             commands::damiao_detach,
             commands::damiao_get_state,
+            commands::damiao_set_motor_id,
             commands::damiao_get_bitrate,
             commands::damiao_set_bitrate,
             commands::damiao_save_parameters,
