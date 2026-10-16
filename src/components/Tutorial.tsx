@@ -405,6 +405,43 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
+  el05: [
+    {
+      title: { en: "1 · Connect and select", zh: "1 · 连接并选择" },
+      body: {
+        en: "Connect an EL05 using RobStride's native protocol at 1 Mbps. Linux defaults to can0; USB adapters use gs_usb0. Host ID defaults to 0xFD. Scan, then select a discovered motor, or enter its ID manually. Selecting another motor stops the previous one.",
+        zh: "使用 RobStride 私有协议，以 1 Mbps 连接 EL05。Linux 默认 can0，USB 适配器使用 gs_usb0，主机 ID 默认为 0xFD。扫描后选择发现的电机，或手动输入 ID。切换电机时会先停止上一台。",
+      },
+    },
+    {
+      title: { en: "2 · Pendulum performance tests", zh: "2 · 摆锤性能测试" },
+      body: {
+        en: "The default Pendulum tests tab provides eleven presets, live traces and automatic metrics. Static friction calibration waits for rest, slowly ramps torque, then returns after detecting a small displacement; its maximum angle is configurable. Enter load geometry and capture the downward reference for gravity-based analysis. Start prepares the mode and drive automatically. Compare completed runs, export CSV/JSON/reports, or import earlier JSON. Manual control and settings have separate tabs.",
+        zh: "默认「摆锤性能测试」提供十一种工况、实时曲线与自动指标。「静摩擦标定」先确认静止、缓慢加转矩，检测到小角度起动后回落，最大偏转角可设。输入负载几何并测定下垂参考后，可进行重力修正。「一键开始测试」自动准备模式并使能。完成后可比较历史，导出 CSV、JSON 或报告，也可导入 JSON 复查。手动控制与设置位于独立分页。",
+      },
+    },
+    {
+      title: { en: "3 · Manual control modes", zh: "3 · 手动控制模式" },
+      body: {
+        en: "Motion/MIT combines position, velocity, torque and Kp/Kd. PP plans a position trajectory with speed and acceleration limits; CSP uses position and speed limits. Velocity and Current control their respective targets. Changing mode stops the motor; enable it again, then send the target.",
+        zh: "运控/MIT 同时设置位置、速度、转矩及 Kp/Kd；PP 使用速度和加速度规划位置轨迹，CSP 使用目标位置与速度限制；速度和电流模式分别控制对应目标。切换模式会停止电机，请重新使能后发送目标。",
+      },
+    },
+    {
+      title: { en: "4 · Watch feedback and stop", zh: "4 · 观察反馈并停止" },
+      body: {
+        en: "Switch between numeric feedback and position/velocity/torque charts. Use Stop / disable to end motion and target streaming. Parameter access includes current, voltage and multi-turn position; writes require a stopped motor. Disconnect and leaving this workspace stop the selected motor before releasing the bus.",
+        zh: "在数值反馈与位置、速度、转矩曲线之间切换。「停止 / 失能」结束运动和连续发送。参数区可读取电流、电压和多圈位置，写参数前需停止电机。断开连接和离开工作区都会先停止所选电机，再释放总线。",
+      },
+    },
+    {
+      title: { en: "5 · Device settings and identity", zh: "5 · 设备设置与身份信息" },
+      body: {
+        en: "Device settings & information reads CAN ID, MCU UID and the documented motor-version field. Changing ID accepts 0–127, stops the motor, checks address conflicts and verifies its UID at the new address. Version reads stop the motor too. Mechanical zero works in MIT / CSP and refreshes the position target. Firmware strings such as AppCodeVersion have no documented native-protocol read format in this manual.",
+        zh: "「设备设置与信息」可读取 CAN ID、MCU UID 和手册定义的电机版本字段。修改 ID 支持 0–127，会先停机、检查地址冲突，再核对新地址的 UID。读取版本也会停机。机械零点支持 MIT / CSP，设置后会更新位置目标。手册未提供 AppCodeVersion 等固件字符串的私有协议读取格式。",
+      },
+    },
+  ],
   rollercanControl: [
     {
       title: { en: "1 · Connect and discover", zh: "1 · 连接并发现" },

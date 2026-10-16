@@ -17,6 +17,7 @@ use can_transport::{
 pub enum CanOwner {
     Manager,
     Analyzer,
+    El05,
     DfuDiscovery,
     DfuUpdate,
 }
@@ -26,6 +27,7 @@ impl fmt::Display for CanOwner {
         formatter.write_str(match self {
             Self::Manager => "the normal CAN session",
             Self::Analyzer => "CAN Analyzer",
+            Self::El05 => "EL05 Motor Control",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
         })

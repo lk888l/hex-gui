@@ -16,6 +16,8 @@ mod device_registry;
 mod dfu_gate;
 mod diag;
 mod dto;
+mod el05;
+mod el05_commands;
 mod friction_calibration;
 mod hopea3;
 mod hpm_dfu;
@@ -241,6 +243,25 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::is_connected,
+            el05_commands::el05_connect,
+            el05_commands::el05_disconnect,
+            el05_commands::el05_get_state,
+            el05_commands::el05_scan,
+            el05_commands::el05_select_motor,
+            el05_commands::el05_set_mode,
+            el05_commands::el05_enable,
+            el05_commands::el05_stop,
+            el05_commands::el05_clear_fault,
+            el05_commands::el05_set_zero,
+            el05_commands::el05_read_identity,
+            el05_commands::el05_change_id,
+            el05_commands::el05_read_version,
+            el05_commands::el05_send_target,
+            el05_commands::el05_stop_stream,
+            el05_commands::el05_read_parameter,
+            el05_commands::el05_write_parameter,
+            el05_commands::el05_start_experiment,
+            el05_commands::el05_experiment_data,
             commands::list_devices,
             authenticity::authenticity_inspect,
             authenticity::authenticity_verify_online,

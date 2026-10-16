@@ -415,12 +415,15 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
 /// Confirm every extension-owned output is disabled before a manual
 /// disconnect releases the stock v1.4 manager and physical adapter.
 async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
-    let failures = collect_extension_stop_failures(
+    let mut failures = collect_extension_stop_failures(
         stop_active_smartknob(state),
         stop_rollercan_control(state, false),
         stop_damiao_sessions(state),
     )
     .await;
+    if let Err(error) = crate::el05_commands::stop_session(state, false).await {
+        failures.push(format!("EL05: {error}"));
+    }
     if !failures.is_empty() {
         // Keep every failed subsystem handle, the shared feature bus, and the
         // active marker intact so Stop/disconnect can retry confirmed disable.
@@ -462,6 +465,9 @@ async fn collect_extension_stop_failures(
 
 /// Best-effort variant used only after an extended window-close request.
 async fn force_stop_extension_runtime_locked(state: &AppState) {
+    if let Err(error) = crate::el05_commands::stop_session(state, true).await {
+        log::warn!("EL05 stop during forced close failed: {error}");
+    }
     if let Err(error) = stop_rollercan_control(state, true).await {
         log::warn!(
             "RollerCAN control disable during forced close failed; motor power must be removed before handling it: {error}"

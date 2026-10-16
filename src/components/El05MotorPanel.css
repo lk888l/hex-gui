@@ -1,0 +1,61 @@
+.el05-panel { width: 100%; max-width: 1760px; margin: 0 auto; }
+.el05-connection { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.el05-workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 16px; }
+.el05-sidebar, .el05-detail { min-width: 0; }
+.el05-sidebar .ant-card-body { padding: 12px; }
+.el05-device { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; width: 100%; margin-bottom: 8px; padding: 12px; border: 1px solid transparent; border-radius: 8px; color: inherit; background: rgba(255, 255, 255, 0.025); cursor: pointer; text-align: left; }
+.el05-device:hover, .el05-device--selected { border-color: #4f8cff; background: rgba(79, 140, 255, 0.1); }
+.el05-device:disabled { cursor: wait; opacity: 0.6; }
+.el05-device__title { display: flex; justify-content: space-between; width: 100%; }
+.el05-device__uid { max-width: 100%; font-size: 11px; overflow-wrap: anywhere; }
+.el05-manual { display: flex; gap: 7px; margin-top: 8px; }
+.el05-manual .ant-input { min-width: 0; }
+.el05-field { display: flex; flex-direction: column; gap: 5px; min-width: 145px; }
+.el05-field > .ant-input-number { width: 150px; }
+.el05-summary { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.el05-target { margin-top: 14px; padding: 14px; border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 8px; background: rgba(15, 23, 42, 0.25); }
+.el05-target__fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 12px 0; }
+.el05-description { margin-top: 10px; display: block; }
+.el05-number { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.el05-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.el05-metric { border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 8px; padding: 13px 15px; }
+.el05-metric__value { font-size: 25px; margin-top: 6px; line-height: 1.3; }
+.el05-metric__unit { font-size: 12px; margin-left: 6px; color: #8a93a3; }
+.el05-parameter { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.el05-parameter > .el05-field:first-child { flex: 1 1 310px; }
+.el05-settings-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.el05-settings-row .el05-field { width: 230px; }
+.el05-settings-zero { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding-top: 16px; border-top: 1px solid rgba(148, 163, 184, 0.2); }
+.el05-settings-zero > div { flex: 1 1 280px; }
+.el05-chart { width: 100%; height: 440px; }
+@media (max-width: 760px) { .el05-workspace { grid-template-columns: 1fr; } .el05-device { display: inline-flex; width: 230px; margin-right: 8px; vertical-align: top; } }
+@media (max-width: 620px) { .el05-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .el05-metric__value { font-size: 20px; } .el05-field { min-width: 120px; } .el05-field > .ant-input-number { width: 130px; } }
+
+.el05-experiments { display: flex; flex-direction: column; gap: 16px; }
+.el05-experiment-presets { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.el05-experiment-preset { min-height: 48px; padding: 10px 9px; border: 1px solid rgba(148, 163, 184, 0.23); border-radius: 7px; background: rgba(148, 163, 184, 0.04); color: inherit; font: inherit; font-size: 12px; cursor: pointer; text-align: left; }
+.el05-experiment-preset:hover, .el05-experiment-preset--selected { background: rgba(79, 140, 255, 0.15); border-color: #4f8cff; }
+.el05-experiment-preset:disabled { cursor: default; opacity: 0.6; }
+.el05-experiment-description { margin: 16px 0 8px; line-height: 1.8; }
+.el05-experiment-name { min-width: 220px; flex: 1 1 220px; max-width: 400px; }
+.el05-experiment-compensation { margin: 0 0 10px; }
+.el05-experiment-geometry { margin: 0 -12px 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.16); }
+.el05-experiment-geometry .ant-collapse-header { padding-left: 12px !important; }
+.el05-experiment-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.el05-experiment-status { margin-top: 18px; }
+.el05-experiment-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.el05-experiment-quality { margin: 14px 0; }
+.el05-experiment-record-meta { margin-bottom: 12px; }
+.el05-experiment-analysis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.el05-experiment-analysis .ant-table-wrapper { overflow: auto; }
+.el05-experiment-analysis .ant-table-cell { font-size: 12px; }
+.el05-experiment-notes { margin-top: 12px; margin-bottom: 0 !important; font-size: 12px; line-height: 1.8; }
+.el05-experiment-source { margin-top: 16px; }
+.el05-experiment-history-name { padding: 0; max-width: 230px; height: auto; white-space: normal; text-align: left; }
+@media (max-width: 1100px) { .el05-experiment-presets { grid-template-columns: repeat(3, minmax(0, 1fr)); } .el05-experiment-analysis { grid-template-columns: 1fr; } }
+@media (max-width: 620px) { .el05-experiment-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); } .el05-experiment-actions .ant-btn { flex: 1 1 150px; } .el05-experiment-toolbar .ant-space { width: 100%; } }
+.el05-experiment-details { margin-top: 14px; }
+.el05-experiment-results > .ant-segmented { max-width: 100%; overflow-x: auto; }
+.el05-experiment-results > .ant-segmented .ant-segmented-group { width: max-content; }
+.el05-experiment-record-meta { max-width: 100%; }
+.el05-experiment-record-meta .ant-typography { overflow-wrap: anywhere; }

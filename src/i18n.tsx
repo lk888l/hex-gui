@@ -427,6 +427,12 @@ const STRINGS = {
     zh: "展开后选择厂商专用电机工作区",
   },
   tagDamiaoProtocol: { en: "DAMIAO CAN 1 Mbps", zh: "达妙 CAN 1 Mbps" },
+  toolEl05: { en: "RobStride EL05 Motor Control", zh: "RobStride EL05 电机控制" },
+  toolEl05Desc: {
+    en: "Independent CAN control with motion/MIT, PP, CSP, velocity and current modes, live feedback and parameter access.",
+    zh: "独立 CAN 控制，支持运控/MIT、PP、CSP、速度与电流模式，以及实时反馈和参数读写。",
+  },
+  tagEl05Protocol: { en: "RobStride 29-bit · 1 Mbps", zh: "RobStride 29 位 · 1 Mbps" },
   toolRollerCanControl: { en: "Unit RollerCAN Motor Control", zh: "Unit RollerCAN 电机控制" },
   toolRollerCanControlDesc: {
     en: "Stock-firmware speed, position, current and encoder control over extended CAN frames.",

@@ -294,6 +294,174 @@ bus with the right settings:
 
 - **Motor Control** — everything above. Broadcasts our heartbeat (the motor's
   `0x1016` consumer needs it).
+- **Other → EL05 Motor Control** — independent RobStride EDULITE 05 workspace
+  based on the EL05 manual dated 2026-09-22. Open `can0` / `socketcan:can0`
+  on Linux or `gs_usb` with Classic CAN at 1 Mbps, scan, and select the motor.
+  The default host ID is `253` (`0xFD`). This app uses RobStride's native
+  29-bit extended CAN protocol and its own connection. SocketCAN timing is
+  configured by the operating system.
+
+  All five motor modes are available: motion control / MIT (`0`, position,
+  velocity, Kp, Kd, torque feedforward), profile position PP (`1`, position,
+  speed and acceleration), velocity (`2`, speed, acceleration and current
+  limit), current (`3`, Iq), and cyclic position CSP (`5`, position and speed
+  limit). Values use rad, rad/s, Nm and A. Mode changes stop the motor before
+  writing and reading back `run_mode`; enable starts with a neutral target.
+  Send a target after enabling. Stop, fault reset, mechanical zero, parameter
+  read/write, live feedback and telemetry charts are provided in the workspace.
+
+  **Device settings & information** provides fresh CAN ID / MCU UID queries
+  (type `0`), ID changes (type `7`, new IDs `0..127`), and the motor version
+  query (type `4`, payload `00 C4 00 00 00 00 00 00`). ID changes stop the
+  motor, probe for address conflicts, verify the same UID at the new address,
+  and move the selected device. Lost acknowledgements trigger an ID query;
+  an unverified address clears the selection. Version reads also stop the
+  motor, since the query uses a Stop frame. Neither operation resumes motion.
+  The version is displayed as the four-byte, high-byte-first value documented
+  on manual p.31, alongside the complete raw reply. The manual lists firmware
+  strings `AppCodeVersion` / `BootCodeVersion` at `0x1003` / `0x1000` but does
+  not specify their native-protocol string transport or a separate hardware
+  revision. These fields are not guessed from the motor-version reply.
+  Mechanical zero is available in MIT / CSP, stops first, reads back `mechPos`,
+  and refreshes the position target and chart for the new coordinate system.
+
+  The backend owns command streaming and stops on stale feedback or a missing
+  UI heartbeat. Enabling sets the volatile `canTimeout` to one second; leaving
+  the workspace or closing the window stops the selected motor. Firmware
+  parameter-read failures are shown explicitly, since older EL05 firmware may
+  not implement every optional parameter in the current manual. This workspace
+  requires the native RobStride protocol; a motor configured for CANopen or
+  the alternative standard-frame MIT protocol must first be switched back.
+  An attended hardware check is available with
+  `cargo run --manifest-path src-tauri/Cargo.toml --example el05_smoke -- can0 1 --motion`.
+  It deliberately moves motor ID 1 with small targets in all five modes,
+  checks the UI timeout stop, and restores the original mode and volatile limits.
+  To check identity and version without sending motion targets, run
+  `cargo run --manifest-path src-tauri/Cargo.toml --example el05_settings -- can0 1 --read`.
+  Use `--roundtrip-id 2` instead of `--read` to verify a temporary ID change
+  and restore ID 1. Both checks stop the motor; they leave its zero unchanged.
+
+  MIT uses `tau = Kp*(p_ref-p) + Kd*(v_ref-v) + tau_ff`; its velocity input
+  is in output-shaft rad/s, not rpm, and does not create an integral velocity
+  loop. With Kp=0, friction produces speed error; with Kd=0, the velocity
+  input has no effect. The EL05 native frame maps ±50 rad/s over 16 bits
+  (100/65535 ≈ 0.001526 rad/s per count). The display and chart use fast
+  type-2/type-24 speed feedback exclusively. Its observed reversed polarity is
+  corrected once on reception to follow increasing encoder position; velocity
+  targets keep their existing direction. The asynchronous `0x701B`
+  `mechVel` float is displayed separately with its sample age. A wrapped-position
+  derivative over roughly 150 ms provides a second, encoder-based check.
+  Both estimates use the same motor encoder and do not establish absolute
+  accuracy against an external reference. Chart points use feedback sequence
+  and monotonic receive time, so dictionary responses do not duplicate points.
+
+  **Pendulum test bench** provides eleven experiments inside the EL05 workspace:
+  free decay, bidirectional velocity steps, signed torque ramps, static
+  multi-angle torque checks, position steps, sine sweeps, impedance disturbance
+  pulses, zero-feedforward backdrive, thermal holding, and slow triangular
+  position motion, plus a dedicated small-angle static-friction calibration.
+  Starting a motion experiment selects MIT and enables the
+  motor automatically; free-decay recording stops the drive automatically.
+  The downward reference can be captured directly without a disable or
+  speed-threshold prerequisite. Position centers are relative to that reference
+  when measured, otherwise relative to the position captured at run start.
+  Optional gravity compensation uses the measured reference and actual angle.
+  The general torque ramp continues after motion begins. Its timed experiments
+  do not use position or velocity to gate start or stop. Duration is configurable
+  from 2 to 3600 seconds, and a
+  temperature bound of zero disables the host temperature cutoff. Duration,
+  communication loss (750 ms), a drive fault, and a missing client heartbeat
+  still stop the run. The service loop runs at 50 Hz; sine sweeps are limited
+  to 10 Hz. Stop removes active support.
+
+  **Static friction calibration** is a separate, one-direction test: place the
+  pendulum naturally down, then start. It confirms 0.5 seconds of rest, records
+  that starting position, and ramps a signed torque at 0.02 Nm/s by default.
+  At a 0.15° displacement it freezes the measurement torque while confirming
+  motion for 40 ms, then ends the ramp and returns toward the starting position.
+  Maximum displacement is configurable (default 3°); an approaching boundary
+  triggers return before the configured angle, and a measured exceedance
+  invalidates the calibration. Software braking has finite delay, so the actual
+  peak displacement is retained rather than promising zero overshoot. Return
+  torque is bounded by the configured maximum test torque and lasts at most
+  three seconds. Maximum torque, time limit, failure to settle, and interruption
+  are reported as unsuccessful calibration outcomes.
+
+  The last stationary, first qualifying motion, and confirmation frames are
+  captured before telemetry thinning. Reports use the first motion frame's
+  drive-estimated torque and distinguish it from the later confirmation frame.
+  A captured resting position is only a displacement reference: gravity
+  correction still requires the independently measured downward reference.
+  The result is an estimated breakaway friction torque in Nm, not a dimensionless
+  contact friction coefficient; small-angle onset still includes detection,
+  inertia and drive torque estimation errors. Each run measures one direction;
+  change the sign of the maximum test torque for the opposite direction.
+
+  The bench displays position/velocity references and feedback, effort,
+  temperature, and derived pendulum traces alongside automatic metrics.
+  Depending on the experiment and available excitation, analysis includes
+  static plateaus and torque/current regression, Coulomb/viscous friction,
+  free-decay period and damping, step response and tracking errors, sweep
+  gain/phase, disturbance recovery, low-speed behavior, and thermal drift.
+  Missing references, incomplete tests, stale current samples, and insufficient
+  excitation are reported rather than converted into fabricated metrics.
+  These are estimates for the combined drive and mechanical structure, using
+  drive-estimated torque; they do not independently measure dynamic shaft
+  torque, backlash, or efficiency. The manual's 0.94 Nm/Arms torque constant
+  must not be treated as an independently calibrated conversion from `iqf`.
+
+  Receive-time data is captured independently of UI refresh and transferred
+  incrementally. Long runs retain original CAN bytes at a duration-dependent
+  interval, bounded to 120,000 samples; that interval is included in the status.
+  The UI keeps recent runs for comparison, imports saved JSON, and exports
+  CSV, JSON with analysis, and Markdown reports. Browser history has an
+  explicit storage budget: its plot samples are reduced over the whole run
+  while the metrics calculated before reduction are retained. Export the live
+  recording for full retained telemetry before leaving the workspace.
+  New JSON recordings mark normalized feedback with `feedback_velocity_sign=-1`.
+  Old JSON and history with matching original type-2/type-24 CAN bytes are
+  normalized on load and their analyses recomputed. Reduced history can only
+  be recomputed from its retained samples; the interface identifies this case.
+
+  EL05 firmware `0x0A050001` was observed to emit periodic telemetry as type
+  `24` with the type-2 payload layout. Its measured `EPScan_time=0` period is
+  about 10 ms and `1` is about 15 ms, differing from the generic SDK manual's
+  starting index. Zero is accepted for restoring this firmware's original
+  setting. The displayed receive rate combines periodic reports and replies
+  to commands; it is not the periodic reporting rate alone.
+
+  CSV rows include received position, unwrapped position, feedback velocity,
+  position-derived velocity, drive-estimated torque, asynchronous Iq/mechVel
+  values with ages, original CAN ID/payload bytes, status, faults and host MIT targets. The target columns
+  are the latest successfully sent host requests before wire quantization,
+  with sequence and age. JSON also contains each MIT send's start/completion
+  times and exact wire bytes; CAN send completion does not prove when the
+  drive applied a command. Times are host monotonic receive
+  times, not drive timestamps; held current/parameter values are not synchronized
+  to each feedback frame. JSON also includes configuration and the stop reason.
+  The geometry calculator uses a point load and a uniform arm. With a 1 kg
+  point load at 0.18 m, gravity peaks at 1.765197 Nm and load inertia is
+  0.0324 kg·m² before adding arm, fixture and motor inertia. Additional rotating
+  inertia can be entered separately. Gravity compensation is opt-in and uses
+  the measured downward reference. Fit friction only after subtracting gravity
+  and inertial torque; reported torque is an estimate, not a torque sensor.
+  Measure the downward encoder reference before fitting gravity. Geometry,
+  reference angle and its measured/unmeasured flag are frozen when recording
+  starts, alongside available read-back torque limit, reporting setting and CAN timeout.
+  A receive queue overflow aborts the run and preserves a dropped-frame count.
+
+  An unloaded motor speed check uses the same production experiment engine:
+  `cargo run --manifest-path src-tauri/Cargo.toml --example el05_bench -- can3 1 --motion /tmp/el05-bench`.
+  It compares positive and negative steady-window speed feedback with a
+  regression of received position at several speeds and Kd values, saves raw
+  JSON and a report, and restores the original mode, torque limit, feedback
+  period and CAN timeout. It leaves the motor stopped and does not change zero.
+  The check also exercises both signed timed torque ramps and a stopped passive
+  recording. `el05_probe can0 can1 can2 can3` compares explicitly selected
+  interfaces using only UID queries, with timing, scan coverage and error
+  counters; it never selects/enables a motor or changes its parameters.
+  `python3 scripts/analyze-el05-bench.py /tmp/el05-bench --png` creates an
+  offline JSON report and speed/effort SVG plots (PNG with local Chrome).
 - **Product Authenticity** — a public, always-visible verification and
   first-registration workspace. It passively discovers heartbeat sessions,
   but reads a proprietary proof object only after a complete `0x1018:00..04`

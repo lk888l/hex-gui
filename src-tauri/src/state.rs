@@ -158,6 +158,8 @@ pub struct AppState {
     /// directly, no `Cia402Manager`), so it is stopped unconditionally on
     /// `disconnect` / tool switch, independent of `manager`.
     pub analyzer: Mutex<Option<crate::analyzer::CanAnalyzer>>,
+    /// Independent RobStride EL05 application, using the native extended CAN protocol.
+    pub el05: Mutex<Option<Arc<crate::el05::El05Session>>>,
     /// Unit RollerCAN protocol monitor attached to the manager-owned `CanBus`.
     /// It does not open or own a second physical adapter in the product path.
     pub rollercan: Mutex<Option<crate::rollercan::RollerCanSession>>,
