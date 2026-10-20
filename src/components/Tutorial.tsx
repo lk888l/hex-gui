@@ -421,21 +421,28 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
     {
-      title: { en: "3 · Manual control modes", zh: "3 · 手动控制模式" },
+      title: { en: "3 · Zero-gravity hold", zh: "3 · 零重力保持" },
+      body: {
+        en: "Open Zero-gravity hold, enter the load and arm geometry, then capture the vertically downward reference with the motor stopped and stationary. Start enables continuous gravity support with adjustable scale, damping, torque limit, startup ramp and speed/temperature limits. Move the pendulum by hand; damping and friction help it settle after release. It does not lock an angle, and model error may cause drift. Stop removes support. Reconnect, reselect, zero/ID changes or lost feedback require a new reference.",
+        zh: "进入「零重力保持」，填写负载与摆杆几何，在电机停机且摆锤静止垂直下垂时测定参考。启动后持续补偿重力，可预设补偿比例、阻尼、转矩上限、缓启时间及速度/温度限制。手动拖动摆锤，松手后靠阻尼与摩擦逐渐静止；此模式不锁定角度，模型误差可能造成缓慢漂移。停止会撤去支撑。重连、重选电机、修改零位/ID 或反馈中断后需重新测定参考。",
+      },
+    },
+    {
+      title: { en: "4 · Manual control modes", zh: "4 · 手动控制模式" },
       body: {
         en: "Motion/MIT combines position, velocity, torque and Kp/Kd. PP plans a position trajectory with speed and acceleration limits; CSP uses position and speed limits. Velocity and Current control their respective targets. Changing mode stops the motor; enable it again, then send the target.",
         zh: "运控/MIT 同时设置位置、速度、转矩及 Kp/Kd；PP 使用速度和加速度规划位置轨迹，CSP 使用目标位置与速度限制；速度和电流模式分别控制对应目标。切换模式会停止电机，请重新使能后发送目标。",
       },
     },
     {
-      title: { en: "4 · Watch feedback and stop", zh: "4 · 观察反馈并停止" },
+      title: { en: "5 · Watch feedback and stop", zh: "5 · 观察反馈并停止" },
       body: {
         en: "Switch between numeric feedback and position/velocity/torque charts. Use Stop / disable to end motion and target streaming. Parameter access includes current, voltage and multi-turn position; writes require a stopped motor. Disconnect and leaving this workspace stop the selected motor before releasing the bus.",
         zh: "在数值反馈与位置、速度、转矩曲线之间切换。「停止 / 失能」结束运动和连续发送。参数区可读取电流、电压和多圈位置，写参数前需停止电机。断开连接和离开工作区都会先停止所选电机，再释放总线。",
       },
     },
     {
-      title: { en: "5 · Device settings and identity", zh: "5 · 设备设置与身份信息" },
+      title: { en: "6 · Device settings and identity", zh: "6 · 设备设置与身份信息" },
       body: {
         en: "Device settings & information reads CAN ID, MCU UID and the documented motor-version field. Changing ID accepts 0–127, stops the motor, checks address conflicts and verifies its UID at the new address. Version reads stop the motor too. Mechanical zero works in MIT / CSP and refreshes the position target. Firmware strings such as AppCodeVersion have no documented native-protocol read format in this manual.",
         zh: "「设备设置与信息」可读取 CAN ID、MCU UID 和手册定义的电机版本字段。修改 ID 支持 0–127，会先停机、检查地址冲突，再核对新地址的 UID。读取版本也会停机。机械零点支持 MIT / CSP，设置后会更新位置目标。手册未提供 AppCodeVersion 等固件字符串的私有协议读取格式。",

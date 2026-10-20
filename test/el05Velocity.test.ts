@@ -23,12 +23,14 @@ function data(samples: El05TelemetrySample[]): El05ExperimentData {
       can_id: 0x010001fd, payload: [0, 0, 0, 0, 0, 0, 0, 0] }] };
 }
 
-test("legacy type-2 negative wire velocity follows the positive position direction without changing other channels", () => {
-  const original = data([sample(30000)]), snapshot = structuredClone(original);
+test("legacy inverted type-2 feedback is restored to the direct wire direction without changing other channels", () => {
+  const inverted = sample(30000);
+  inverted.velocity_rad_s *= -1;
+  const original = data([inverted]), snapshot = structuredClone(original);
   const result = normalizeExperimentFeedbackVelocity(original);
   assert.equal(result.changed, true);
-  assert.equal(result.data.feedback_velocity_sign, -1);
-  assert.ok(result.data.samples[0].velocity_rad_s > 0);
+  assert.equal(result.data.feedback_velocity_sign, 1);
+  assert.ok(result.data.samples[0].velocity_rad_s < 0);
   assert.equal(result.data.samples[0].velocity_rad_s, -original.samples[0].velocity_rad_s);
   assert.deepEqual(original, snapshot, "normalization does not mutate its input");
   const { velocity_rad_s: originalVelocity, ...originalOther } = original.samples[0];
@@ -38,19 +40,18 @@ test("legacy type-2 negative wire velocity follows the positive position directi
   assert.deepEqual(result.data.status.config, original.status.config);
 });
 
-test("type-24 positive wire velocity becomes negative and already-corrected samples keep their sign", () => {
-  const wire = sample(35000, 24), canonical = sample(30000, 24);
-  canonical.velocity_rad_s *= -1;
-  const result = normalizeExperimentFeedbackVelocity(data([wire, canonical]));
+test("type-24 direct feedback keeps its sign and mixed inverted samples are restored once", () => {
+  const wire = sample(35000, 24), inverted = sample(30000, 24);
+  inverted.velocity_rad_s *= -1;
+  const result = normalizeExperimentFeedbackVelocity(data([wire, inverted]));
   assert.equal(result.changed, true);
-  assert.ok(result.data.samples[0].velocity_rad_s < 0);
-  assert.equal(result.data.samples[0].velocity_rad_s, -wire.velocity_rad_s);
-  assert.equal(result.data.samples[1].velocity_rad_s, canonical.velocity_rad_s);
+  assert.ok(result.data.samples[0].velocity_rad_s > 0);
+  assert.equal(result.data.samples[0].velocity_rad_s, wire.velocity_rad_s);
+  assert.equal(result.data.samples[1].velocity_rad_s, -inverted.velocity_rad_s);
 });
 
 test("an already-corrected archive gets a direction marker and never flips again after export/import", () => {
   const canonical = sample(30000);
-  canonical.velocity_rad_s *= -1;
   const first = normalizeExperimentFeedbackVelocity(data([canonical]));
   assert.equal(first.changed, true);
   assert.equal(first.data.samples[0].velocity_rad_s, canonical.velocity_rad_s);
@@ -61,13 +62,38 @@ test("an already-corrected archive gets a direction marker and never flips again
   assert.equal(second.data.samples[0].velocity_rad_s, canonical.velocity_rad_s);
 });
 
-test("native marked data is trusted without applying a second correction", () => {
+test("native +1 marked data is trusted without applying a second correction", () => {
   const original = data([sample(30000)]);
-  original.feedback_velocity_sign = -1;
+  original.feedback_velocity_sign = 1;
   original.samples[0].payload = [];
   const result = normalizeExperimentFeedbackVelocity(original);
   assert.deepEqual(result, { data: original, changed: false });
   assert.equal(result.data, original);
+});
+
+test("an explicit old -1 multiplier restores curves and events even without raw payloads", () => {
+  const inverted = sample(30000);
+  inverted.velocity_rad_s *= -1;
+  inverted.payload = [];
+  const original = data([inverted]);
+  original.feedback_velocity_sign = -1;
+  original.status.static_friction = { phase: "Complete", outcome: "BreakawayDetected",
+    reference_position_rad: 0, ramp_started_s: 0, return_started_s: 0.8,
+    last_stationary_sample: { ...inverted }, onset_sample: { ...inverted }, confirmation_sample: { ...inverted },
+    peak_excursion_rad: 0.01 };
+  const snapshot = structuredClone(original);
+  const result = normalizeExperimentFeedbackVelocity(original);
+  assert.equal(result.changed, true);
+  assert.equal(result.data.feedback_velocity_sign, 1);
+  assert.equal(result.data.samples[0].velocity_rad_s, -inverted.velocity_rad_s);
+  const events = result.data.status.static_friction!;
+  for (const event of [events.last_stationary_sample, events.onset_sample, events.confirmation_sample]) {
+    assert.equal(event!.velocity_rad_s, -inverted.velocity_rad_s);
+  }
+  assert.deepEqual(original, snapshot);
+  const replay = normalizeExperimentFeedbackVelocity(result.data);
+  assert.equal(replay.changed, false);
+  assert.equal(replay.data, result.data);
 });
 
 test("one unrecognizable curve frame prevents guessing or partially migrating a historical run", () => {
@@ -87,12 +113,16 @@ test("one unrecognizable curve frame prevents guessing or partially migrating a 
 });
 
 test("static-friction event frames receive the same evidenced correction as the curve", () => {
-  const original = data([sample(30000)]);
+  const inverted = sample(30000);
+  inverted.velocity_rad_s *= -1;
+  const original = data([inverted]);
   const canonicalEvent = sample(35000, 24);
-  canonicalEvent.velocity_rad_s *= -1;
+  const stationary = sample(32768), onset = sample(30000, 24);
+  stationary.velocity_rad_s *= -1;
+  onset.velocity_rad_s *= -1;
   original.status.static_friction = { phase: "Complete", outcome: "BreakawayDetected",
     reference_position_rad: 0, ramp_started_s: 0, return_started_s: 0.8, return_settled: true,
-    last_stationary_sample: sample(32768), onset_sample: sample(30000, 24), confirmation_sample: canonicalEvent,
+    last_stationary_sample: stationary, onset_sample: onset, confirmation_sample: canonicalEvent,
     peak_excursion_rad: 0.01 };
   const snapshot = structuredClone(original);
   const result = normalizeExperimentFeedbackVelocity(original);
@@ -117,4 +147,25 @@ test("unverifiable event frames keep the entire run untouched even when curve fr
 test("empty recordings have no evidence for historical direction migration", () => {
   const original = data([]);
   assert.deepEqual(normalizeExperimentFeedbackVelocity(original), { data: original, changed: false });
+});
+
+test("bidirectional friction archives normalize both directions' event frames without mutating the source", () => {
+  const original = data([sample(30000)]);
+  const pass = { phase: "Complete" as const, outcome: "BreakawayDetected" as const,
+    reference_position_rad: 0, ramp_started_s: 0.5, return_started_s: 0.8, return_settled: true,
+    peak_excursion_rad: 0.01, last_stationary_sample: sample(32768), onset_sample: sample(35000), confirmation_sample: sample(36000) };
+  original.feedback_velocity_sign = -1;
+  original.status.static_friction = { ...structuredClone(pass), direction: -1, started_s: 2,
+    completed_directions: [{ ...structuredClone(pass), direction: 1, started_s: 0 }] };
+  const snapshot = structuredClone(original);
+  const result = normalizeExperimentFeedbackVelocity(original);
+  assert.equal(result.changed, true);
+  for (const [i, corrected] of [...result.data.status.static_friction!.completed_directions!, result.data.status.static_friction!].entries()) {
+    const before = i === 0 ? original.status.static_friction.completed_directions![0] : original.status.static_friction;
+    assert.equal(corrected.onset_sample!.velocity_rad_s, -before.onset_sample!.velocity_rad_s);
+    assert.equal(corrected.confirmation_sample!.velocity_rad_s, -before.confirmation_sample!.velocity_rad_s);
+    assert.equal(corrected.direction, before.direction);
+  }
+  assert.deepEqual(original, snapshot);
+  assert.equal(normalizeExperimentFeedbackVelocity(result.data).changed, false);
 });

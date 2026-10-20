@@ -1,10 +1,34 @@
-import type { El05ExperimentData, El05TelemetrySample } from "./el05Api";
+import type { El05ExperimentConfig, El05ExperimentData, El05StaticFrictionPass, El05TelemetrySample } from "./el05Api";
 
-/** Point mass at the arm end plus a uniform arm, angle measured from down. */
+/** Native type-2/type-24 torque: uint16 0..65535 maps to -6..6 Nm (manual pp.30, 34). */
+export const EL05_TORQUE_UNIT = "Nm";
+export const EL05_TORQUE_LIMIT_NM = 6;
+
+/**
+ * Point mass at the arm end plus a uniform arm, angle measured from down.
+ * kg × m/s² × m gives output-shaft Nm, the same unit as native drive feedback.
+ * Neither the 9:1 gear ratio nor the 0.94 Nm/Arms constant is a unit conversion here.
+ */
 export function pendulumModel(massKg: number, lengthM: number, armMassKg: number, extraInertiaKgM2 = 0) {
   const gravityNm = 9.80665 * lengthM * (massKg + armMassKg / 2);
   const inertiaKgM2 = lengthM ** 2 * (massKg + armMassKg / 3) + extraInertiaKgM2;
   return { gravityNm, inertiaKgM2 };
+}
+
+/** Maximum gravity-only demand at the five distinct StaticTorque plateau targets. */
+export function staticHoldingTorquePeakNm(config: El05ExperimentConfig | null | undefined): number | null {
+  const pendulum = config?.pendulum;
+  if (config?.kind !== "StaticTorque" || !pendulum?.zero_measured) return null;
+  const { gravityNm } = pendulumModel(pendulum.mass_kg, pendulum.length_m, pendulum.arm_mass_kg);
+  const center = config.center_angle_rad ?? 0, amplitude = config.position_amplitude_rad ?? 0.25;
+  return Math.max(...[-1, -0.5, 0, 0.5, 1].map(offset => Math.abs(gravityNm * Math.sin(center + offset * amplitude))));
+}
+
+/** A captured 0x700B limit may be smaller than the native feedback/command range. */
+export function experimentTorqueLimitNm(data: El05ExperimentData): number {
+  const limit = data.parameters.find(parameter => parameter.index === 0x700b)?.value;
+  return typeof limit === "number" && Number.isFinite(limit) && limit >= 0
+    ? Math.min(limit, EL05_TORQUE_LIMIT_NM) : EL05_TORQUE_LIMIT_NM;
 }
 
 export interface El05DerivedSample {
@@ -72,7 +96,8 @@ export interface El05StaticPlatform {
   sample_count: number;
   fresh_current_samples: number;
 }
-export interface El05StaticFrictionAnalysis {
+export interface El05StaticFrictionPassAnalysis {
+  direction: 1 | -1;
   phase: string | null;
   outcome: string | null;
   valid_breakaway: boolean;
@@ -96,6 +121,12 @@ export interface El05StaticFrictionAnalysis {
   confirmation_time_s: number | null;
   ramp_rate_nm_s: number | null;
   reason: string | null;
+}
+export interface El05StaticFrictionAnalysis extends El05StaticFrictionPassAnalysis {
+  directions: El05StaticFrictionPassAnalysis[];
+  both_directions_valid: boolean;
+  feedback_magnitude_difference_nm: number | null;
+  adjusted_magnitude_difference_nm: number | null;
 }
 export interface El05ExperimentAnalysis {
   kind: string;
@@ -705,10 +736,14 @@ function motionAnalysis(points: Point[], config: RunConfig | null): El05Experime
     reason: config?.kind as string === "TorqueRamp" && !onset ? initiallyStationary ? "未观测到持续 100 ms 的起动。" : "采集开始时已在运动，不能识别起动转矩。" : null };
 }
 
-/** Use the controller's captured event frames, even when the plot samples have been thinned. */
-function staticFrictionAnalysis(data: El05ExperimentData, config: RunConfig | null): El05StaticFrictionAnalysis | undefined {
-  if (config?.kind as string !== "StaticFriction") return undefined;
+/** Chronological passes, including the current one; legacy runs contain only one. */
+export function staticFrictionPasses(data: El05ExperimentData): El05StaticFrictionPass[] {
   const state = data.status.static_friction;
+  return state ? [...(state.completed_directions ?? []), state] : [];
+}
+
+/** Use captured event frames, even when the plot samples have been thinned. */
+function staticFrictionPassAnalysis(state: El05StaticFrictionPass | undefined, config: RunConfig | null, active: boolean): El05StaticFrictionPassAnalysis {
   const onset = state?.onset_sample, confirmation = state?.confirmation_sample;
   const reference = finite(state?.reference_position_rad) ? state.reference_position_rad : null;
   const driveEvidenceValid = onset?.status_code === 2 && confirmation?.status_code === 2
@@ -736,6 +771,7 @@ function staticFrictionAnalysis(data: El05ExperimentData, config: RunConfig | nu
     Interrupted: "试验中断，未得到有效静摩擦标定。",
   };
   return {
+    direction: state?.direction ?? (config?.torque_nm != null && config.torque_nm < 0 ? -1 : 1),
     phase: state?.phase ?? null, outcome: state?.outcome ?? null, valid_breakaway: valid,
     return_settled: typeof state?.return_settled === "boolean" ? state.return_settled : null,
     reference_position_rad: reference,
@@ -756,8 +792,20 @@ function staticFrictionAnalysis(data: El05ExperimentData, config: RunConfig | nu
     reason: valid ? null : state?.outcome === "BreakawayDetected" && onset && confirmation && !driveEvidenceValid
       ? "起动证据包含驱动非运行状态或故障，未得到有效静摩擦标定。"
       : state?.outcome ? reasons[state.outcome] ?? "起动事件记录不完整，未得到有效静摩擦标定。"
-      : data.status.active ? "标定正在运行，等待起动确认。" : "缺少后端起动事件记录，未得到有效静摩擦标定。",
+      : active ? "标定正在运行，等待起动确认。" : "缺少后端起动事件记录，未得到有效静摩擦标定。",
   };
+}
+
+function staticFrictionAnalysis(data: El05ExperimentData, config: RunConfig | null): El05StaticFrictionAnalysis | undefined {
+  if (config?.kind as string !== "StaticFriction") return undefined;
+  const states = staticFrictionPasses(data);
+  const directions = (states.length ? states : [undefined]).map(state => staticFrictionPassAnalysis(state, config, data.status.active));
+  const positive = directions.find(pass => pass.direction === 1 && pass.valid_breakaway);
+  const negative = directions.find(pass => pass.direction === -1 && pass.valid_breakaway);
+  const magnitudeDifference = (a: number | null | undefined, b: number | null | undefined) => a != null && b != null ? Math.abs(a) - Math.abs(b) : null;
+  return { ...directions[directions.length - 1], directions, both_directions_valid: !!positive && !!negative,
+    feedback_magnitude_difference_nm: magnitudeDifference(positive?.onset_feedback_torque_nm, negative?.onset_feedback_torque_nm),
+    adjusted_magnitude_difference_nm: magnitudeDifference(positive?.onset_gravity_adjusted_torque_nm, negative?.onset_gravity_adjusted_torque_nm) };
 }
 
 function metric(key: string, label: string, label_en: string, value: number | null, unit: string, note?: string): El05AnalysisMetric {
@@ -796,6 +844,10 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
     position_steps: positionSteps, velocity_steps: velocitySteps };
   const staticTorque = kind === "StaticTorque" ? staticAnalysis(performancePoints, config) : { platforms: [], torque_constant_nm_per_a: null,
     intercept_nm: null, r_squared: null, forward_reverse_torque_difference_nm: null, reason: null };
+  const staticHoldingPeak = staticHoldingTorquePeakNm(config), torqueLimit = experimentTorqueLimitNm(data);
+  const staticTorqueRangeNotes = staticHoldingPeak !== null && staticHoldingPeak > torqueLimit
+    ? [`目标角最大理论保持力矩 ${staticHoldingPeak.toFixed(3)} Nm 超过本组驱动限值 ${torqueLimit.toFixed(3)} Nm（EL05 峰值 / 协议量程上限 6 Nm）；部分目标角无法仅靠该力矩保持。理论与反馈均为 Nm，理论需求按实际负载保留。`]
+    : [];
   const staticFriction = staticFrictionAnalysis(data, config);
   const friction = fitFriction(performancePoints, Boolean(config?.pendulum?.zero_measured));
   const freeDecay = kind === "Record" || kind === "Backdrive" ? decayAnalysis(performancePoints, config)
@@ -818,44 +870,57 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
   ], notes: qualityNotes }];
   if (kind === "StaticTorque") sections.push({ id: "static", title: "静态转矩与电流", title_en: "Static torque and current", metrics: [
     metric("stable_platforms", "有效稳定平台", "Stable plateaus", staticTorque.platforms.length, ""),
-    metric("effective_torque_constant", "重力负载 / Iq 回归斜率", "Gravity load / Iq slope", staticTorque.torque_constant_nm_per_a, "Nm/A"),
-    metric("torque_intercept", "转矩回归截距", "Torque regression intercept", staticTorque.intercept_nm, "Nm"),
+    metric("target_holding_peak", "目标角最大理论保持力矩", "Peak target holding torque", staticHoldingPeak, EL05_TORQUE_UNIT),
+    metric("drive_torque_limit", "本组驱动力矩上限", "Run drive torque limit", torqueLimit, EL05_TORQUE_UNIT,
+      "优先使用开始时读取的 0x700B；读数不可用时显示 EL05 的 6 Nm 峰值 / 协议量程上限。"),
+    metric("effective_torque_constant", "重力负载 / Iq 回归斜率", "Gravity load / Iq slope", staticTorque.torque_constant_nm_per_a, `${EL05_TORQUE_UNIT}/A`),
+    metric("torque_intercept", "转矩回归截距", "Torque regression intercept", staticTorque.intercept_nm, EL05_TORQUE_UNIT),
     metric("torque_r2", "转矩回归 R²", "Torque regression R²", staticTorque.r_squared, ""),
-    metric("approach_difference", "正反接近的估计转矩差", "Approach direction torque difference", staticTorque.forward_reverse_torque_difference_nm, "Nm"),
-  ], notes: [...(staticTorque.reason ? [staticTorque.reason] : []), "仅取各平台末 40% 且速度与加速度接近零的样本。重力负载回归受静摩擦影响；正反接近差为驱动估计转矩差，非独立实测回差。"] });
+    metric("approach_difference", "正反接近的估计转矩差", "Approach direction torque difference", staticTorque.forward_reverse_torque_difference_nm, EL05_TORQUE_UNIT),
+  ], notes: [...staticTorqueRangeNotes, ...(staticTorque.reason ? [staticTorque.reason] : []), "仅取各平台末 40% 且速度与加速度接近零的样本。重力负载回归受静摩擦影响；正反接近差为驱动估计转矩差，非独立实测回差。"] });
   if (staticFriction) {
-    const sf = staticFriction, degrees = (angle: number | null) => angle === null ? null : angle * 180 / Math.PI;
-    const outcomes: Record<string, string> = { BreakawayDetected: "已确认起动", AngleLimit: "达到角偏移上限",
-      TorqueLimit: "达到最大施加转矩", Timeout: "达到试验时限", NotSettled: "起始未静止", Interrupted: "试验中断" };
-    sections.push({ id: "static_friction", title: "独立静摩擦标定", title_en: "Static friction calibration", metrics: [
-      metric("static_friction_valid", "有效起动标志", "Valid breakaway event", sf.valid_breakaway ? 1 : 0, "", `结局：${sf.outcome ? outcomes[sf.outcome] ?? sf.outcome : data.status.active ? "进行中" : "无有效事件"}。`),
-      metric("static_friction_return_settled", "回位稳定标志", "Stable return confirmed", sf.return_settled === null ? null : sf.return_settled ? 1 : 0, ""),
-      metric("static_friction_stationary_command", "最后静止帧指令转矩", "Last stationary commanded torque", sf.last_stationary_command_torque_nm, "Nm"),
-      metric("static_friction_stationary_feedback", "最后静止帧反馈转矩", "Last stationary feedback torque", sf.last_stationary_feedback_torque_nm, "Nm"),
-      metric("static_friction_onset_command", "起动首帧指令转矩", "First motion frame commanded torque", sf.onset_command_torque_nm, "Nm"),
-      metric("static_friction_onset_feedback", "起动首帧估计转矩", "First motion frame estimated torque", sf.onset_feedback_torque_nm, "Nm"),
-      metric("static_friction_confirmation_command", "确认帧指令转矩", "Confirmation frame commanded torque", sf.confirmation_command_torque_nm, "Nm"),
-      metric("static_friction_confirmation_feedback", "确认帧反馈转矩", "Confirmation frame feedback torque", sf.confirmation_feedback_torque_nm, "Nm"),
-      metric("static_friction_gravity", "起动首帧重力矩", "Gravity torque at first motion frame", sf.onset_gravity_torque_nm, "Nm"),
-      metric("static_friction_adjusted", "扣除重力的起动转矩估计", "Gravity-adjusted breakaway torque estimate", sf.onset_gravity_adjusted_torque_nm, "Nm", "反馈转矩 − G sinθ；仍含首帧起动惯性及驱动估计误差。"),
-      metric("static_friction_detection_delay", "起动到确认的时间", "Motion-to-confirmation delay", sf.detection_delay_s === null ? null : sf.detection_delay_s * 1000, "ms"),
-      metric("static_friction_detection_command_increase", "确认期间指令转矩增量", "Signed commanded torque increase during confirmation", sf.command_increase_during_detection_nm, "Nm"),
-      metric("static_friction_onset_angle", "起动首帧相对起点角度", "First motion displacement from rest", degrees(sf.onset_angle_rad), "°"),
-      metric("static_friction_peak_angle", "实测最大角偏移", "Observed peak displacement", degrees(sf.peak_excursion_rad), "°"),
-      metric("static_friction_max_angle", "允许角偏移上限", "Configured displacement limit", degrees(sf.max_excursion_rad), "°"),
-      metric("static_friction_ramp_start", "转矩斜坡开始时刻", "Torque ramp start time", sf.ramp_started_s, "s"),
-      metric("static_friction_onset_time", "起动首帧时刻", "First motion frame time", sf.onset_time_s, "s"),
-      metric("static_friction_ramp_duration", "从斜坡开始到起动", "Ramp-to-motion duration", sf.onset_time_s !== null && sf.ramp_started_s !== null ? sf.onset_time_s - sf.ramp_started_s : null, "s"),
-      metric("static_friction_ramp_rate", "施加转矩斜坡速率", "Applied torque ramp rate", sf.ramp_rate_nm_s, "Nm/s"),
-    ], notes: [
-      ...(sf.reason ? [sf.reason] : []),
-      ...(sf.return_settled === false ? ["回位在 3 秒内未稳定，已停止驱动；已确认的起动转矩结果仍保留。"] : []),
-      "采用后端保存的最后静止、首次越过位移阈值和持续确认事件帧；确认后撤去斜坡并回落，不把确认帧转矩冒充首次起动转矩。",
-      "最后静止与起动首帧的指令值仅表示本次名义指令变化，不能作为真实静摩擦力矩的严格上下界；运动首帧仍含惯性。",
-      "标定结果为电机与摆臂机构的起动转矩估计，单位 Nm。未知接触法向载荷及接触半径时不计算无量纲摩擦系数 μ。",
-      "角偏移以本次捕获的静止位置为基准；该位置不能替代独立测定的重力下垂零点。",
-      ...(!config?.pendulum?.zero_measured ? ["未实测重力下垂零点：仅报告原始起动转矩估计，重力修正留空。"] : []),
-    ] });
+    if (config?.friction_direction === "Both" || staticFriction.directions.length > 1) sections.push({
+      id: "static_friction_summary", title: "双向静摩擦对比", title_en: "Bidirectional static friction comparison", metrics: [
+        metric("static_friction_both_valid", "双向均取得有效起动", "Valid breakaway in both directions", staticFriction.both_directions_valid ? 1 : 0, ""),
+        metric("static_friction_valid_directions", "有效起动方向数", "Directions with valid breakaway", staticFriction.directions.filter(pass => pass.valid_breakaway).length, "/ 2"),
+        metric("static_friction_feedback_difference", "起动反馈转矩幅值差（正向 − 反向）", "Breakaway feedback magnitude difference (positive − negative)", staticFriction.feedback_magnitude_difference_nm, "Nm"),
+        metric("static_friction_adjusted_difference", "扣除重力后幅值差（正向 − 反向）", "Gravity-adjusted magnitude difference (positive − negative)", staticFriction.adjusted_magnitude_difference_nm, "Nm"),
+      ], notes: ["各方向独立保存起动事件；只有两边均有效时才计算幅值差。回位未稳定或角度保护触发时停止后续方向。"] });
+    for (const sf of staticFriction.directions) {
+      const degrees = (angle: number | null) => angle === null ? null : angle * 180 / Math.PI;
+      const outcomes: Record<string, string> = { BreakawayDetected: "已确认起动", AngleLimit: "达到角偏移上限",
+        TorqueLimit: "达到最大施加转矩", Timeout: "达到试验时限", NotSettled: "起始未静止", Interrupted: "试验中断" };
+      sections.push({ id: staticFriction.directions.length > 1 ? `static_friction_${sf.direction > 0 ? "positive" : "negative"}` : "static_friction",
+        title: `${sf.direction > 0 ? "正向 (+)" : "反向 (−)"} 静摩擦标定`, title_en: `${sf.direction > 0 ? "Positive (+)" : "Negative (−)"} static friction calibration`, metrics: [
+        metric("static_friction_valid", "有效起动标志", "Valid breakaway event", sf.valid_breakaway ? 1 : 0, "", `结局：${sf.outcome ? outcomes[sf.outcome] ?? sf.outcome : data.status.active ? "进行中" : "无有效事件"}。`),
+        metric("static_friction_return_settled", "回位稳定标志", "Stable return confirmed", sf.return_settled === null ? null : sf.return_settled ? 1 : 0, ""),
+        metric("static_friction_stationary_command", "最后静止帧指令转矩", "Last stationary commanded torque", sf.last_stationary_command_torque_nm, "Nm"),
+        metric("static_friction_stationary_feedback", "最后静止帧反馈转矩", "Last stationary feedback torque", sf.last_stationary_feedback_torque_nm, "Nm"),
+        metric("static_friction_onset_command", "起动首帧指令转矩", "First motion frame commanded torque", sf.onset_command_torque_nm, "Nm"),
+        metric("static_friction_onset_feedback", "起动首帧估计转矩", "First motion frame estimated torque", sf.onset_feedback_torque_nm, "Nm"),
+        metric("static_friction_confirmation_command", "确认帧指令转矩", "Confirmation frame commanded torque", sf.confirmation_command_torque_nm, "Nm"),
+        metric("static_friction_confirmation_feedback", "确认帧反馈转矩", "Confirmation frame feedback torque", sf.confirmation_feedback_torque_nm, "Nm"),
+        metric("static_friction_gravity", "起动首帧重力矩", "Gravity torque at first motion frame", sf.onset_gravity_torque_nm, "Nm"),
+        metric("static_friction_adjusted", "扣除重力的起动转矩估计", "Gravity-adjusted breakaway torque estimate", sf.onset_gravity_adjusted_torque_nm, "Nm", "反馈转矩 − G sinθ；仍含首帧起动惯性及驱动估计误差。"),
+        metric("static_friction_detection_delay", "起动到确认的时间", "Motion-to-confirmation delay", sf.detection_delay_s === null ? null : sf.detection_delay_s * 1000, "ms"),
+        metric("static_friction_detection_command_increase", "确认期间指令转矩增量", "Signed commanded torque increase during confirmation", sf.command_increase_during_detection_nm, "Nm"),
+        metric("static_friction_onset_angle", "起动首帧相对起点角度", "First motion displacement from rest", degrees(sf.onset_angle_rad), "°"),
+        metric("static_friction_peak_angle", "实测最大角偏移", "Observed peak displacement", degrees(sf.peak_excursion_rad), "°"),
+        metric("static_friction_max_angle", "允许角偏移上限", "Configured displacement limit", degrees(sf.max_excursion_rad), "°"),
+        metric("static_friction_ramp_start", "转矩斜坡开始时刻", "Torque ramp start time", sf.ramp_started_s, "s"),
+        metric("static_friction_onset_time", "起动首帧时刻", "First motion frame time", sf.onset_time_s, "s"),
+        metric("static_friction_ramp_duration", "从斜坡开始到起动", "Ramp-to-motion duration", sf.onset_time_s !== null && sf.ramp_started_s !== null ? sf.onset_time_s - sf.ramp_started_s : null, "s"),
+        metric("static_friction_ramp_rate", "施加转矩斜坡速率", "Applied torque ramp rate", sf.ramp_rate_nm_s, "Nm/s"),
+      ], notes: [
+        ...(sf.reason ? [sf.reason] : []),
+        ...(sf.return_settled === false ? ["回位在 3 秒内未稳定，已停止驱动；已确认的起动转矩结果仍保留。"] : []),
+        "采用后端保存的最后静止、首次越过位移阈值和持续确认事件帧；确认后撤去斜坡并回落，不把确认帧转矩冒充首次起动转矩。",
+        "最后静止与起动首帧的指令值仅表示本次名义指令变化，不能作为真实静摩擦力矩的严格上下界；运动首帧仍含惯性。",
+        "标定结果为电机与摆臂机构的起动转矩估计，单位 Nm。未知接触法向载荷及接触半径时不计算无量纲摩擦系数 μ。",
+        "角偏移以本次捕获的静止位置为基准；该位置不能替代独立测定的重力下垂零点。",
+        ...(!config?.pendulum?.zero_measured ? ["未实测重力下垂零点：仅报告原始起动转矩估计，重力修正留空。"] : []),
+      ] });
+    }
   }
   if (positionErrors.length || velocityErrors.length) {
     const steps = positionSteps.length ? positionSteps : velocitySteps;
@@ -925,6 +990,8 @@ export function experimentJson(data: El05ExperimentData, includeDerivedSamples =
     analysis: analyzeExperiment(data),
     ...(includeDerivedSamples ? { derived_samples: deriveExperimentSamples(data) } : {}),
     time_source: "host monotonic CAN receive time; no drive timestamp",
+    torque_unit: EL05_TORQUE_UNIT,
+    torque_feedback_range_nm: [-EL05_TORQUE_LIMIT_NM, EL05_TORQUE_LIMIT_NM],
     torque_source: "drive feedback estimate; not a torque sensor",
     pendulum_angle_definition: "theta_rad = unwrapped_position_rad - downward_zero_rad; use for gravity analysis only when zero_measured is true",
   }, null, 2);
@@ -938,12 +1005,17 @@ export function experimentCsv(data: El05ExperimentData): string {
   const derivedFields = ["relative_position_rad", "angle_rad", "acceleration_rad_s2", "gravity_torque_nm", "target_holding_torque_nm", "inertial_torque_nm",
     "friction_torque_nm", "position_error_rad", "velocity_error_rad_s", "fresh_current_a"] as const;
   const headers = [...fields, "can_id_hex", "payload_hex", "target_position_rad", "target_velocity_rad_s", "target_torque_nm", "kp", "kd", "motor_id", "uid",
-    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields];
+    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields, "static_friction_direction", "static_friction_phase"];
+  const passes = staticFrictionPasses(data).reverse();
   const rows = data.samples.map((sample, i) => {
     const target = sample.target?.kind === "Mit" ? sample.target : null;
+    const pass = passes.find(pass => sample.t_s >= (pass.started_s ?? 0));
+    const phase = !pass ? "" : pass.return_started_s != null && sample.t_s >= pass.return_started_s ? "Returning"
+      : pass.ramp_started_s != null && sample.t_s >= pass.ramp_started_s ? "Ramping" : "Settling";
     return [...fields.map(field => sample[field] ?? ""), sample.can_id.toString(16).padStart(8, "0"), sample.payload.map(byte => byte.toString(16).padStart(2, "0")).join(" "), target?.position_rad ?? "", target?.velocity_rad_s ?? "",
       target?.torque_nm ?? "", target?.kp ?? "", target?.kd ?? "", data.motor_id ?? "", data.uid ?? "",
-      derived[i].velocity_rad_s ?? "", derived[i].target_position_rad ?? "", ...derivedFields.map(field => derived[i][field] ?? "")].join(",");
+      derived[i].velocity_rad_s ?? "", derived[i].target_position_rad ?? "", ...derivedFields.map(field => derived[i][field] ?? ""),
+      pass ? pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1) : "", phase].join(",");
   });
   return [headers.join(","), ...rows].join("\r\n") + "\r\n";
 }

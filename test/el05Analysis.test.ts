@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analyzeExperiment, deriveExperimentSamples, experimentCsv, experimentJson, pendulumModel } from "../src/el05Experiment.ts";
+import { analyzeExperiment, deriveExperimentSamples, experimentCsv, experimentJson, experimentTorqueLimitNm, pendulumModel, staticHoldingTorquePeakNm } from "../src/el05Experiment.ts";
 import { normalizeExperimentFeedbackVelocity } from "../src/el05Velocity.ts";
 import type { El05ExperimentConfig, El05ExperimentData, El05TelemetrySample } from "../src/el05Api.ts";
 
@@ -81,10 +81,10 @@ test("correcting packed feedback polarity restores acceleration and physical fri
   };
   const samples = Array.from({ length: 2401 }, (_, i) => {
     const t = i / 200, m = motion(t);
-    // Legacy recordings kept the drive's opposite-polarity packed velocity.
-    const packedVelocity = Math.round((50 - m.velocity) * 65535 / 100);
+    // The previous decoder inverted the direct packed feedback velocity.
+    const packedVelocity = Math.round((50 + m.velocity) * 65535 / 100);
     const wireVelocity = packedVelocity * 100 / 65535 - 50;
-    const p = sample(t, i, m.theta, wireVelocity, model.gravityNm * Math.sin(m.theta)
+    const p = sample(t, i, m.theta, -wireVelocity, model.gravityNm * Math.sin(m.theta)
       + model.inertiaKgM2 * m.acceleration + fc * Math.sign(m.velocity) + b * m.velocity);
     p.can_id = i % 2 ? 0x180001fd : 0x020001fd;
     p.payload[2] = packedVelocity >> 8;
@@ -94,6 +94,7 @@ test("correcting packed feedback polarity restores acceleration and physical fri
     return p;
   });
   const legacy = data(config("Record", 12), samples);
+  legacy.feedback_velocity_sign = -1;
   const normalized = normalizeExperimentFeedbackVelocity(legacy);
   assert.equal(normalized.changed, true);
   const derived = deriveExperimentSamples(normalized.data);
@@ -165,6 +166,57 @@ test("target holding torque follows sent static angles, frozen geometry and the 
   assert.ok(deriveExperimentSamples(run).every(p => p.target_holding_torque_nm === null));
   cfg.pendulum = null;
   assert.ok(deriveExperimentSamples(run).every(p => p.target_holding_torque_nm === null));
+});
+
+test("static holding torque and drive feedback retain the same signed Nm unit in CSV and JSON", () => {
+  const cfg = config("StaticTorque", 12);
+  cfg.pendulum = { ...geometry, arm_mass_kg: 0 };
+  const samples = [-1, 1].map((direction, i) => {
+    // A horizontal 1 kg load at 180 mm requires ±1.765197 Nm.
+    // Native feedback words 0x5555/0xAAAA represent exactly -2/+2 Nm;
+    // the estimate need not equal the ideal gravity-only load.
+    const p = sample(i * 6, i + 1, direction * Math.PI / 2, 0, direction * 2);
+    p.payload[4] = p.payload[5] = direction < 0 ? 0x55 : 0xaa;
+    p.target = { kind: "Mit", position_rad: p.position_rad, velocity_rad_s: 0, torque_nm: 0, kp: 8, kd: 0.5 };
+    return p;
+  });
+  const run = data(cfg, samples), exported = JSON.parse(experimentJson(run));
+  assert.equal(exported.torque_unit, "Nm");
+  assert.deepEqual(exported.torque_feedback_range_nm, [-6, 6]);
+  const [headers, ...rows] = experimentCsv(run).trim().split("\r\n").map(line => line.split(","));
+  for (const [i, direction] of [-1, 1].entries()) {
+    near(exported.samples[i].torque_nm, direction * 2, 1e-12);
+    near(exported.derived_samples[i].target_holding_torque_nm, direction * 1.765197, 1e-12);
+    near(exported.derived_samples[i].gravity_torque_nm, direction * 1.765197, 1e-12);
+    near(Number(rows[i][headers.indexOf("torque_nm")]), direction * 2, 1e-12);
+    near(Number(rows[i][headers.indexOf("target_holding_torque_nm")]), direction * 1.765197, 1e-12);
+    near(Number(rows[i][headers.indexOf("gravity_torque_nm")]), direction * 1.765197, 1e-12);
+  }
+});
+
+test("9.96 kg at 180 mm is reported as over the EL05 torque range without rescaling theory", () => {
+  const cfg = config("StaticTorque", 72);
+  cfg.position_amplitude_rad = 0.6;
+  cfg.pendulum = { ...geometry, mass_kg: 9.96, length_m: 0.18, arm_mass_kg: 0.06 };
+  const p = sample(6, 1, 0.6, 0, 6);
+  p.target = { kind: "Mit", position_rad: 0.6, velocity_rad_s: 0, torque_nm: 0, kp: 12, kd: 0.5 };
+  const run = data(cfg, [p]), derived = deriveExperimentSamples(run);
+  near(staticHoldingTorquePeakNm(cfg), 9.957084949093867, 1e-12);
+  near(derived[0].target_holding_torque_nm, 9.957084949093867, 1e-12);
+  near(derived[0].gravity_torque_nm, 9.957084949093867, 1e-12);
+  assert.equal(experimentTorqueLimitNm(run), 6);
+  const section = analyzeExperiment(run).sections.find(section => section.id === "static")!;
+  near(section.metrics.find(metric => metric.key === "target_holding_peak")!.value, 9.957084949093867, 1e-12);
+  assert.ok(section.notes.some(note => note.includes("9.957 Nm") && note.includes("6.000 Nm")));
+  // A smaller captured limit is a capacity setting, not a different torque unit.
+  run.parameters = [{ index: 0x700b, value: 2, kind: "Float" }];
+  assert.equal(experimentTorqueLimitNm(run), 2);
+  assert.ok(analyzeExperiment(run).sections.find(section => section.id === "static")!.notes.some(note => note.includes("2.000 Nm")));
+  const exported = JSON.parse(experimentJson(run));
+  near(exported.derived_samples[0].target_holding_torque_nm, 9.957084949093867, 1e-12);
+  assert.equal(exported.samples[0].torque_nm, 6);
+  cfg.pendulum.zero_measured = false;
+  assert.equal(staticHoldingTorquePeakNm(cfg), null);
 });
 
 test("free decay identifies period, logarithmic decrement and total damping of a known damped oscillator", () => {
@@ -312,6 +364,72 @@ function staticFrictionRun(direction: 1 | -1 = 1) {
     confirmation_sample: confirmation, peak_excursion_rad: 0.012, return_started_s: confirmation.t_s };
   return run;
 }
+
+function bidirectionalStaticFrictionRun() {
+  const positive = staticFrictionRun(1), negative = staticFrictionRun(-1);
+  const shifted = (sample: El05TelemetrySample | null) => sample ? { ...sample, t_s: sample.t_s + 12, sequence: sample.sequence + 1200 } : null;
+  const first = { ...positive.status.static_friction!, direction: 1 as const, started_s: 0, return_settled: true };
+  negative.status.config = { ...positive.status.config!, friction_direction: "Both" };
+  negative.status.static_friction = { ...negative.status.static_friction!, direction: -1, started_s: 12,
+    ramp_started_s: 12.5, return_started_s: 22.54, return_settled: true, completed_directions: [first],
+    last_stationary_sample: shifted(negative.status.static_friction!.last_stationary_sample),
+    onset_sample: shifted(negative.status.static_friction!.onset_sample),
+    confirmation_sample: shifted(negative.status.static_friction!.confirmation_sample) };
+  negative.samples = [...positive.samples, ...negative.samples.map(sample => shifted(sample)!)];
+  negative.status.elapsed_s = 23;
+  negative.status.samples = negative.samples.length;
+  negative.feedback_velocity_sign = 1;
+  return negative;
+}
+
+test("one bidirectional calibration keeps both signed onset events in analysis, CSV and JSON", () => {
+  const run = bidirectionalStaticFrictionRun();
+  // Make the reverse mechanism measurably different from the forward one.
+  run.status.static_friction!.onset_sample!.torque_nm -= 0.08;
+  const report = analyzeExperiment(run), sf = report.static_friction!;
+  assert.deepEqual(sf.directions.map(pass => pass.direction), [1, -1]);
+  assert.equal(sf.both_directions_valid, true);
+  near(sf.directions[0].onset_command_torque_nm, 0.2, 1e-10);
+  near(sf.directions[1].onset_command_torque_nm, -0.2, 1e-10);
+  near(sf.directions[0].onset_time_s, 10.5, 1e-10);
+  near(sf.directions[1].onset_time_s, 22.5, 1e-10);
+  near(sf.directions[1].ramp_started_s, 12.5, 1e-10);
+  near(sf.directions[0].onset_gravity_adjusted_torque_nm, 0.172, 1e-10);
+  near(sf.directions[1].onset_gravity_adjusted_torque_nm, -0.252, 1e-10);
+  near(sf.adjusted_magnitude_difference_nm, -0.08, 1e-10);
+  assert.ok(report.sections.find(section => section.id === "static_friction_positive"));
+  assert.ok(report.sections.find(section => section.id === "static_friction_negative"));
+  const summary = report.sections.find(section => section.id === "static_friction_summary")!;
+  assert.equal(summary.metrics.find(metric => metric.key === "static_friction_both_valid")!.value, 1);
+  const exported = JSON.parse(experimentJson(run));
+  assert.equal(exported.status.static_friction.completed_directions[0].onset_sample.sequence, 1050);
+  assert.equal(exported.status.static_friction.onset_sample.sequence, 2250);
+  assert.equal(exported.analysis.static_friction.directions.length, 2);
+  const csv = experimentCsv(run).trim().split("\r\n").map(row => row.split(","));
+  const direction = csv[0].indexOf("static_friction_direction"), phase = csv[0].indexOf("static_friction_phase");
+  assert.deepEqual(csv.slice(1).map(row => row[direction]), ["1", "1", "1", "1", "-1", "-1", "-1", "-1"]);
+  assert.deepEqual(csv.slice(1).map(row => row[phase]), ["Settling", "Ramping", "Ramping", "Returning", "Settling", "Ramping", "Ramping", "Returning"]);
+});
+
+test("a failed or interrupted second direction preserves the first result without a fabricated comparison", () => {
+  for (const outcome of ["Timeout", "Interrupted", "AngleLimit", "NotSettled", "TorqueLimit"] as const) {
+    const run = bidirectionalStaticFrictionRun();
+    run.status.static_friction!.outcome = outcome;
+    const sf = analyzeExperiment(run).static_friction!;
+    assert.equal(sf.directions[0].valid_breakaway, true);
+    near(sf.directions[0].onset_command_torque_nm, 0.2, 1e-10);
+    assert.equal(sf.directions[1].valid_breakaway, false);
+    assert.equal(sf.directions[1].onset_feedback_torque_nm, null);
+    assert.equal(sf.both_directions_valid, false);
+    assert.equal(sf.feedback_magnitude_difference_nm, null);
+    assert.equal(sf.adjusted_magnitude_difference_nm, null);
+  }
+  const run = staticFrictionRun();
+  run.status.config!.friction_direction = "Both";
+  const sf = analyzeExperiment(run).static_friction!;
+  assert.equal(sf.directions.length, 1, "an untested reverse direction must not be invented");
+  assert.equal(sf.both_directions_valid, false);
+});
 
 test("static friction analysis preserves captured first-motion events and signed forward/reverse torque estimates", () => {
   for (const direction of [1, -1] as const) {

@@ -67,6 +67,40 @@ export interface El05State {
   last_error: string | null;
   devices: El05Device[];
   experiment: El05ExperimentStatus;
+  gravity_compensation: El05GravityCompensationStatus;
+}
+
+export interface El05GravityReference {
+  id: string;
+  motor_id: number;
+  position_rad: number;
+  captured_at_s: number;
+}
+
+export interface El05GravityCompensationConfig {
+  reference_id: string;
+  mass_kg: number;
+  length_m: number;
+  arm_mass_kg: number;
+  compensation_scale: number;
+  damping_nm_s_rad: number;
+  torque_limit_nm: number;
+  max_velocity_rad_s: number;
+  max_temperature_c: number;
+  ramp_s: number;
+}
+
+export interface El05GravityCompensationStatus {
+  active: boolean;
+  elapsed_s: number;
+  reference: El05GravityReference | null;
+  config: El05GravityCompensationConfig | null;
+  angle_rad: number | null;
+  gravity_torque_nm: number;
+  damping_torque_nm: number;
+  command_torque_nm: number;
+  limited: boolean;
+  reason: string | null;
 }
 
 export type El05ExperimentKind = "Record" | "VelocitySteps" | "TorqueRamp" | "StaticTorque" | "PositionSteps" | "SineSweep" | "Impedance" | "Backdrive" | "ThermalHold" | "SlowTriangle" | "StaticFriction";
@@ -99,8 +133,12 @@ export interface El05ExperimentConfig {
   motion_threshold_rad?: number;
   motion_confirm_s?: number;
   settle_time_s?: number;
+  friction_direction?: "Both" | "Positive" | "Negative";
 }
-export interface El05StaticFrictionStatus {
+export interface El05StaticFrictionPass {
+  /** Absent in legacy single-direction recordings; infer from signed torque. */
+  direction?: 1 | -1;
+  started_s?: number;
   phase: "Settling" | "Ramping" | "Returning" | "Complete";
   outcome: "BreakawayDetected" | "AngleLimit" | "TorqueLimit" | "Timeout" | "NotSettled" | "Interrupted" | null;
   reference_position_rad: number | null;
@@ -111,6 +149,9 @@ export interface El05StaticFrictionStatus {
   peak_excursion_rad: number;
   return_started_s: number | null;
   return_settled?: boolean | null;
+}
+export interface El05StaticFrictionStatus extends El05StaticFrictionPass {
+  completed_directions?: El05StaticFrictionPass[];
 }
 export interface El05ExperimentStatus {
   run_id?: number;
@@ -145,8 +186,8 @@ export interface El05TelemetrySample {
   target_age_ms: number | null;
 }
 export interface El05ExperimentData {
-  /** Packed CAN feedback velocity is normalized once; raw payload stays unchanged. */
-  feedback_velocity_sign?: -1;
+  /** Multiplier applied to packed CAN feedback velocity; current recordings use +1. */
+  feedback_velocity_sign?: -1 | 1;
   status: El05ExperimentStatus;
   motor_id: number | null;
   uid: string | null;
@@ -181,4 +222,7 @@ export const el05Api = {
   writeParameter: (index: number, value: number) => invoke<void>("el05_write_parameter", { index, value }),
   startExperiment: (config: El05ExperimentConfig) => invoke<void>("el05_start_experiment", { config }),
   experimentData: (afterSequence?: number) => invoke<El05ExperimentData>("el05_experiment_data", { afterSequence }),
+  captureGravityReference: () => invoke<El05GravityReference>("el05_capture_gravity_reference"),
+  startGravityCompensation: (config: El05GravityCompensationConfig) => invoke<void>("el05_start_gravity_compensation", { config }),
+  stopGravityCompensation: () => invoke<void>("el05_stop_gravity_compensation"),
 };

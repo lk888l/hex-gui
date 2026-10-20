@@ -26,6 +26,38 @@ pub async fn el05_start_experiment(
 }
 
 #[tauri::command]
+pub async fn el05_capture_gravity_reference(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::el05::gravity::GravityReference> {
+    session(&state)
+        .await?
+        .capture_gravity_reference()
+        .await
+        .map_err(error)
+}
+
+#[tauri::command]
+pub async fn el05_start_gravity_compensation(
+    state: State<'_, AppState>,
+    config: crate::el05::gravity::GravityCompensationConfig,
+) -> CmdResult<()> {
+    session(&state)
+        .await?
+        .start_gravity_compensation(config)
+        .await
+        .map_err(error)
+}
+
+#[tauri::command]
+pub async fn el05_stop_gravity_compensation(state: State<'_, AppState>) -> CmdResult<()> {
+    session(&state)
+        .await?
+        .stop_gravity_compensation()
+        .await
+        .map_err(error)
+}
+
+#[tauri::command]
 pub async fn el05_experiment_data(
     state: State<'_, AppState>,
     after_sequence: Option<u64>,

@@ -59,3 +59,15 @@
 .el05-experiment-results > .ant-segmented .ant-segmented-group { width: max-content; }
 .el05-experiment-record-meta { max-width: 100%; }
 .el05-experiment-record-meta .ant-typography { overflow-wrap: anywhere; }
+
+.el05-workspace-tabs { max-width: 100%; overflow-x: auto; }
+.el05-workspace-tabs .ant-segmented-group { min-width: max-content; }
+.el05-gravity { display: flex; flex-direction: column; gap: 16px; }
+.el05-gravity-model { margin-bottom: 12px; }
+.el05-gravity-reference { padding-top: 14px; margin-top: 8px; border-top: 1px solid rgba(148, 163, 184, 0.2); }
+.el05-gravity-reference + .ant-alert { margin-top: 12px; }
+.el05-gravity-live { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: center; }
+.el05-gravity-pendulum { width: 100%; max-width: 240px; color: inherit; }
+.el05-gravity-status { margin-top: 16px; }
+@media (max-width: 1100px) { .el05-gravity-live { grid-template-columns: 150px minmax(0, 1fr); } .el05-gravity-live .el05-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 620px) { .el05-gravity-live { grid-template-columns: 1fr; } .el05-gravity-pendulum { height: 180px; margin: 0 auto; } }

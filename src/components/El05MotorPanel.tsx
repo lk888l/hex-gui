@@ -6,6 +6,7 @@ import { el05Api, type El05Mode, type El05State, type El05Target } from "../el05
 import { useI18n } from "../i18n";
 import "./El05MotorPanel.css";
 import { El05ExperimentPanel } from "./El05ExperimentPanel";
+import { El05GravityPanel } from "./El05GravityPanel";
 
 const MODES: El05Mode[] = ["Mit", "PositionPp", "Velocity", "Current", "PositionCsp"];
 const MODE_LABELS: Record<El05Mode, [string, string]> = {
@@ -81,11 +82,12 @@ export function El05MotorPanel() {
   const [newMotorId, setNewMotorId] = useState("");
   const [state, setState] = useState<El05State | null>(null);
   const [busy, setBusy] = useState(false);
+  const [benchWorking, setBenchWorking] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
   const [refreshHz, setRefreshHz] = useState(20);
   const [view, setView] = useState<"numeric" | "chart">("numeric");
-  const [workspaceTab, setWorkspaceTab] = useState<"bench" | "manual" | "settings">("bench");
+  const [workspaceTab, setWorkspaceTab] = useState<"bench" | "gravity" | "manual" | "settings">("bench");
   const [windowSec, setWindowSec] = useState(10);
   const [repeat, setRepeat] = useState(true);
   const [position, setPosition] = useState(0);
@@ -112,10 +114,12 @@ export function El05MotorPanel() {
   const mode = state?.mode ?? "Mit";
   const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0);
   const enabled = !!state?.enabled;
-  const motionReady = selected && !!state?.online && enabled && !faulted && !state?.experiment.active;
+  const gravityActive = !!state?.gravity_compensation?.active;
+  const controlLocked = busy || gravityActive || benchWorking || stopping;
+  const motionReady = selected && !!state?.online && enabled && !faulted && !state?.experiment.active && !gravityActive && !benchWorking && !stopping;
   const parameter = PARAMETERS.find((item) => item.index === parameterIndex)!;
   const proposedId = /^(?:0x[0-9a-f]+|\d+)$/i.test(newMotorId.trim()) ? Number(newMotorId) : NaN;
-  const canChangeId = selected && !busy && Number.isInteger(proposedId) && proposedId >= 0 && proposedId <= 127
+  const canChangeId = selected && !controlLocked && Number.isInteger(proposedId) && proposedId >= 0 && proposedId <= 127
     && proposedId !== state?.motor_id && proposedId !== state?.host_id;
 
   const acceptState = useCallback((next: El05State | null) => {
@@ -354,11 +358,11 @@ export function El05MotorPanel() {
 
       <div className="el05-workspace">
         <aside className="el05-sidebar">
-          <Card size="small" title={tr("EL05 电机", "EL05 motors")} extra={<Button size="small" disabled={!connected || busy} loading={busy} onClick={() => void run(() => el05Api.scan())}>{tr("扫描", "Scan")}</Button>}>
+          <Card size="small" title={tr("EL05 电机", "EL05 motors")} extra={<Button size="small" disabled={!connected || controlLocked} loading={busy} onClick={() => void run(() => el05Api.scan())}>{tr("扫描", "Scan")}</Button>}>
             {(state?.devices.length ?? 0) === 0 ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={connected ? tr("点击扫描发现电机", "Scan to discover motors") : tr("先连接 CAN", "Connect CAN first")} />
             ) : state?.devices.map((device) => (
-              <button key={device.motor_id} className={`el05-device${device.selected ? " el05-device--selected" : ""}`} type="button" disabled={busy} onClick={() => selectMotor(device.motor_id)}>
+              <button key={device.motor_id} className={`el05-device${device.selected ? " el05-device--selected" : ""}`} type="button" disabled={controlLocked} onClick={() => selectMotor(device.motor_id)}>
                 <span className="el05-device__title"><strong>RobStride EL05</strong><code>{hexId(device.motor_id)}</code></span>
                 <span><Tag color={device.online ? "green" : "default"}>{device.online ? tr("在线", "Online") : tr("已发现", "Discovered")}</Tag>{device.selected && <Tag color="blue">{tr("已选择", "Selected")}</Tag>}</span>
                 {device.uid && <Typography.Text type="secondary" className="el05-device__uid">UID {device.uid}</Typography.Text>}
@@ -366,8 +370,8 @@ export function El05MotorPanel() {
             ))}
             <Typography.Text type="secondary">{tr("或指定电机 ID（十进制 / 0x）", "Or enter a motor ID (decimal / 0x)")}</Typography.Text>
             <div className="el05-manual">
-              <Input aria-label={tr("电机 ID", "Motor ID")} value={manualId} disabled={!connected || busy} onChange={(event) => setManualId(event.target.value)} />
-              <Button disabled={!connected || busy} onClick={() => void run(() => selectMotorOperation(parseId(manualId, 0xff)))}>{tr("选择", "Select")}</Button>
+              <Input aria-label={tr("电机 ID", "Motor ID")} value={manualId} disabled={!connected || controlLocked} onChange={(event) => setManualId(event.target.value)} />
+              <Button disabled={!connected || controlLocked} onClick={() => void run(() => selectMotorOperation(parseId(manualId, 0xff)))}>{tr("选择", "Select")}</Button>
             </div>
             <Typography.Text className="el05-description" type="secondary">{tr("切换电机前会停止当前电机。", "Changing selection stops the current motor.")}</Typography.Text>
           </Card>
@@ -389,22 +393,30 @@ export function El05MotorPanel() {
             {selected && !state?.online && <Alert type="warning" showIcon message={tr("尚无有效反馈，请检查电源、1 Mbps 总线速率、接线及电机当前协议。", "No fresh feedback. Check power, 1 Mbps bus timing, wiring and the motor's current protocol.")} />}
             {state?.last_error && <Alert type="error" showIcon message={state.last_error} />}
             {faulted && <Alert type="error" showIcon message={tr("电机故障", "Motor fault")} description={<Space wrap>{faultLabels(state!.fault_bits, zh).map((label) => <Tag color="red" key={label}>{label}</Tag>)}<Typography.Text code>{`Fault ${hexId(state!.fault_code, 8)}`}</Typography.Text>{state!.faults.length > 0 && <Typography.Text>{state!.faults.join(" · ")}</Typography.Text>}</Space>} />}
+            {gravityActive && workspaceTab !== "gravity" && <Alert type="info" showIcon
+              message={tr("零重力保持正在运行；调整控制或开始测试前请先停止。", "Zero-gravity hold is running. Stop it before changing control or starting an experiment.")}
+              action={<Button size="small" onClick={() => setWorkspaceTab("gravity")}>{tr("查看补偿", "View compensation")}</Button>} />}
+            {benchWorking && <Alert type="info" showIcon message={tr("正在处理摆锤测试，请稍候；可随时停止电机。", "Processing the pendulum experiment. You can stop the motor at any time.")} />}
 
-            <Segmented block value={workspaceTab} onChange={value => setWorkspaceTab(value as typeof workspaceTab)} options={[
+            <Segmented className="el05-workspace-tabs" block value={workspaceTab} onChange={value => setWorkspaceTab(value as typeof workspaceTab)} options={[
               { label: tr("摆锤性能测试", "Pendulum tests"), value: "bench" },
+              { label: tr("零重力保持", "Zero-gravity hold"), value: "gravity" },
               { label: tr("手动控制与监视", "Manual control & monitor"), value: "manual" },
               { label: tr("设备设置与参数", "Settings & parameters"), value: "settings" },
             ]} />
             <div hidden={workspaceTab !== "bench"}>
-              <El05ExperimentPanel state={state} zh={zh} busy={busy} coordinateRevision={coordinateRevision} refresh={async () => acceptState(await el05Api.getState())} />
+              <El05ExperimentPanel state={state} zh={zh} busy={busy || stopping} coordinateRevision={coordinateRevision} refresh={async () => acceptState(await el05Api.getState())} onWorkingChange={setBenchWorking} />
+            </div>
+            <div hidden={workspaceTab !== "gravity"}>
+              <El05GravityPanel state={state} zh={zh} busy={busy || benchWorking} stopping={stopping} run={run} stop={stop} />
             </div>
             <div hidden={workspaceTab !== "manual"}><Space direction="vertical" size={12} style={{ width: "100%" }}>
             <Card size="small" title={tr("电机控制", "Motor control")} extra={state?.streaming && <Tag color="processing">{tr("目标连续发送中", "Target streaming")}</Tag>}>
               <Space wrap>
-                <Select aria-label={tr("控制模式", "Control mode")} style={{ width: 200 }} value={mode} disabled={!selected || busy} options={MODES.map((value) => ({ label: MODE_LABELS[value][zh ? 0 : 1], value }))} onChange={changeMode} />
-                <Button type="primary" disabled={!selected || !state?.online || enabled || faulted || busy || state?.experiment.active} onClick={() => void run(() => el05Api.enable())}>{tr("使能", "Enable")}</Button>
+                <Select aria-label={tr("控制模式", "Control mode")} style={{ width: 200 }} value={mode} disabled={!selected || controlLocked} options={MODES.map((value) => ({ label: MODE_LABELS[value][zh ? 0 : 1], value }))} onChange={changeMode} />
+                <Button type="primary" disabled={!selected || !state?.online || enabled || faulted || controlLocked || state?.experiment.active} onClick={() => void run(() => el05Api.enable())}>{tr("使能", "Enable")}</Button>
                 <Button type="primary" danger disabled={!selected} loading={stopping} onClick={() => void stop()}>{tr("停止 / 失能", "Stop / disable")}</Button>
-                <Button disabled={!selected || busy} onClick={() => void run(() => el05Api.clearFault())}>{tr("清除故障", "Clear fault")}</Button>
+                <Button disabled={!selected || controlLocked} onClick={() => void run(() => el05Api.clearFault())}>{tr("清除故障", "Clear fault")}</Button>
               </Space>
               <Typography.Text className="el05-description" type="secondary">{tr("切换模式会先停止电机；使能后点击「发送目标」执行。", "Changing mode stops the motor. Enable, then press Send target to execute.")}</Typography.Text>
               <div className="el05-target">
@@ -472,13 +484,13 @@ export function El05MotorPanel() {
                   </Descriptions.Item>
                 </Descriptions>
                 <Space wrap>
-                  <Button disabled={!selected || busy} onClick={() => void run(() => el05Api.readIdentity(), tr("ID / UID 已读取", "ID / UID read"))}>{tr("读取 ID / UID", "Read ID / UID")}</Button>
-                  <Button disabled={!selected || busy} onClick={() => void run(() => el05Api.readVersion(), tr("电机版本已读取，电机保持停止", "Motor version read; motor remains stopped"))}>{tr("读取版本（先停机）", "Read version (stops motor)")}</Button>
+                  <Button disabled={!selected || controlLocked} onClick={() => void run(() => el05Api.readIdentity(), tr("ID / UID 已读取", "ID / UID read"))}>{tr("读取 ID / UID", "Read ID / UID")}</Button>
+                  <Button disabled={!selected || controlLocked} onClick={() => void run(() => el05Api.readVersion(), tr("电机版本已读取，电机保持停止", "Motor version read; motor remains stopped"))}>{tr("读取版本（先停机）", "Read version (stops motor)")}</Button>
                 </Space>
                 <Typography.Text type="secondary">{tr("版本值按手册第 31 页的 4 字节字段显示。手册虽列出 AppCodeVersion、BootCodeVersion 等固件字符串，但未给出私有协议读取格式，也未定义独立硬件版本，因此此处不推测这些版本号。", "The motor version is the four-byte field defined on manual p.31. AppCodeVersion and BootCodeVersion are listed, but their native-protocol string reads and a separate hardware revision are not documented.")}</Typography.Text>
                 <div className="el05-settings-row">
                   <Field label={tr("新 CAN ID（0–127）", "New CAN ID (0–127)")}>
-                    <Input aria-label={tr("新 CAN ID", "New CAN ID")} value={newMotorId} disabled={!selected || busy} placeholder={tr("十进制或 0x 十六进制", "Decimal or 0x hex")} onChange={(event) => setNewMotorId(event.target.value)} />
+                    <Input aria-label={tr("新 CAN ID", "New CAN ID")} value={newMotorId} disabled={!selected || controlLocked} placeholder={tr("十进制或 0x 十六进制", "Decimal or 0x hex")} onChange={(event) => setNewMotorId(event.target.value)} />
                   </Field>
                   <Popconfirm title={tr("修改电机 CAN ID？", "Change motor CAN ID?")}
                     description={tr(`将先停机并检查新 ID ${newMotorId}，修改后通过 UID 核对并选择新地址。`, `Stops the motor, checks ID ${newMotorId}, and selects the new address after verifying its UID.`)}
@@ -493,7 +505,7 @@ export function El05MotorPanel() {
                     <Typography.Text>{tr("当前多圈位置：", "Current multi-turn position: ")}<Numeric value={state?.mechanical_position_rad} /> rad</Typography.Text>
                   </div>
                   <Popconfirm title={tr("将当前位置设置为机械零点？电机会先停止。", "Set the current position as mechanical zero? The motor will stop first.")} okText={tr("设置零点", "Set zero")} cancelText={tr("取消", "Cancel")} onConfirm={setZero}>
-                    <Button disabled={!selected || busy || (mode !== "Mit" && mode !== "PositionCsp")}>{tr("设置零点", "Set zero")}</Button>
+                    <Button disabled={!selected || controlLocked || (mode !== "Mit" && mode !== "PositionCsp")}>{tr("设置零点", "Set zero")}</Button>
                   </Popconfirm>
                 </div>
               </Space>
@@ -503,8 +515,8 @@ export function El05MotorPanel() {
               <div className="el05-parameter">
                 <Field label={tr("手册参数", "Manual parameter")}><Select disabled={busy} showSearch optionFilterProp="label" value={parameterIndex} style={{ width: "100%" }} onChange={(value) => { setParameterIndex(value); setParameterValue(null); setParameterReadback(null); }} options={PARAMETERS.map((item) => ({ value: item.index, label: `${hexId(item.index, 4)} · ${item.name} · ${item.label[zh ? 0 : 1]}${item.readOnly ? tr("（只读）", " (read only)") : ""}` }))} /></Field>
                 <NumberField label={tr("参数值", "Value")} unit={parameter.unit} value={parameterValue} min={parameter.min} max={parameter.max} step={parameter.integer ? 1 : 0.01} precision={parameter.integer ? 0 : undefined} onChange={setParameterValue} disabled={parameter.readOnly || busy} />
-                <Button disabled={!selected || busy} onClick={readParameter}>{tr("读取", "Read")}</Button>
-                <Button disabled={!selected || busy || parameter.readOnly || parameterValue == null || enabled || state?.experiment.active} onClick={writeParameter}>{tr("写入并读回", "Write & read back")}</Button>
+                <Button disabled={!selected || controlLocked} onClick={readParameter}>{tr("读取", "Read")}</Button>
+                <Button disabled={!selected || controlLocked || parameter.readOnly || parameterValue == null || enabled || state?.experiment.active} onClick={writeParameter}>{tr("写入并读回", "Write & read back")}</Button>
               </div>
               {parameterReadback && <Typography.Text code copyable>{parameterReadback}</Typography.Text>}
               <Typography.Text type="secondary">{parameterHint(parameterIndex, zh)} {tr("参数写入在电机停止后开放。", "Parameter writes are available while the motor is stopped.")}</Typography.Text>

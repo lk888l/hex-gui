@@ -346,10 +346,12 @@ bus with the right settings:
   loop. With Kp=0, friction produces speed error; with Kd=0, the velocity
   input has no effect. The EL05 native frame maps ±50 rad/s over 16 bits
   (100/65535 ≈ 0.001526 rad/s per count). The display and chart use fast
-  type-2/type-24 speed feedback exclusively. Its observed reversed polarity is
-  corrected once on reception to follow increasing encoder position; velocity
-  targets keep their existing direction. The asynchronous `0x701B`
-  `mechVel` float is displayed separately with its sample age. A wrapped-position
+  type-2/type-24 speed feedback exclusively. Following the reported hardware
+  direction, the shared decoder now uses its signed value directly (+1),
+  reversing the previous -1 multiplier for live monitoring, experiments and
+  zero-gravity damping. Velocity targets keep their existing direction.
+  The asynchronous `0x701B` `mechVel` float is displayed separately with its
+  sample age. A wrapped-position
   derivative over roughly 150 ms provides a second, encoder-based check.
   Both estimates use the same motor encoder and do not establish absolute
   accuracy against an external reference. Chart points use feedback sequence
@@ -374,7 +376,32 @@ bus with the right settings:
   still stop the run. The service loop runs at 50 Hz; sine sweeps are limited
   to 10 Hz. Stop removes active support.
 
-  **Static friction calibration** is a separate, one-direction test: place the
+  **Zero-gravity hold** is an independent tab for moving the pendulum by hand
+  and supporting it after release. Enter the end mass, arm length and uniform
+  arm mass, then place the pendulum vertically down and capture its reference
+  while the motor is stopped and stationary. This reference is captured by the
+  backend and is invalidated after motor reselection, reconnection, a mechanical
+  zero or CAN ID change, or lost feedback. It is independent of the test bench's
+  reference and does not change the motor's mechanical zero.
+
+  Start automatically prepares MIT and enables continuous support without a
+  fixed duration. At 50 Hz, the backend computes
+  `tau = scale * (m + arm_mass/2) * 9.80665 * L * sin(q - q_down) - damping * velocity`
+  using current feedback, with MIT Kp and Kd both zero. There is no commanded
+  holding angle: damping and friction let the pendulum settle after release,
+  while geometry or reference errors may cause slow drift. Compensation scale,
+  damping, torque limit, startup ramp, speed limit and temperature limit are
+  configurable before starting; active settings are frozen. Startup ramps the
+  gravity component while damping acts immediately. Start is rejected when
+  the configured peak gravity compensation exceeds the torque limit; the
+  combined gravity/damping command is also limited during operation. Speed or
+  temperature limits, feedback older than 150 ms, a missing UI heartbeat for
+  three seconds and drive faults stop support. Stop disables the motor and
+  removes its supporting torque.
+
+  **Static friction calibration** tests both directions in one run by default
+  (positive → return → rest → negative → return → stop), with optional
+  positive-only and negative-only modes. Place the
   pendulum naturally down, then start. It confirms 0.5 seconds of rest, records
   that starting position, and ramps a signed torque at 0.02 Nm/s by default.
   At a 0.15° displacement it freezes the measurement torque while confirming
@@ -385,7 +412,12 @@ bus with the right settings:
   peak displacement is retained rather than promising zero overshoot. Return
   torque is bounded by the configured maximum test torque and lasts at most
   three seconds. Maximum torque, time limit, failure to settle, and interruption
-  are reported as unsuccessful calibration outcomes.
+  are reported separately for each direction. The configured timeout applies
+  independently to each direction's settling and ramp, plus up to three seconds
+  for its return. The second direction starts from zero torque only after a
+  stable return and a new rest confirmation. An angle guard, unstable return,
+  fault or interruption stops further directions; a torque/time limit followed
+  by a stable return still allows testing the other direction.
 
   The last stationary, first qualifying motion, and confirmation frames are
   captured before telemetry thinning. Reports use the first motion frame's
@@ -394,8 +426,13 @@ bus with the right settings:
   correction still requires the independently measured downward reference.
   The result is an estimated breakaway friction torque in Nm, not a dimensionless
   contact friction coefficient; small-angle onset still includes detection,
-  inertia and drive torque estimation errors. Each run measures one direction;
-  change the sign of the maximum test torque for the opposite direction.
+  inertia and drive torque estimation errors. Both directions use the configured
+  torque magnitude and ramp rate, retaining signed results and independent event
+  frames even if the other direction fails. Charts mark both onsets and returns;
+  reports compare torque magnitudes only when both directions have valid onset
+  evidence. CSV includes `static_friction_direction` and `static_friction_phase`;
+  JSON retains the current pass and `completed_directions` before plot thinning.
+  Legacy single-direction recordings remain single-direction results on import.
 
   The bench displays position/velocity references and feedback, effort,
   temperature, and derived pendulum traces alongside automatic metrics.
@@ -409,6 +446,19 @@ bus with the right settings:
   drive-estimated torque; they do not independently measure dynamic shaft
   torque, backlash, or efficiency. The manual's 0.94 Nm/Arms torque constant
   must not be treated as an independently calibrated conversion from `iqf`.
+  All torque traces, static plateau results and exports use the native drive's
+  **Nm (N·m)** unit. The EL05 260922 manual (printed pp.30, 34) maps type-2
+  and type-24 feedback torque words from `0..65535` to `-6..6 Nm`. Theoretical
+  holding torque `(m + arm_mass/2) * g * L * sin(theta)`, with mass in kg and
+  length in m, already uses this same unit; no gear-ratio or current-constant
+  conversion is applied. CSV torque columns retain their `_nm` suffix and JSON
+  explicitly records `torque_unit: "Nm"`. A difference between theory and
+  feedback can include friction, geometry errors and drive-estimation error.
+  Static calibration previews the peak theoretical demand at its target angles;
+  the torque chart and analysis show the captured `0x700B` drive limit, falling
+  back to the native 6 Nm maximum when no readback is available. Theory above
+  the limit remains visible and is flagged. For example, 9.96 kg at 180 mm with
+  a 0.06 kg uniform arm requires 9.957 Nm at 0.6 rad, exceeding the 6 Nm peak.
 
   Receive-time data is captured independently of UI refresh and transferred
   incrementally. Long runs retain original CAN bytes at a duration-dependent
@@ -418,10 +468,12 @@ bus with the right settings:
   explicit storage budget: its plot samples are reduced over the whole run
   while the metrics calculated before reduction are retained. Export the live
   recording for full retained telemetry before leaving the workspace.
-  New JSON recordings mark normalized feedback with `feedback_velocity_sign=-1`.
-  Old JSON and history with matching original type-2/type-24 CAN bytes are
-  normalized on load and their analyses recomputed. Reduced history can only
-  be recomputed from its retained samples; the interface identifies this case.
+  New JSON recordings use `feedback_velocity_sign=1`. Old JSON and history
+  marked `-1` have their feedback and calibration-event velocities reversed
+  once on load; unmarked recordings require matching original type-2/type-24
+  CAN bytes. Converted recordings are marked `1` and their analyses recomputed.
+  Reduced history can only be recomputed from its retained samples; the
+  interface identifies this case.
 
   EL05 firmware `0x0A050001` was observed to emit periodic telemetry as type
   `24` with the type-2 payload layout. Its measured `EPScan_time=0` period is

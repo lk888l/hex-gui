@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, Card, Collapse, Descriptions, Empty, Segmented, Space, Table, Tag, Typography } from "antd";
 import ReactECharts from "echarts-for-react";
 import type { El05ExperimentData, El05ExperimentStatus } from "../el05Api";
-import { analyzeExperiment, deriveExperimentSamples } from "../el05Experiment";
+import { analyzeExperiment, deriveExperimentSamples, EL05_TORQUE_UNIT, experimentTorqueLimitNm, staticFrictionPasses } from "../el05Experiment";
 import { LEGACY_VELOCITY_ANALYSIS_NOTE, normalizeExperimentFeedbackVelocity } from "../el05Velocity";
 
 export type ExperimentAnalysis = ReturnType<typeof analyzeExperiment>;
@@ -96,6 +96,7 @@ function parseExperimentValue(parsed: any): { data: El05ExperimentData; analysis
     throw new Error("Invalid experiment numeric configuration / 测试配置缺少必要数值或包含无效数值");
   }
   if (config.gravity_compensation != null && typeof config.gravity_compensation !== "boolean") throw new Error("Invalid gravity compensation setting / 重力补偿设置无效");
+  if (config.friction_direction != null && !["Both", "Positive", "Negative"].includes(config.friction_direction)) throw new Error("Invalid friction direction / 静摩擦方向无效");
   if (config.pendulum && typeof config.pendulum.zero_measured !== "boolean") throw new Error("Invalid downward reference flag / 下垂参考标记无效");
   if (config.pendulum && (["mass_kg", "length_m", "arm_mass_kg", "downward_zero_rad"].some(key => !Number.isFinite(config.pendulum[key])) || (config.pendulum.extra_inertia_kg_m2 != null && !Number.isFinite(config.pendulum.extra_inertia_kg_m2)))) {
     throw new Error("Invalid pendulum geometry / 摆锤几何或参考角数据无效");
@@ -118,16 +119,29 @@ function parseExperimentValue(parsed: any): { data: El05ExperimentData; analysis
   for (const sample of data.samples) validateSample(sample);
   const calibration = data.status.static_friction;
   if (calibration != null) {
+    if (calibration.completed_directions != null && (!Array.isArray(calibration.completed_directions) || calibration.completed_directions.length > 1)) {
+      throw new Error("Invalid completed friction directions / 已完成的静摩擦方向无效");
+    }
     const phases = ["Settling", "Ramping", "Returning", "Complete"];
     const outcomes = ["BreakawayDetected", "AngleLimit", "TorqueLimit", "Timeout", "NotSettled", "Interrupted"];
-    if (typeof calibration !== "object" || !phases.includes(calibration.phase) || (calibration.outcome !== null && !outcomes.includes(calibration.outcome))
-      || !Number.isFinite(calibration.peak_excursion_rad)
-      || (calibration.return_settled != null && typeof calibration.return_settled !== "boolean")
-      || ["reference_position_rad", "ramp_started_s", "return_started_s"].some(key => calibration[key] !== null && !Number.isFinite(calibration[key]))) {
-      throw new Error("Invalid static friction calibration status / 静摩擦标定状态无效");
+    const passes = [...(calibration.completed_directions ?? []), calibration];
+    for (const pass of passes) {
+      if (!pass || typeof pass !== "object" || !phases.includes(pass.phase) || (pass.outcome !== null && !outcomes.includes(pass.outcome))
+        || !Number.isFinite(pass.peak_excursion_rad)
+        || (pass.direction != null && pass.direction !== 1 && pass.direction !== -1)
+        || (pass.started_s != null && (!Number.isFinite(pass.started_s) || pass.started_s < 0))
+        || (pass.return_settled != null && typeof pass.return_settled !== "boolean")
+        || ["reference_position_rad", "ramp_started_s", "return_started_s"].some(key => pass[key] !== null && !Number.isFinite(pass[key]))) {
+        throw new Error("Invalid static friction calibration status / 静摩擦标定状态无效");
+      }
+      for (const key of ["last_stationary_sample", "onset_sample", "confirmation_sample"]) {
+        if (pass[key] != null) validateSample(pass[key]);
+      }
     }
-    for (const key of ["last_stationary_sample", "onset_sample", "confirmation_sample"]) {
-      if (calibration[key] != null) validateSample(calibration[key]);
+    if (passes.length === 2 && (passes.some(pass => pass.direction == null || pass.started_s == null)
+      || passes[0].direction === passes[1].direction || passes[0].started_s > passes[1].started_s
+      || passes[0].phase !== "Complete" || passes[0].return_settled !== true)) {
+      throw new Error("Invalid friction direction sequence / 静摩擦方向序列无效");
     }
   }
   data.samples.sort((a: { t_s: number }, b: { t_s: number }) => a.t_s - b.t_s);
@@ -172,18 +186,23 @@ export function staticFrictionStatusText(status: El05ExperimentStatus, zh: boole
     TorqueLimit: ["达到最大转矩，未检测到起动", "Torque limit reached without breakaway"], Timeout: ["标定超时", "Calibration timed out"],
     NotSettled: ["未能确认静止，未开始标定", "Rest not confirmed; calibration not started"], Interrupted: ["标定中断", "Calibration interrupted"],
   };
-  if (calibration.return_settled === false && calibration.outcome === "BreakawayDetected") {
-    return zh ? "起动已测得，回位未完成（已停止）" : "Breakaway measured; return incomplete (stopped)";
-  }
+  const direction = calibration.direction ?? Math.sign(status.config?.torque_nm ?? 1);
+  const prefix = direction > 0 ? ["正向 (+)", "Positive (+)"] : ["反向 (−)", "Negative (−)"];
+  const passes = [...(calibration.completed_directions ?? []), calibration];
+  const bidirectional = status.config?.friction_direction === "Both" || passes.length > 1;
+  const progress = bidirectional ? `${passes.filter(pass => pass.outcome === "BreakawayDetected").length}/2 ${zh ? "方向已起动" : "directions detected"}` : null;
+  const untested = bidirectional && passes.length === 1 && !status.active && calibration.phase === "Complete"
+    ? ["反向未测试", "Negative direction not tested"] : null;
   const returned = calibration.return_settled === false ? ["回位未完成（已停止）", "Return incomplete (stopped)"]
     : calibration.return_settled === true ? ["已稳定回到起始位置", "Settled at the starting position"] : null;
-  return [phases[calibration.phase]?.[zh ? 0 : 1], calibration.outcome && outcomes[calibration.outcome]?.[zh ? 0 : 1], returned?.[zh ? 0 : 1]].filter(Boolean).join(" · ");
+  return [prefix[zh ? 0 : 1], phases[calibration.phase]?.[zh ? 0 : 1], calibration.outcome && outcomes[calibration.outcome]?.[zh ? 0 : 1], returned?.[zh ? 0 : 1], progress, untested?.[zh ? 0 : 1]].filter(Boolean).join(" · ");
 }
 export function experimentReport(data: El05ExperimentData, analysis: ExperimentAnalysis, name: string, zh: boolean, reduced = false): string {
   const tr = (cn: string, en: string) => zh ? cn : en;
   const geometry = data.status.config?.pendulum;
   const lines = [`# ${name}`, "", `${tr("导出时间", "Exported")}: ${new Date().toISOString()}`, "",
     `${tr("电机", "Motor")}: ${data.motor_id ?? "—"} · UID ${data.uid ?? "—"}`,
+    `${tr("力矩单位", "Torque unit")}: ${EL05_TORQUE_UNIT} (N·m) · ${tr("理论保持力矩、驱动反馈与指令使用相同单位", "Theoretical holding torque, drive feedback and commands use the same unit")}`,
     `${tr("工况", "Experiment")}: ${data.status.config?.kind ?? "—"} · ${data.status.elapsed_s.toFixed(3)} s · ${data.samples.length} ${tr("保留样本", "retained samples")}`,
     `${tr("状态", "Status")}: ${data.status.static_friction ? staticFrictionStatusText(data.status, zh) : data.status.reason ?? (data.status.active ? tr("进行中", "Running") : tr("完成", "Complete"))}`, "",
     ...(reduced ? [analysis.quality.notes.includes(LEGACY_VELOCITY_ANALYSIS_NOTE)
@@ -202,7 +221,7 @@ export function experimentReport(data: El05ExperimentData, analysis: ExperimentA
     lines.push(`## ${title}`, "", `| ${headers.join(" | ")} |`, `| ${headers.map(() => "---").join(" | ")} |`, ...rows.map(row => `| ${row.join(" | ")} |`), "");
   };
   if (analysis.kind === "StaticTorque") detailTable(tr("逐平台静态结果", "Static plateau results"),
-    ["t (s)", tr("目标角 (rad)", "Target (rad)"), tr("实际角 (rad)", "Angle (rad)"), tr("重力矩 (Nm)", "Gravity (Nm)"), "Iq (A)", tr("估计转矩 (Nm)", "Drive torque (Nm)"), tr("接近方向", "Approach")],
+    ["t (s)", tr("目标角 (rad)", "Target (rad)"), tr("实际角 (rad)", "Angle (rad)"), `${tr("理论重力矩", "Theoretical gravity torque")} (${EL05_TORQUE_UNIT})`, "Iq (A)", `${tr("驱动反馈力矩", "Drive feedback torque")} (${EL05_TORQUE_UNIT})`, tr("接近方向", "Approach")],
     (analysis.static_torque?.platforms ?? []).map(point => [fmt(point.start_s, 2), fmt(point.target_angle_rad), fmt(point.angle_rad), fmt(point.gravity_torque_nm), fmt(point.current_a), fmt(point.feedback_torque_nm), point.approach ?? "—"]));
   const position = analysis.kind !== "VelocitySteps";
   const steps = position ? analysis.tracking?.position_steps : analysis.tracking?.velocity_steps;
@@ -229,23 +248,29 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
     if (!data?.samples.length) return {};
     if (chart === "friction") {
       const samples = thin(data.samples, 3000);
-      const calibration = data.status.static_friction;
-      const origin = calibration?.reference_position_rad ?? data.status.config?.origin_position_rad ?? samples[0].unwrapped_position_rad;
+      const passes = staticFrictionPasses(data);
+      const origin = data.status.config?.origin_position_rad ?? samples[0].unwrapped_position_rad;
       const limitDeg = (data.status.config?.max_excursion_rad ?? 3 * Math.PI / 180) * 180 / Math.PI;
       const thresholdDeg = (data.status.config?.motion_threshold_rad ?? 0.15 * Math.PI / 180) * 180 / Math.PI;
-      const events = [
-        { name: tr("开始斜坡", "Ramp starts"), time: calibration?.ramp_started_s },
-        { name: tr("起动", "Motion onset"), time: calibration?.onset_sample?.t_s },
-        { name: tr("回位", "Return starts"), time: calibration?.return_started_s },
-      ].filter(event => event.time != null && Number.isFinite(event.time));
+      const events = passes.flatMap(pass => {
+        const prefix = (pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1)) > 0 ? "+ " : "− ";
+        return [
+          { name: prefix + tr("开始斜坡", "Ramp starts"), time: pass.ramp_started_s },
+          { name: prefix + tr("起动", "Motion onset"), time: pass.onset_sample?.t_s },
+          { name: prefix + tr("回位", "Return starts"), time: pass.return_started_s },
+        ];
+      }).filter(event => event.time != null && Number.isFinite(event.time));
       return { animation: false, color: ["#60a5fa", "#f59e0b", "#34d399"],
         tooltip: { trigger: "axis", valueFormatter: (value: number | null) => value != null ? value.toFixed(5) : "—" },
         legend: { textStyle: { color: "#94a3b8" }, top: 0 }, grid: { left: 65, right: 65, top: 55, bottom: 70 },
         xAxis: { type: "value", name: "s", min: 0, axisLabel: { color: "#94a3b8" } },
-        yAxis: [{ type: "value", name: tr("偏转角 (°)", "Excursion (°)"), scale: true, axisLabel: { color: "#94a3b8" } }, { type: "value", name: "Nm", scale: true, axisLabel: { color: "#94a3b8" } }],
+        yAxis: [{ type: "value", name: tr("偏转角 (°)", "Excursion (°)"), scale: true, axisLabel: { color: "#94a3b8" } }, { type: "value", name: EL05_TORQUE_UNIT, scale: true, axisLabel: { color: "#94a3b8" } }],
         dataZoom: [{ type: "inside", filterMode: "none" }, { type: "slider", height: 20, bottom: 10 }],
         series: [
-          { type: "line", name: tr("相对静止起点的偏转角", "Excursion from rest"), showSymbol: false, data: samples.map(sample => [sample.t_s, (sample.unwrapped_position_rad - origin) * 180 / Math.PI]),
+          { type: "line", name: tr("相对各方向静止起点的偏转角", "Excursion from each direction's rest"), showSymbol: false, data: samples.map(sample => {
+            const pass = [...passes].reverse().find(pass => sample.t_s >= (pass.started_s ?? 0));
+            return [sample.t_s, (sample.unwrapped_position_rad - (pass?.reference_position_rad ?? origin)) * 180 / Math.PI];
+          }),
             markLine: { symbol: "none", silent: true, label: { color: "#94a3b8", fontSize: 10 }, data: [
               ...[limitDeg, -limitDeg].map(value => ({ name: tr("角度上限", "Excursion limit"), yAxis: value, lineStyle: { color: "#f59e0b", type: "dashed" }, label: { formatter: `${Math.abs(value).toFixed(2)}° ${tr("上限", "limit")}` } })),
               ...[thresholdDeg, -thresholdDeg].map(value => ({ name: tr("起动阈值", "Motion threshold"), yAxis: value, lineStyle: { color: "#64748b", type: "dotted" }, label: { formatter: `${Math.abs(value).toFixed(2)}° ${tr("起动阈值", "threshold")}` } })),
@@ -265,7 +290,7 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
       return { animation: false, color: ["#60a5fa", "#f59e0b", "#34d399"], tooltip: { trigger: "item" },
         legend: { textStyle: { color: "#94a3b8" } }, grid: { left: 65, right: 35, top: 45, bottom: 45 },
         xAxis: { type: "value", name: "Iq (A)", scale: true, axisLabel: { color: "#94a3b8" } },
-        yAxis: { type: "value", name: tr("重力矩 (Nm)", "Gravity (Nm)"), scale: true, axisLabel: { color: "#94a3b8" } },
+        yAxis: { type: "value", name: `${tr("理论重力矩", "Theoretical gravity torque")} (${EL05_TORQUE_UNIT})`, scale: true, axisLabel: { color: "#94a3b8" } },
         series: [
           { type: "scatter", name: tr("正向接近", "Positive approach"), symbolSize: 10, data: valid.filter(point => point.approach !== "negative").map(point => [point.current_a, point.gravity_torque_nm]) },
           { type: "scatter", name: tr("反向接近", "Negative approach"), symbolSize: 10, data: valid.filter(point => point.approach === "negative").map(point => [point.current_a, point.gravity_torque_nm]) },
@@ -294,13 +319,18 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
       add(tr("速度", "Velocity"), samples.map(sample => sample.velocity_rad_s), 1);
       add(tr("目标速度", "Target velocity"), samples.map(sample => sample.target?.kind === "Mit" ? sample.target.velocity_rad_s : null), 1);
     } else if (chart === "torque") {
-      units = ["Nm", "A"];
-      add(tr("驱动估计转矩", "Drive torque estimate"), samples.map(sample => sample.torque_nm));
+      units = [EL05_TORQUE_UNIT, "A"];
+      add(tr("驱动反馈力矩", "Drive feedback torque"), samples.map(sample => sample.torque_nm));
       add(tr("前馈转矩指令", "Feedforward torque"), samples.map(sample => sample.target?.kind === "Mit" ? sample.target.torque_nm : null));
       add(tr("重力保持转矩", "Gravity holding torque"), derived.map(sample => sample.gravity_torque_nm));
       add(tr("摩擦转矩估计", "Estimated friction"), derived.map(sample => sample.friction_torque_nm));
       add("Iq", derived.map(sample => sample.fresh_current_a), 1);
       if (data.status.config?.kind === "StaticTorque") {
+        const torqueLimit = experimentTorqueLimitNm(data);
+        Object.assign(series[0], { markLine: { silent: true, symbol: "none", lineStyle: { color: "#f87171", type: "dashed" },
+          label: { color: "#f87171", formatter: `{c} ${EL05_TORQUE_UNIT} ${tr("驱动上限", "drive limit")}` },
+          data: (torqueLimit === 0 ? [0] : [-torqueLimit, torqueLimit]).map(value => ({ yAxis: value })),
+        } });
         add(tr("目标角理论保持力矩", "Theoretical holding torque at target"), derived.map(sample => sample.target_holding_torque_nm));
         Object.assign(series[series.length - 1], { step: "end", lineStyle: { width: 2, type: "dashed" } });
       }
@@ -327,7 +357,8 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
     {reduced && <Alert type="info" showIcon message={analysis.quality.notes.includes(LEGACY_VELOCITY_ANALYSIS_NOTE)
       ? tr("历史曲线已抽样；反馈速度方向已修正，指标按当前保留样本重新计算。", "History traces are reduced. Feedback velocity direction is corrected and metrics are recalculated from retained samples.")
       : tr("本地历史的曲线已抽样；指标保留自原始完整数据分析。需要完整原始帧时，请在下一组开始前导出 JSON。", "Local history traces are reduced; metrics retain the original full-data analysis. Export JSON before the next run to keep every original frame.")} />}
-    {data.status.static_friction && <Alert showIcon type={data.status.static_friction.return_settled === false ? "warning" : data.status.active ? "info" : data.status.static_friction.outcome === "BreakawayDetected" ? "success" : "warning"} message={staticFrictionStatusText(data.status, zh)} description={tr("仅需检测微小起动；图中角度相对于本次确认静止后的起点。起动静摩擦力矩为驱动估计值，回位数据不参与起动力矩计算。", "Only a small motion is needed. Chart angles use this run's confirmed rest position. Breakaway static friction torque uses the drive estimate; return samples are excluded from the breakaway calculation.")} />}
+    {data.status.static_friction && <Alert showIcon type={data.status.active ? "info" : staticFrictionPasses(data).every(pass => pass.outcome === "BreakawayDetected" && pass.return_settled !== false)
+      && (data.status.config?.friction_direction !== "Both" || analysis.static_friction?.both_directions_valid) ? "success" : "warning"} message={staticFrictionStatusText(data.status, zh)} description={tr("正反方向分别保存最后静止、首次起动和确认帧，图中标记各自的斜坡、起动和回位。起动力矩保留正负号，统一为 Nm；回位数据不参与起动力矩计算。", "Each direction preserves its last-rest, first-motion and confirmation frames; the chart marks each ramp, onset and return. Breakaway torque retains its sign in Nm; return samples are excluded from the calculation.")} />}
     <div className="el05-experiment-quality">
       <Space wrap><Tag>{analysis.sample_count} {tr("分析样本", "analyzed samples")}</Tag><Tag>{analysis.duration_s.toFixed(2)} s</Tag><Tag>{analysis.quality.sample_rate_hz?.toFixed(1) ?? "—"} Hz</Tag><Tag>{tr("最大间隔", "Max gap")} {analysis.quality.max_gap_s?.toFixed(3) ?? "—"} s</Tag><Tag>{tr("丢弃帧", "Dropped")} {analysis.quality.dropped_frames}</Tag></Space>
     </div>
@@ -337,7 +368,7 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
       { value: "error", label: tr("跟踪误差", "Tracking errors") }, { value: "thermal", label: tr("温升", "Temperature") }, ...(data.status.config?.kind === "SineSweep" ? [{ value: "frequency", label: tr("频率响应", "Frequency response") }] : []), ...(data.status.config?.kind === "StaticTorque" ? [{ value: "static", label: tr("转矩 / Iq 标定", "Torque / Iq fit") }] : [])]} />
     {chart === "frequency" && !analysis.frequency_response?.points.length && <Typography.Paragraph type="secondary" className="el05-experiment-notes">{analysis.frequency_response?.reason ?? tr("可辨识的完整周期不足，暂无法提取频率响应。", "Insufficient identifiable complete cycles for a frequency response.")}</Typography.Paragraph>}
     {chart === "torque" && data.status.config?.kind === "StaticTorque" && <Typography.Paragraph type={data.status.config.pendulum?.zero_measured ? "secondary" : "warning"} className="el05-experiment-notes">{data.status.config.pendulum?.zero_measured
-      ? tr("目标角理论保持力矩按目标角和本组负载几何计算；重力保持转矩按实际反馈角计算，均不含摩擦和惯性。", "The theoretical holding torque uses target angles and this run's load geometry; gravity holding torque uses measured angles. Both exclude friction and inertia.")
+      ? tr(`理论保持力矩和驱动反馈统一使用 ${EL05_TORQUE_UNIT}（N·m）。目标角理论保持力矩按目标角和本组负载几何计算；重力保持转矩按实际反馈角计算，均不含摩擦和惯性。与驱动反馈的差值可能包含静摩擦和驱动估计偏差。`, `Theoretical holding torque and drive feedback both use ${EL05_TORQUE_UNIT} (N·m). Target holding torque uses target angles and this run's load geometry; gravity holding torque uses measured angles. Both exclude friction and inertia. Differences from drive feedback may include static friction and drive estimation error.`)
       : tr("本组未测定下垂参考，无法绘制有效的目标角理论保持力矩；请在开始测试前测定下垂参考。", "This run has no measured downward reference, so target holding torque is unavailable. Measure the downward reference before starting a run.")}</Typography.Paragraph>}
     <ReactECharts option={chartOption} notMerge style={{ height: 350 }} />
     <div className="el05-experiment-analysis">
@@ -369,9 +400,9 @@ function El05ExperimentDetails({ analysis, zh }: { analysis: ExperimentAnalysis;
       { title: "t (s)", dataIndex: "start_s", render: value => fmt(value, 2) },
       { title: tr("目标角 (rad)", "Target (rad)"), dataIndex: "target_angle_rad", render: value => fmt(value) },
       { title: tr("实际角 (rad)", "Angle (rad)"), dataIndex: "angle_rad", render: value => fmt(value) },
-      { title: tr("重力矩 (Nm)", "Gravity (Nm)"), dataIndex: "gravity_torque_nm", render: value => fmt(value) },
+      { title: `${tr("理论重力矩", "Theoretical gravity torque")} (${EL05_TORQUE_UNIT})`, dataIndex: "gravity_torque_nm", render: value => fmt(value) },
       { title: "Iq (A)", dataIndex: "current_a", render: value => fmt(value) },
-      { title: tr("估计转矩 (Nm)", "Drive torque (Nm)"), dataIndex: "feedback_torque_nm", render: value => fmt(value) },
+      { title: `${tr("驱动反馈力矩", "Drive feedback torque")} (${EL05_TORQUE_UNIT})`, dataIndex: "feedback_torque_nm", render: value => fmt(value) },
       { title: tr("接近方向", "Approach"), dataIndex: "approach", render: value => value === "positive" ? "+" : value === "negative" ? "−" : "—" },
       { title: tr("有效 Iq 样本", "Fresh Iq samples"), dataIndex: "fresh_current_samples" },
     ]} /> });

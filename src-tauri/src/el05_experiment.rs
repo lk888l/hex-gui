@@ -45,6 +45,24 @@ pub enum ExperimentKind {
     SlowTriangle,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum StaticFrictionDirection {
+    #[default]
+    Both,
+    Positive,
+    Negative,
+}
+
+impl StaticFrictionDirection {
+    fn sequence(self) -> &'static [i8] {
+        match self {
+            Self::Both => &[1, -1],
+            Self::Positive => &[1],
+            Self::Negative => &[-1],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendulumConfig {
     pub mass_kg: f64,
@@ -101,7 +119,10 @@ pub struct ExperimentConfig {
     /// Captured by the session when the run starts; always an unwrapped angle.
     #[serde(default)]
     pub origin_position_rad: f64,
-    /// Single-direction static friction calibration ramp, in Nm/s.
+    /// Static friction uses the torque magnitude for each selected direction.
+    #[serde(default)]
+    pub friction_direction: StaticFrictionDirection,
+    /// Static friction calibration ramp, in Nm/s; duration_s is per direction.
     #[serde(default = "default_torque_ramp_rate")]
     pub torque_ramp_rate_nm_s: f64,
     #[serde(default = "default_max_excursion")]
@@ -164,6 +185,7 @@ impl Default for ExperimentConfig {
             gravity_compensation: false,
             disturbance_torque_nm: default_disturbance_torque(),
             origin_position_rad: 0.0,
+            friction_direction: StaticFrictionDirection::Both,
             torque_ramp_rate_nm_s: default_torque_ramp_rate(),
             max_excursion_rad: default_max_excursion(),
             motion_threshold_rad: default_motion_threshold(),
@@ -522,7 +544,10 @@ pub enum StaticFrictionOutcome {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct StaticFrictionStatus {
+pub struct StaticFrictionPass {
+    pub direction: i8,
+    /// Each direction has its own settling/ramp time budget.
+    pub started_s: f64,
     pub phase: StaticFrictionPhase,
     pub outcome: Option<StaticFrictionOutcome>,
     pub reference_position_rad: Option<f64>,
@@ -537,9 +562,11 @@ pub struct StaticFrictionStatus {
     pub return_settled: Option<bool>,
 }
 
-impl Default for StaticFrictionStatus {
+impl Default for StaticFrictionPass {
     fn default() -> Self {
         Self {
+            direction: 1,
+            started_s: 0.0,
             phase: StaticFrictionPhase::Settling,
             outcome: None,
             reference_position_rad: None,
@@ -550,6 +577,26 @@ impl Default for StaticFrictionStatus {
             peak_excursion_rad: 0.0,
             return_started_s: None,
             return_settled: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StaticFrictionStatus {
+    // Keep the original single-direction JSON fields for existing archives.
+    #[serde(flatten)]
+    pub current: StaticFrictionPass,
+    pub completed_directions: Vec<StaticFrictionPass>,
+}
+
+impl StaticFrictionStatus {
+    fn new(config: &ExperimentConfig) -> Self {
+        Self {
+            current: StaticFrictionPass {
+                direction: config.friction_direction.sequence()[0],
+                ..Default::default()
+            },
+            completed_directions: Vec::new(),
         }
     }
 }
@@ -566,14 +613,14 @@ struct StaticFrictionRuntime {
 const FRICTION_REST_VELOCITY: f64 = 0.015;
 const FRICTION_RETURN_TIMEOUT_S: f64 = 3.0;
 
-fn friction_ramp_torque(config: &ExperimentConfig, state: &StaticFrictionStatus, t_s: f64) -> f64 {
-    config.torque_nm.signum()
+fn friction_ramp_torque(config: &ExperimentConfig, state: &StaticFrictionPass, t_s: f64) -> f64 {
+    f64::from(state.direction)
         * (config.torque_ramp_rate_nm_s * (t_s - state.ramp_started_s.unwrap_or(t_s)).max(0.0))
             .min(config.torque_nm.abs())
 }
 
 fn friction_begin_return(
-    state: &mut StaticFrictionStatus,
+    state: &mut StaticFrictionPass,
     runtime: &mut StaticFrictionRuntime,
     outcome: StaticFrictionOutcome,
     t_s: f64,
@@ -588,16 +635,16 @@ fn friction_begin_return(
 
 fn friction_advance_time(
     config: &ExperimentConfig,
-    state: &mut StaticFrictionStatus,
+    state: &mut StaticFrictionPass,
     runtime: &mut StaticFrictionRuntime,
     t_s: f64,
 ) {
     match state.phase {
-        StaticFrictionPhase::Settling if t_s >= config.duration_s => {
+        StaticFrictionPhase::Settling if t_s - state.started_s >= config.duration_s => {
             state.outcome = Some(StaticFrictionOutcome::NotSettled);
             state.phase = StaticFrictionPhase::Complete;
         }
-        StaticFrictionPhase::Ramping if t_s >= config.duration_s => {
+        StaticFrictionPhase::Ramping if t_s - state.started_s >= config.duration_s => {
             friction_begin_return(state, runtime, StaticFrictionOutcome::Timeout, t_s);
         }
         StaticFrictionPhase::Returning
@@ -610,9 +657,50 @@ fn friction_advance_time(
     }
 }
 
-fn friction_observe(
+fn friction_next_direction(
     config: &ExperimentConfig,
     state: &mut StaticFrictionStatus,
+    runtime: &mut StaticFrictionRuntime,
+    t_s: f64,
+) {
+    let next = config
+        .friction_direction
+        .sequence()
+        .get(state.completed_directions.len() + 1);
+    // A failed measurement can still be compared with the other direction,
+    // but only after a stable return. Angle guards and interruptions end the run.
+    let can_continue = matches!(
+        state.current.outcome,
+        Some(
+            StaticFrictionOutcome::BreakawayDetected
+                | StaticFrictionOutcome::TorqueLimit
+                | StaticFrictionOutcome::Timeout
+        )
+    );
+    if let Some(&direction) = next {
+        if state.current.phase == StaticFrictionPhase::Complete
+            && state.current.return_settled == Some(true)
+            && can_continue
+        {
+            let reference_position_rad = state.current.reference_position_rad;
+            let previous = std::mem::replace(
+                &mut state.current,
+                StaticFrictionPass {
+                    direction,
+                    started_s: t_s,
+                    reference_position_rad,
+                    ..Default::default()
+                },
+            );
+            state.completed_directions.push(previous);
+            *runtime = StaticFrictionRuntime::default();
+        }
+    }
+}
+
+fn friction_observe(
+    config: &ExperimentConfig,
+    state: &mut StaticFrictionPass,
     runtime: &mut StaticFrictionRuntime,
     sample: &TelemetrySample,
 ) {
@@ -659,7 +747,7 @@ fn friction_observe(
             }
         }
         StaticFrictionPhase::Ramping => {
-            let direction = config.torque_nm.signum();
+            let direction = f64::from(state.direction);
             let moving =
                 (q - reference) * direction >= config.motion_threshold_rad && v * direction > 0.0;
             if moving {
@@ -762,9 +850,14 @@ impl Experiment {
             status: ExperimentStatus {
                 run_id: next_run_id(),
                 active: true,
-                recording_interval_s: config.duration_s / (MAX_SAMPLES - 1) as f64,
+                recording_interval_s: if config.kind == ExperimentKind::StaticFriction {
+                    (config.duration_s + FRICTION_RETURN_TIMEOUT_S)
+                        * config.friction_direction.sequence().len() as f64
+                } else {
+                    config.duration_s
+                } / (MAX_SAMPLES - 1) as f64,
                 static_friction: (config.kind == ExperimentKind::StaticFriction)
-                    .then(StaticFrictionStatus::default),
+                    .then(|| StaticFrictionStatus::new(&config)),
                 config: Some(config),
                 ..Default::default()
             },
@@ -784,6 +877,7 @@ impl Experiment {
         if self.status.active {
             let reason = reason.into();
             if let Some(state) = self.status.static_friction.as_mut() {
+                let state = &mut state.current;
                 let completed_reason = format!("static friction calibration: {:?}", state.outcome);
                 if state.phase != StaticFrictionPhase::Complete || reason != completed_reason {
                     state.phase = StaticFrictionPhase::Complete;
@@ -802,7 +896,18 @@ impl Experiment {
             if let (Some(config), Some(state)) =
                 (&self.status.config, &mut self.status.static_friction)
             {
-                friction_observe(config, state, &mut self.static_friction_runtime, &sample);
+                friction_observe(
+                    config,
+                    &mut state.current,
+                    &mut self.static_friction_runtime,
+                    &sample,
+                );
+                friction_next_direction(
+                    config,
+                    state,
+                    &mut self.static_friction_runtime,
+                    sample.t_s,
+                );
             }
             if self.samples.len() == MAX_SAMPLES {
                 // Preserve the latest observation even if a high-rate source
@@ -848,6 +953,7 @@ impl Experiment {
         let Some(state) = self.status.static_friction.as_mut() else {
             return config.target_with_feedback(elapsed_s, wrapped_position, unwrapped_position);
         };
+        let state = &mut state.current;
         friction_advance_time(config, state, &mut self.static_friction_runtime, elapsed_s);
         let torque_nm = match state.phase {
             StaticFrictionPhase::Settling | StaticFrictionPhase::Complete => 0.0,
@@ -920,6 +1026,7 @@ impl Experiment {
             return Some("temperature bound reached".into());
         }
         if let Some(state) = &mut self.status.static_friction {
+            let state = &mut state.current;
             friction_advance_time(config, state, &mut self.static_friction_runtime, elapsed);
             return (state.phase == StaticFrictionPhase::Complete)
                 .then(|| format!("static friction calibration: {:?}", state.outcome));
@@ -1331,6 +1438,11 @@ mod tests {
                 kind: ExperimentKind::StaticFriction,
                 duration_s: 45.0,
                 torque_nm: direction * 0.6,
+                friction_direction: if direction > 0.0 {
+                    StaticFrictionDirection::Positive
+                } else {
+                    StaticFrictionDirection::Negative
+                },
                 kd: 0.8,
                 ..Default::default()
             },
@@ -1352,8 +1464,8 @@ mod tests {
         );
     }
 
-    fn friction_state(run: &Experiment) -> &StaticFrictionStatus {
-        run.status.static_friction.as_ref().unwrap()
+    fn friction_state(run: &Experiment) -> &StaticFrictionPass {
+        &run.status.static_friction.as_ref().unwrap().current
     }
 
     fn settle(run: &mut Experiment) {
@@ -1361,6 +1473,132 @@ mod tests {
         observe(run, 0.0, origin, 0.0);
         observe(run, 0.5, origin, 0.0);
         assert_eq!(friction_state(run).phase, StaticFrictionPhase::Ramping);
+    }
+
+    #[test]
+    fn friction_both_directions_return_settle_and_keep_independent_event_frames() {
+        let mut run = friction_run(1.0);
+        let config = run.status.config.as_mut().unwrap();
+        config.friction_direction = StaticFrictionDirection::Both;
+        config.origin_position_rad = 37.69;
+        settle(&mut run);
+        observe(&mut run, 1.0, 37.693, 0.02);
+        observe(&mut run, 1.04, 37.694, 0.02);
+        observe(&mut run, 1.2, 37.6901, 0.0);
+        assert_eq!(friction_state(&run).direction, 1);
+        observe(&mut run, 1.4, 37.6901, 0.0);
+        let status = run.status.static_friction.as_ref().unwrap();
+        assert_eq!(status.completed_directions.len(), 1);
+        assert_eq!(status.completed_directions[0].return_settled, Some(true));
+        assert_eq!(
+            status.completed_directions[0]
+                .onset_sample
+                .as_ref()
+                .unwrap()
+                .t_s,
+            1.0
+        );
+        assert_eq!(status.current.direction, -1);
+        assert_eq!(status.current.phase, StaticFrictionPhase::Settling);
+        assert!(status.current.onset_sample.is_none());
+        assert_eq!(mit(run.runtime_target_at(1.5, 12.55, 37.6901, 0.0)).2, 0.0);
+        assert!(run.end_reason(25.0).is_none());
+
+        observe(&mut run, 1.5, 37.6901, 0.0);
+        observe(&mut run, 2.0, 37.6901, 0.0);
+        assert_eq!(friction_state(&run).ramp_started_s, Some(2.0));
+        assert!((mit(run.runtime_target_at(3.0, 12.55, 37.6901, 0.0)).2 + 0.02).abs() < 1e-12);
+        observe(&mut run, 3.0, 37.6871, -0.02);
+        observe(&mut run, 3.04, 37.6861, -0.02);
+        assert!(mit(run.runtime_target_at(3.04, 12.55, 37.6861, -0.02)).2 > 0.0);
+        observe(&mut run, 3.2, 37.6901, 0.0);
+        observe(&mut run, 3.4, 37.6901, 0.0);
+        assert_eq!(friction_state(&run).phase, StaticFrictionPhase::Complete);
+        assert_eq!(friction_state(&run).return_settled, Some(true));
+        let reason = run.end_reason(25.0).unwrap();
+        run.finish(reason);
+        let exported = serde_json::to_value(&run.status).unwrap();
+        let state = &exported["static_friction"];
+        assert_eq!(state["direction"], -1);
+        assert_eq!(state["onset_sample"]["t_s"], 3.0);
+        assert_eq!(state["completed_directions"][0]["direction"], 1);
+        assert_eq!(state["completed_directions"][0]["onset_sample"]["t_s"], 1.0);
+    }
+
+    #[test]
+    fn friction_second_direction_gets_its_own_timeout_after_first_limit() {
+        let mut run = friction_run(1.0);
+        let config = run.status.config.as_mut().unwrap();
+        config.friction_direction = StaticFrictionDirection::Both;
+        config.duration_s = 2.0;
+        settle(&mut run);
+        observe(&mut run, 2.0, 0.0, 0.0);
+        observe(&mut run, 2.2, 0.0, 0.0);
+        assert_eq!(friction_state(&run).direction, -1);
+        assert_eq!(
+            run.status
+                .static_friction
+                .as_ref()
+                .unwrap()
+                .completed_directions[0]
+                .outcome,
+            Some(StaticFrictionOutcome::Timeout)
+        );
+        observe(&mut run, 2.3, 0.0, 0.0);
+        observe(&mut run, 2.8, 0.0, 0.0);
+        assert_eq!(friction_state(&run).phase, StaticFrictionPhase::Ramping);
+        observe(&mut run, 3.0, -0.003, -0.02);
+        observe(&mut run, 3.04, -0.004, -0.02);
+        assert_eq!(
+            friction_state(&run).outcome,
+            Some(StaticFrictionOutcome::BreakawayDetected)
+        );
+        run.finish("operator stop / mode or device change");
+        assert_eq!(
+            friction_state(&run).outcome,
+            Some(StaticFrictionOutcome::Interrupted)
+        );
+        assert_eq!(
+            run.status
+                .static_friction
+                .as_ref()
+                .unwrap()
+                .completed_directions[0]
+                .outcome,
+            Some(StaticFrictionOutcome::Timeout)
+        );
+    }
+
+    #[test]
+    fn friction_does_not_start_reverse_after_an_angle_guard_or_unstable_return() {
+        for angle_guard in [true, false] {
+            let mut run = friction_run(1.0);
+            run.status.config.as_mut().unwrap().friction_direction = StaticFrictionDirection::Both;
+            settle(&mut run);
+            observe(&mut run, 1.0, 0.003, 0.02);
+            observe(&mut run, 1.04, 0.004, 0.02);
+            if angle_guard {
+                observe(&mut run, 1.1, 0.06, 0.2);
+                observe(&mut run, 1.2, 0.0, 0.0);
+                observe(&mut run, 1.4, 0.0, 0.0);
+                assert_eq!(
+                    friction_state(&run).outcome,
+                    Some(StaticFrictionOutcome::AngleLimit)
+                );
+            } else {
+                assert_eq!(mit(run.runtime_target_at(4.04, 0.004, 0.004, 0.02)).2, 0.0);
+                assert_eq!(friction_state(&run).return_settled, Some(false));
+            }
+            assert_eq!(friction_state(&run).phase, StaticFrictionPhase::Complete);
+            assert_eq!(friction_state(&run).direction, 1);
+            assert!(run
+                .status
+                .static_friction
+                .as_ref()
+                .unwrap()
+                .completed_directions
+                .is_empty());
+        }
     }
 
     #[test]
@@ -1684,6 +1922,7 @@ mod tests {
     fn friction_legacy_defaults_and_kind_specific_validation_are_supported() {
         let mut value = serde_json::to_value(config(ExperimentKind::StaticFriction)).unwrap();
         for key in [
+            "friction_direction",
             "torque_ramp_rate_nm_s",
             "max_excursion_rad",
             "motion_threshold_rad",
@@ -1693,6 +1932,7 @@ mod tests {
             value.as_object_mut().unwrap().remove(key);
         }
         let mut config: ExperimentConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.friction_direction, StaticFrictionDirection::Both);
         assert_eq!(config.torque_ramp_rate_nm_s, 0.02);
         assert_eq!(config.max_excursion_rad, 3.0_f64.to_radians());
         assert_eq!(config.motion_threshold_rad, 0.15_f64.to_radians());

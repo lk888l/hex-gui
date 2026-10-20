@@ -14,8 +14,13 @@ use tokio::task::JoinHandle;
 
 #[path = "el05_experiment.rs"]
 pub mod experiment;
+#[path = "el05_gravity.rs"]
+pub mod gravity;
 use experiment::{
     Experiment, ExperimentConfig, ExperimentData, ExperimentKind, ExperimentStatus, TelemetrySample,
+};
+use gravity::{
+    GravityCompensation, GravityCompensationConfig, GravityCompensationStatus, GravityReference,
 };
 
 const FEEDBACK_TIMEOUT: Duration = Duration::from_millis(750);
@@ -24,9 +29,9 @@ const READ_TIMEOUT: Duration = Duration::from_millis(350);
 const STEP: Duration = Duration::from_millis(20);
 const MOTOR_TIMEOUT: u32 = 20_000; // 50 us ticks: one second.
 const POLL: [u16; 5] = [0x7019, 0x701A, 0x701B, 0x701C, 0x7005];
-// EL05 packed type-2/type-24 feedback reports speed opposite to increasing
-// encoder position. Normalize at reception; targets and mechVel are separate.
-const FEEDBACK_VELOCITY_SIGN: i8 = -1;
+// Use type-2/type-24 packed velocity directly, following the user's current
+// direction measurements. Targets and dictionary mechVel remain separate.
+const FEEDBACK_VELOCITY_SIGN: i8 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum El05Mode {
@@ -168,6 +173,7 @@ pub struct El05State {
     pub last_error: Option<String>,
     pub devices: Vec<El05Device>,
     pub experiment: ExperimentStatus,
+    pub gravity_compensation: GravityCompensationStatus,
 }
 impl El05State {
     fn new(host_id: u8, connected: bool) -> Self {
@@ -209,6 +215,7 @@ impl El05State {
             last_error: None,
             devices: Vec::new(),
             experiment: ExperimentStatus::default(),
+            gravity_compensation: GravityCompensationStatus::default(),
         }
     }
 }
@@ -243,6 +250,8 @@ struct Shared {
     safety_hold: bool,
     /// Changes whenever a stop is requested, including while preparing a run.
     stop_revision: u64,
+    /// Public Stop records cancellation before waiting for the CAN gate.
+    stop_request_revision: u64,
     feedback_sequence: u64,
     mode_confirmed: bool,
     receive_error: Option<String>,
@@ -255,6 +264,7 @@ struct Shared {
     dictionary_velocity_seen: Option<Instant>,
     position_window: VecDeque<(Instant, f64)>,
     experiment: Experiment,
+    gravity: GravityCompensation,
     last_sent_target: Option<El05Target>,
     last_target_sent: Option<Instant>,
     target_sequence: u64,
@@ -292,6 +302,7 @@ impl El05Session {
                 armed: false,
                 safety_hold: false,
                 stop_revision: 0,
+                stop_request_revision: 0,
                 feedback_sequence: 0,
                 mode_confirmed: false,
                 receive_error: None,
@@ -304,6 +315,7 @@ impl El05Session {
                 dictionary_velocity_seen: None,
                 position_window: VecDeque::new(),
                 experiment: Experiment::default(),
+                gravity: GravityCompensation::default(),
                 last_sent_target: None,
                 last_target_sent: None,
                 target_sequence: 0,
@@ -331,6 +343,10 @@ impl El05Session {
         let now = Instant::now();
         let mut view = state.view.clone();
         view.experiment = state.experiment.status.clone();
+        view.gravity_compensation = state.gravity.status.clone();
+        if view.gravity_compensation.active {
+            view.gravity_compensation.elapsed_s = state.gravity.elapsed_s();
+        }
         if view.experiment.active {
             view.experiment.elapsed_s = state.experiment.elapsed_s();
         }
@@ -403,6 +419,9 @@ impl El05Session {
             s.last_target_sent = None;
             s.mode_confirmed = false;
             s.receive_error = None;
+            s.gravity.invalidate_reference(
+                "motor selection changed; capture the downward reference again",
+            );
             s.client_seen = Instant::now();
         }
         self.inner.stop_locked(false).await?;
@@ -447,15 +466,24 @@ impl El05Session {
         Ok(self.snapshot())
     }
     pub async fn enable(&self) -> Result<()> {
+        let stop_request_revision = self.inner.state.lock().unwrap().stop_request_revision;
         let _guard = self.inner.gate.lock().await;
-        self.enable_locked().await
+        self.inner.check_stop_request(Some(stop_request_revision))?;
+        self.enable_with_cancellation_locked(Some(stop_request_revision))
+            .await
     }
-    async fn enable_locked(&self) -> Result<()> {
+    async fn enable_with_cancellation_locked(
+        &self,
+        stop_request_revision: Option<u64>,
+    ) -> Result<()> {
         let (id, host, mode) = self.inner.selected()?;
         {
             let s = self.inner.state.lock().unwrap();
             if s.experiment.status.active {
                 bail!("stop the EL05 experiment before enabling");
+            }
+            if s.gravity.status.active {
+                bail!("stop EL05 gravity compensation before enabling manual control");
             }
             if s.armed {
                 bail!("EL05 is already enabled");
@@ -511,7 +539,9 @@ impl El05Session {
         self.inner
             .write_verified_locked(0x7028, f64::from(MOTOR_TIMEOUT))
             .await?;
+        self.inner.check_stop_request(stop_request_revision)?;
         self.inner.target_locked(neutral, true).await?;
+        self.inner.check_stop_request(stop_request_revision)?;
         let sequence = self.inner.state.lock().unwrap().feedback_sequence;
         let enabled = async {
             self.inner
@@ -521,6 +551,10 @@ impl El05Session {
         }
         .await;
         if let Err(error) = enabled {
+            let _ = self.inner.stop_locked(false).await;
+            return Err(error);
+        }
+        if let Err(error) = self.inner.check_stop_request(stop_request_revision) {
             let _ = self.inner.stop_locked(false).await;
             return Err(error);
         }
@@ -540,6 +574,12 @@ impl El05Session {
         Ok(())
     }
     pub async fn stop(&self) -> Result<()> {
+        {
+            let mut s = self.inner.state.lock().unwrap();
+            s.stop_request_revision = s.stop_request_revision.wrapping_add(1);
+            s.stop_revision = s.stop_revision.wrapping_add(1);
+            s.target = None;
+        }
         let _guard = self.inner.gate.lock().await;
         self.inner.stop_locked(false).await
     }
@@ -554,8 +594,11 @@ impl El05Session {
     }
     pub async fn read_identity(&self) -> Result<El05Identity> {
         let _guard = self.inner.gate.lock().await;
-        if self.inner.state.lock().unwrap().experiment.status.active {
-            bail!("stop the EL05 experiment before querying identity");
+        if {
+            let s = self.inner.state.lock().unwrap();
+            s.experiment.status.active || s.gravity.status.active
+        } {
+            bail!("stop the EL05 experiment or gravity compensation before querying identity");
         }
         let (id, host, _) = self.inner.selected()?;
         self.inner
@@ -602,6 +645,12 @@ impl El05Session {
             bail!("EL05 new motor ID is the same as the current ID");
         }
         self.inner.stop_locked(false).await?;
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .gravity
+            .invalidate_reference("motor ID changed; capture the downward reference again");
         let original = self
             .inner
             .query_identity_locked(old_id, host)
@@ -725,6 +774,9 @@ impl El05Session {
             s.view.unwrapped_position_rad = None;
             s.view.position_velocity_rad_s = None;
             s.position_window.clear();
+            s.gravity.invalidate_reference(
+                "mechanical zero changed; capture the downward reference again",
+            );
             s.feedback_sequence
         };
         let result = async {
@@ -749,8 +801,11 @@ impl El05Session {
     pub async fn send_target(&self, target: El05Target, repeat: bool) -> Result<()> {
         let _guard = self.inner.gate.lock().await;
         let (_, _, mode) = self.inner.selected()?;
-        if self.inner.state.lock().unwrap().experiment.status.active {
-            bail!("stop the EL05 experiment before sending manual targets");
+        if {
+            let s = self.inner.state.lock().unwrap();
+            s.experiment.status.active || s.gravity.status.active
+        } {
+            bail!("stop the EL05 experiment or gravity compensation before sending manual targets");
         }
         if mode != target.mode() {
             bail!("EL05 target mode does not match the selected mode");
@@ -773,13 +828,120 @@ impl El05Session {
     pub async fn stop_stream(&self) -> Result<()> {
         self.stop().await
     }
+    pub async fn capture_gravity_reference(&self) -> Result<GravityReference> {
+        let _start_guard = self.start_gate.lock().await;
+        let _guard = self.inner.gate.lock().await;
+        let (id, host, _) = self.inner.selected()?;
+        {
+            let s = self.inner.state.lock().unwrap();
+            validate_gravity_capture(&s)?;
+        }
+        let identity = self
+            .inner
+            .query_identity_locked(id, host)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("EL05 UID must be verified before capturing the gravity reference")
+            })?;
+        let mut s = self.inner.state.lock().unwrap();
+        validate_gravity_capture(&s)?;
+        let position = s.view.unwrapped_position_rad.unwrap();
+        let captured_at_s = s.epoch.elapsed().as_secs_f64();
+        Ok(s.gravity.capture(id, identity.uid, position, captured_at_s))
+    }
+
+    pub async fn start_gravity_compensation(
+        &self,
+        config: GravityCompensationConfig,
+    ) -> Result<()> {
+        config.validate()?;
+        let stop_request_revision = self.inner.state.lock().unwrap().stop_request_revision;
+        let _start_guard = self.start_gate.lock().await;
+        self.inner.check_stop_request(Some(stop_request_revision))?;
+        {
+            let s = self.inner.state.lock().unwrap();
+            if s.experiment.status.active || s.gravity.status.active {
+                bail!("stop the active EL05 experiment or gravity compensation before starting another mode");
+            }
+            validate_gravity_reference(&s, &config)?;
+        }
+        self.touch_client();
+        let result = async {
+            let stop_revision = {
+                let _guard = self.inner.gate.lock().await;
+                self.inner.check_stop_request(Some(stop_request_revision))?;
+                let needs_stop = {
+                    let s = self.inner.state.lock().unwrap();
+                    s.armed || s.view.enabled || s.target.is_some() || s.safety_hold
+                };
+                if needs_stop {
+                    self.inner.stop_locked(false).await?;
+                }
+                if self.inner.selected()?.2 != El05Mode::Mit {
+                    self.set_mode_locked(El05Mode::Mit).await?;
+                }
+                self.inner.state.lock().unwrap().stop_revision
+            };
+            // Release the CAN gate between preparation and enabling so Stop
+            // and device changes cancel preparation using the same revision.
+            let _guard = self.inner.gate.lock().await;
+            self.inner.check_stop_request(Some(stop_request_revision))?;
+            {
+                let s = self.inner.state.lock().unwrap();
+                if s.stop_revision != stop_revision {
+                    bail!("EL05 gravity compensation preparation cancelled by Stop");
+                }
+                validate_gravity_reference(&s, &config)?;
+                if let Some(reason) = gravity_input_problem(&s, &config, false) {
+                    bail!("{reason}");
+                }
+            }
+            self.enable_with_cancellation_locked(Some(stop_request_revision))
+                .await?;
+            let mut s = self.inner.state.lock().unwrap();
+            if s.stop_revision != stop_revision || !self.inner.running.load(Ordering::Acquire) {
+                bail!("EL05 gravity compensation preparation cancelled by Stop");
+            }
+            validate_gravity_reference(&s, &config)?;
+            if let Some(reason) = gravity_input_problem(&s, &config, true) {
+                bail!("{reason}");
+            }
+            let position = s.view.unwrapped_position_rad.unwrap();
+            let velocity = s.view.velocity_rad_s.unwrap();
+            s.gravity.begin(config);
+            s.target = Some(s.gravity.runtime_target(position, velocity));
+            s.client_seen = Instant::now();
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _guard = self.inner.gate.lock().await;
+            if self.inner.state.lock().unwrap().view.motor_id.is_some() {
+                let _ = self.inner.stop_locked(false).await;
+            }
+        }
+        result
+    }
+
+    pub async fn stop_gravity_compensation(&self) -> Result<()> {
+        self.stop().await
+    }
+
     pub async fn start_experiment(&self, mut config: ExperimentConfig) -> Result<()> {
         config.validate()?;
+        let stop_request_revision = self.inner.state.lock().unwrap().stop_request_revision;
         // Serialize starts independently of the CAN gate so Stop can interrupt
         // slow preparation reads rather than waiting for the entire startup.
         let _start_guard = self.start_gate.lock().await;
-        if self.inner.state.lock().unwrap().experiment.status.active {
-            bail!("an EL05 experiment is already active");
+        self.inner.check_stop_request(Some(stop_request_revision))?;
+        {
+            let s = self.inner.state.lock().unwrap();
+            if s.experiment.status.active {
+                bail!("an EL05 experiment is already active");
+            }
+            if s.gravity.status.active {
+                bail!("stop EL05 gravity compensation before starting an experiment");
+            }
         }
         self.touch_client();
         let result = async {
@@ -788,6 +950,7 @@ impl El05Session {
             // while waiting, and the drive is enabled only after they finish.
             let stop_revision = {
                 let _guard = self.inner.gate.lock().await;
+                self.inner.check_stop_request(Some(stop_request_revision))?;
                 let needs_stop = {
                     let s = self.inner.state.lock().unwrap();
                     s.armed || s.view.enabled || s.target.is_some() || s.safety_hold
@@ -806,6 +969,7 @@ impl El05Session {
             let mut parameters = Vec::new();
             for index in [0x700B, 0x7026, 0x7028] {
                 let _guard = self.inner.gate.lock().await;
+                self.inner.check_stop_request(Some(stop_request_revision))?;
                 if self.inner.state.lock().unwrap().stop_revision != stop_revision {
                     bail!("EL05 experiment preparation cancelled by Stop");
                 }
@@ -816,6 +980,7 @@ impl El05Session {
             }
 
             let _guard = self.inner.gate.lock().await;
+            self.inner.check_stop_request(Some(stop_request_revision))?;
             {
                 let s = self.inner.state.lock().unwrap();
                 if s.stop_revision != stop_revision {
@@ -839,7 +1004,8 @@ impl El05Session {
                 }
             }
             if config.kind != ExperimentKind::Record {
-                self.enable_locked().await?;
+                self.enable_with_cancellation_locked(Some(stop_request_revision))
+                    .await?;
             }
 
             let (id, _, _) = self.inner.selected()?;
@@ -923,8 +1089,11 @@ impl El05Session {
     }
     pub async fn read_parameter(&self, index: u16) -> Result<El05ParameterValue> {
         let _guard = self.inner.gate.lock().await;
-        if self.inner.state.lock().unwrap().experiment.status.active {
-            bail!("stop the EL05 experiment before a synchronous parameter read");
+        if {
+            let s = self.inner.state.lock().unwrap();
+            s.experiment.status.active || s.gravity.status.active
+        } {
+            bail!("stop the EL05 experiment or gravity compensation before a synchronous parameter read");
         }
         self.inner.read_locked(index).await
     }
@@ -941,7 +1110,12 @@ impl El05Session {
         // gains/limits underneath an active host stream.
         {
             let s = self.inner.state.lock().unwrap();
-            if s.armed || s.safety_hold || s.view.enabled || s.experiment.status.active {
+            if s.armed
+                || s.safety_hold
+                || s.view.enabled
+                || s.experiment.status.active
+                || s.gravity.status.active
+            {
                 bail!("confirm EL05 is stopped before editing dictionary parameters");
             }
         }
@@ -963,8 +1137,11 @@ impl El05Session {
         }
         let mut s = self.inner.state.lock().unwrap();
         s.stop_revision = s.stop_revision.wrapping_add(1);
+        s.stop_request_revision = s.stop_request_revision.wrapping_add(1);
         s.target = None;
         s.experiment.finish("session closed");
+        s.gravity
+            .invalidate_reference("session closed; capture the downward reference again");
         s.armed = false;
         s.view.connected = false;
         s.view.attached = false;
@@ -978,6 +1155,15 @@ impl Drop for El05Session {
 }
 
 impl Inner {
+    fn check_stop_request(&self, expected: Option<u64>) -> Result<()> {
+        self.check_running()?;
+        if expected
+            .is_some_and(|revision| self.state.lock().unwrap().stop_request_revision != revision)
+        {
+            bail!("EL05 preparation cancelled by Stop");
+        }
+        Ok(())
+    }
     fn check_running(&self) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             bail!("EL05 session is disconnected");
@@ -1034,6 +1220,7 @@ impl Inner {
             s.stop_revision = s.stop_revision.wrapping_add(1);
             s.target = None;
             s.experiment.finish("operator stop / mode or device change");
+            s.gravity.finish("operator stop / mode or device change");
             s.armed = false;
             s.safety_hold = true;
             s.feedback_sequence
@@ -1167,6 +1354,102 @@ impl Inner {
     }
 }
 
+fn validate_gravity_reference(s: &Shared, config: &GravityCompensationConfig) -> Result<()> {
+    let motor_id = s
+        .view
+        .motor_id
+        .ok_or_else(|| anyhow!("select an EL05 motor first"))?;
+    if !s.gravity.reference_matches(
+        &config.reference_id,
+        motor_id,
+        s.view
+            .identity
+            .as_ref()
+            .map(|identity| identity.uid.as_str()),
+    ) {
+        bail!("EL05 downward reference is missing or belongs to an older motor/coordinate session; capture it again");
+    }
+    Ok(())
+}
+
+fn validate_gravity_capture(s: &Shared) -> Result<()> {
+    if s.armed
+        || s.view.enabled
+        || s.safety_hold
+        || s.target.is_some()
+        || s.experiment.status.active
+        || s.gravity.status.active
+    {
+        bail!("stop EL05 before capturing the pendulum downward reference");
+    }
+    if s.receive_error.is_some()
+        || !s.mode_confirmed
+        || s.feedback_times
+            .back()
+            .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
+        || s.view.fault_bits != 0
+        || s.view.fault_code != 0
+        || s.view.unwrapped_position_rad.is_none_or(|q| !q.is_finite())
+    {
+        bail!("EL05 downward reference requires fresh feedback, a confirmed mode and no faults");
+    }
+    if s.view
+        .velocity_rad_s
+        .is_none_or(|v| !v.is_finite() || v.abs() > gravity::CAPTURE_MAX_SPEED)
+        || s.view
+            .position_velocity_rad_s
+            .is_some_and(|v| !v.is_finite() || v.abs() > gravity::CAPTURE_MAX_SPEED)
+    {
+        bail!("hold the pendulum still vertically down (speed must be at most 0.1 rad/s), then capture its reference");
+    }
+    Ok(())
+}
+
+fn gravity_input_problem(
+    s: &Shared,
+    config: &GravityCompensationConfig,
+    require_enabled: bool,
+) -> Option<String> {
+    if let Some(error) = &s.receive_error {
+        return Some(error.clone());
+    }
+    let problem = if s
+        .feedback_times
+        .back()
+        .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
+    {
+        Some("EL05 gravity compensation feedback timed out; capture the downward reference again")
+    } else if s.view.fault_bits != 0 || s.view.fault_code != 0 {
+        Some("EL05 gravity compensation stopped on a drive fault")
+    } else if s.view.mode != El05Mode::Mit || !s.mode_confirmed {
+        Some("EL05 gravity compensation requires confirmed MIT mode")
+    } else if require_enabled && (!s.armed || !s.view.enabled) {
+        Some("EL05 gravity compensation stopped because the drive left enabled state")
+    } else if s.view.unwrapped_position_rad.is_none_or(|q| !q.is_finite())
+        || s.view.velocity_rad_s.is_none_or(|v| !v.is_finite())
+    {
+        Some("EL05 gravity compensation requires finite position and velocity feedback")
+    } else if s
+        .view
+        .velocity_rad_s
+        .is_some_and(|v| v.abs() >= config.max_velocity_rad_s)
+        || s.view
+            .position_velocity_rad_s
+            .is_some_and(|v| !v.is_finite() || v.abs() >= config.max_velocity_rad_s)
+    {
+        Some("EL05 gravity compensation speed limit exceeded; motor stopped")
+    } else if s
+        .view
+        .temperature_c
+        .is_none_or(|t| !t.is_finite() || t >= config.max_temperature_c)
+    {
+        Some("EL05 gravity compensation temperature limit exceeded or temperature unavailable; motor stopped")
+    } else {
+        None
+    };
+    problem.map(str::to_owned)
+}
+
 async fn service_loop(inner: Arc<Inner>) {
     let mut ticker = tokio::time::interval(STEP);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1176,6 +1459,57 @@ async fn service_loop(inner: Arc<Inner>) {
         let _guard = inner.gate.lock().await;
         if !inner.running.load(Ordering::Acquire) {
             break;
+        }
+        let gravity_end = {
+            let mut s = inner.state.lock().unwrap();
+            let reference_lost = if s.gravity.status.reference.is_some() {
+                if s.feedback_times
+                    .back()
+                    .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
+                {
+                    Some(
+                        "EL05 gravity feedback timed out; capture the downward reference again"
+                            .to_string(),
+                    )
+                } else {
+                    s.receive_error.clone()
+                }
+            } else {
+                None
+            };
+            if let Some(reason) = reference_lost {
+                let was_active = s.gravity.status.active;
+                s.gravity.invalidate_reference(reason.clone());
+                was_active.then_some(reason)
+            } else if s.gravity.status.active {
+                let config = s.gravity.status.config.as_ref().unwrap();
+                let reason = if s.client_seen.elapsed() > CLIENT_TIMEOUT {
+                    Some(
+                        "EL05 gravity compensation UI heartbeat expired; motor stopped".to_string(),
+                    )
+                } else if let Err(error) = validate_gravity_reference(&s, config) {
+                    Some(error.to_string())
+                } else {
+                    gravity_input_problem(&s, config, true)
+                };
+                if let Some(reason) = &reason {
+                    s.gravity.finish(reason.clone());
+                } else {
+                    let position = s.view.unwrapped_position_rad.unwrap();
+                    let velocity = s.view.velocity_rad_s.unwrap();
+                    s.target = Some(s.gravity.runtime_target(position, velocity));
+                }
+                reason
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = gravity_end {
+            let stopped = inner.stop_locked(false).await;
+            inner.state.lock().unwrap().view.last_error = Some(match stopped {
+                Ok(()) => reason,
+                Err(error) => format!("{reason}; {error}"),
+            });
         }
         let experiment_end = {
             let mut s = inner.state.lock().unwrap();
@@ -1314,7 +1648,15 @@ async fn receive_loop(inner: Arc<Inner>, mut rx: Box<dyn CanRx>) {
                 if s.experiment.status.active {
                     s.experiment.status.dropped_frames =
                         s.experiment.status.dropped_frames.saturating_add(dropped);
-                    s.receive_error = Some(message);
+                    s.receive_error = Some(message.clone());
+                }
+                if s.gravity.status.reference.is_some() {
+                    if s.gravity.status.active {
+                        s.receive_error = Some(message.clone());
+                    }
+                    s.gravity.invalidate_reference(format!(
+                        "{message}; capture the downward reference again"
+                    ));
                 }
             }
             Err(error) => {
@@ -1360,6 +1702,19 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
             uid: hex::encode(data),
         };
         if s.view.motor_id == Some(source) {
+            if s.view
+                .identity
+                .as_ref()
+                .is_some_and(|previous| previous.uid != identity.uid)
+                && s.gravity.status.reference.is_some()
+            {
+                s.gravity.invalidate_reference(
+                    "EL05 motor UID changed; capture the downward reference again",
+                );
+                if s.armed {
+                    s.receive_error = Some("EL05 motor UID changed; motor stopped".into());
+                }
+            }
             s.view.identity = Some(identity.clone());
         }
         // ID changes and collision probes can target an unselected address.
@@ -1407,6 +1762,19 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
                     }
                 }
                 return;
+            }
+            if s.gravity.status.reference.is_some()
+                && s.feedback_times
+                    .back()
+                    .is_some_and(|last| now.duration_since(*last) > gravity::FEEDBACK_TIMEOUT)
+            {
+                let active = s.gravity.status.active;
+                s.gravity.invalidate_reference(
+                    "EL05 gravity feedback gap; capture the downward reference again",
+                );
+                if active {
+                    s.receive_error = Some("EL05 gravity feedback gap; motor stopped".into());
+                }
             }
             s.view.fault_bits = ((id >> 16) & 0x3F) as u8;
             s.view.status_code = ((id >> 22) & 3) as u8;
@@ -1885,8 +2253,8 @@ mod tests {
                     .unwrap_or([0; 4]),
             );
             bytes[..2].copy_from_slice(&pack(f64::from(position), -12.57, 12.57).to_be_bytes());
-            // Physical speed follows mechVel; packed feedback has opposite polarity.
-            bytes[2..4].copy_from_slice(&pack(-f64::from(velocity), -50.0, 50.0).to_be_bytes());
+            // Model the selected shared feedback direction without a sign flip.
+            bytes[2..4].copy_from_slice(&pack(f64::from(velocity), -50.0, 50.0).to_be_bytes());
             bytes[4..6].copy_from_slice(&pack(0.0, -6.0, 6.0).to_be_bytes());
             bytes[6..].copy_from_slice(&250u16.to_be_bytes());
             let _ = self.tx.send(
@@ -2070,6 +2438,284 @@ mod tests {
         }
     }
 
+    async fn gravity_config(app: &El05Session) -> GravityCompensationConfig {
+        let reference = app.capture_gravity_reference().await.unwrap();
+        GravityCompensationConfig {
+            reference_id: reference.id,
+            mass_kg: 0.5,
+            length_m: 0.18,
+            arm_mass_kg: 0.0,
+            compensation_scale: 1.0,
+            damping_nm_s_rad: 0.1,
+            torque_limit_nm: 1.0,
+            max_velocity_rad_s: 3.0,
+            max_temperature_c: 70.0,
+            ramp_s: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn gravity_reference_requires_stopped_stationary_feedback() {
+        let (bus, app) = attached().await;
+        let first = gravity_config(&app).await;
+        app.inner.state.lock().unwrap().view.velocity_rad_s = Some(0.5);
+        assert!(app
+            .capture_gravity_reference()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("still"));
+        bus.feedback();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = gravity_config(&app).await;
+        assert_ne!(first.reference_id, second.reference_id);
+        assert!(app.start_gravity_compensation(first).await.is_err());
+        app.enable().await.unwrap();
+        assert!(app
+            .capture_gravity_reference()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stop"));
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_mode_excludes_experiments_manual_targets_and_synchronous_reads() {
+        let (_, app) = attached().await;
+        let config = gravity_config(&app).await;
+        app.start_gravity_compensation(config.clone())
+            .await
+            .unwrap();
+        let state = app.snapshot();
+        assert!(state.enabled && state.streaming && state.gravity_compensation.active);
+        assert!(!state.experiment.active);
+        assert!(app
+            .start_experiment(experiment_config(ExperimentKind::Record))
+            .await
+            .is_err());
+        assert!(app
+            .start_gravity_compensation(config.clone())
+            .await
+            .is_err());
+        assert!(app.enable().await.is_err());
+        assert!(app.read_parameter(0x7019).await.is_err());
+        assert!(app.write_parameter(0x700B, 0.1).await.is_err());
+        assert!(app
+            .send_target(
+                El05Target::Mit {
+                    position_rad: 0.0,
+                    velocity_rad_s: 0.0,
+                    torque_nm: 1.0,
+                    kp: 0.0,
+                    kd: 0.0,
+                },
+                true
+            )
+            .await
+            .is_err());
+        app.stop_gravity_compensation().await.unwrap();
+        let state = app.snapshot();
+        assert!(!state.enabled && !state.streaming && !state.gravity_compensation.active);
+        assert_eq!(state.gravity_compensation.command_torque_nm, 0.0);
+        // An ordinary stop preserves the stationary encoder coordinate session.
+        app.start_gravity_compensation(config).await.unwrap();
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_reference_is_invalid_after_zero_selection_and_feedback_gap() {
+        let (bus, app) = attached().await;
+        let before_zero = gravity_config(&app).await;
+        app.set_zero().await.unwrap();
+        assert!(app.snapshot().gravity_compensation.reference.is_none());
+        assert!(app.start_gravity_compensation(before_zero).await.is_err());
+        let before_selection = gravity_config(&app).await;
+        app.attach(1).await.unwrap();
+        assert!(app.snapshot().gravity_compensation.reference.is_none());
+        assert!(app
+            .start_gravity_compensation(before_selection)
+            .await
+            .is_err());
+        let before_gap = gravity_config(&app).await;
+        app.start_gravity_compensation(before_gap.clone())
+            .await
+            .unwrap();
+        {
+            let _guard = app.inner.gate.lock().await;
+            let mut s = app.inner.state.lock().unwrap();
+            s.feedback_times.clear();
+            s.feedback_times
+                .push_back(Instant::now() - Duration::from_secs(1));
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let state = app.snapshot();
+        assert!(!state.enabled && !state.streaming && !state.gravity_compensation.active);
+        assert!(state.gravity_compensation.reference.is_none());
+        bus.feedback();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(app.start_gravity_compensation(before_gap).await.is_err());
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_safety_limits_stop_the_drive() {
+        for condition in ["speed", "temperature", "fault", "heartbeat", "disabled"] {
+            let (bus, app) = attached().await;
+            let config = gravity_config(&app).await;
+            app.start_gravity_compensation(config).await.unwrap();
+            bus.suppress_motion_feedback.store(true, Ordering::Release);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            {
+                let _guard = app.inner.gate.lock().await;
+                let mut s = app.inner.state.lock().unwrap();
+                match condition {
+                    "speed" => s.view.velocity_rad_s = Some(4.0),
+                    "temperature" => s.view.temperature_c = Some(85.0),
+                    "fault" => s.view.fault_code = 1,
+                    "heartbeat" => s.client_seen = Instant::now() - Duration::from_secs(4),
+                    "disabled" => s.view.enabled = false,
+                    _ => unreachable!(),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let state = app.snapshot();
+            assert!(
+                !state.enabled && !state.streaming && !state.gravity_compensation.active,
+                "{condition}"
+            );
+            assert_eq!(state.gravity_compensation.command_torque_nm, 0.0);
+            assert!(state
+                .gravity_compensation
+                .reason
+                .as_ref()
+                .is_some_and(|reason| !reason.is_empty()));
+            app.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn gravity_uid_change_invalidates_reference_and_stops_motion() {
+        let (_, app) = attached().await;
+        let config = gravity_config(&app).await;
+        app.start_gravity_compensation(config).await.unwrap();
+        observe_frame(&app.inner, frame(0, 1, 254, [9; 8]).unwrap());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let state = app.snapshot();
+        assert!(state.gravity_compensation.reference.is_none());
+        assert!(!state.enabled && !state.streaming && !state.gravity_compensation.active);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_and_experiment_requests_queued_before_stop_cannot_restart() {
+        let (bus, app) = attached().await;
+        let config = gravity_config(&app).await;
+        let start_guard = app.start_gate.lock().await;
+        let gravity_app = app.clone();
+        let gravity_start =
+            tokio::spawn(async move { gravity_app.start_gravity_compensation(config).await });
+        let experiment_app = app.clone();
+        let experiment_start = tokio::spawn(async move {
+            experiment_app
+                .start_experiment(experiment_config(ExperimentKind::TorqueRamp))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        app.stop().await.unwrap();
+        drop(start_guard);
+        assert!(gravity_start
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled by Stop"));
+        assert!(experiment_start
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled by Stop"));
+        assert!(!bus
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.id().raw() >> 24 == 3));
+        assert!(!app.snapshot().gravity_compensation.active);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_stop_during_watchdog_readback_cancels_before_enable_frame() {
+        let (bus, app) = attached().await;
+        let config = gravity_config(&app).await;
+        bus.skip_read_replies.lock().unwrap().insert(0x7028, 1);
+        let start_app = app.clone();
+        let start = tokio::spawn(async move { start_app.start_gravity_compensation(config).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.sent.lock().unwrap().iter().any(|frame| {
+                    frame.id().raw() >> 24 == 17 && frame.data().starts_with(&[0x28, 0x70])
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let stop_app = app.clone();
+        let stop = tokio::spawn(async move { stop_app.stop().await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut payload = [0; 8];
+        payload[..2].copy_from_slice(&0x7028u16.to_le_bytes());
+        payload[4..].copy_from_slice(&MOTOR_TIMEOUT.to_le_bytes());
+        bus.tx.send(frame(17, 1, 253, payload).unwrap()).unwrap();
+        assert!(start
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled by Stop"));
+        stop.await.unwrap().unwrap();
+        assert!(!bus
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.id().raw() >> 24 == 3));
+        assert!(!app.snapshot().enabled && !app.snapshot().streaming);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gravity_receive_lag_invalidates_idle_reference_and_stops_active_mode() {
+        for active in [false, true] {
+            let (bus, app) = attached().await;
+            let config = gravity_config(&app).await;
+            if active {
+                app.start_gravity_compensation(config).await.unwrap();
+            }
+            // Fill the mock receive queue synchronously so the receiver sees
+            // the transport's actual Lagged error on its next poll.
+            for _ in 0..300 {
+                bus.tx.send(frame(0, 2, 254, [2; 8]).unwrap()).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let state = app.snapshot();
+            assert!(state.gravity_compensation.reference.is_none());
+            assert!(!state.gravity_compensation.active && !state.enabled && !state.streaming);
+            assert!(state
+                .gravity_compensation
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("dropped"));
+            app.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn dictionary_velocity_never_overwrites_fast_feedback() {
         let (_bus, app) = attached().await;
@@ -2150,7 +2796,7 @@ mod tests {
                 let mut payload = [0; 8];
                 payload[..2]
                     .copy_from_slice(&pack(1.0 + velocity * 0.12, -12.57, 12.57).to_be_bytes());
-                payload[2..4].copy_from_slice(&pack(-velocity, -50.0, 50.0).to_be_bytes());
+                payload[2..4].copy_from_slice(&pack(velocity, -50.0, 50.0).to_be_bytes());
                 payload[4..6].copy_from_slice(&pack(0.0, -6.0, 6.0).to_be_bytes());
                 payload[6..].copy_from_slice(&250u16.to_be_bytes());
                 observe_frame(&app.inner, frame(ty, 1, 253, payload).unwrap());
@@ -2160,12 +2806,78 @@ mod tests {
                 assert!((view.position_velocity_rad_s.unwrap() - velocity).abs() < 0.02);
                 assert_eq!(view.dictionary_velocity_rad_s, Some(velocity));
                 let data = app.experiment_data();
-                assert_eq!(data.feedback_velocity_sign, -1);
+                assert_eq!(data.feedback_velocity_sign, 1);
                 let sample = data.samples.last().unwrap();
                 assert_eq!(sample.velocity_rad_s, view.velocity_rad_s.unwrap());
                 assert_eq!(sample.dictionary_velocity_rad_s, Some(velocity));
                 assert_eq!(sample.payload, payload);
                 assert_eq!(sample.can_id >> 24, u32::from(ty));
+            }
+        }
+        assert_eq!(app.experiment_data().samples.len(), 4);
+        drop(guard);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_frame_velocity_drives_experiment_samples_and_gravity_damping() {
+        let (_, app) = attached().await;
+        let mut config = gravity_config(&app).await;
+        let downward_position = app
+            .snapshot()
+            .gravity_compensation
+            .reference
+            .unwrap()
+            .position_rad;
+        // Exercise both consumers of the shared decode while retaining the
+        // session's mutual exclusion between experimental and gravity modes.
+        let mut gravity = GravityCompensation::default();
+        config.reference_id = gravity
+            .capture(1, "test-uid".into(), downward_position, 0.0)
+            .id;
+        let damping = config.damping_nm_s_rad;
+        gravity.begin(config);
+        let guard = app.inner.gate.lock().await;
+        {
+            let mut s = app.inner.state.lock().unwrap();
+            s.experiment
+                .begin(experiment_config(ExperimentKind::Record), 1, None);
+            s.experiment.status.recording_interval_s = 0.0;
+        }
+        for ty in [2, 24] {
+            for wire_velocity in [-2.5, 2.5] {
+                let mut payload = [0; 8];
+                payload[..2].copy_from_slice(&pack(1.5, -12.57, 12.57).to_be_bytes());
+                payload[2..4].copy_from_slice(&pack(wire_velocity, -50.0, 50.0).to_be_bytes());
+                payload[4..6].copy_from_slice(&pack(0.0, -6.0, 6.0).to_be_bytes());
+                payload[6..].copy_from_slice(&250u16.to_be_bytes());
+                observe_frame(&app.inner, frame(ty, 1, 253, payload).unwrap());
+
+                let view = app.snapshot();
+                let velocity = view.velocity_rad_s.unwrap();
+                assert!((velocity - wire_velocity).abs() < 0.002);
+                let data = app.experiment_data();
+                let sample = data.samples.last().unwrap();
+                assert_eq!(data.feedback_velocity_sign, 1);
+                assert_eq!(sample.velocity_rad_s, velocity);
+                assert_eq!(sample.can_id >> 24, u32::from(ty));
+
+                let target = gravity.runtime_target(view.unwrapped_position_rad.unwrap(), velocity);
+                assert!(gravity.status.gravity_torque_nm.abs() < 1e-12);
+                let El05Target::Mit {
+                    torque_nm, kp, kd, ..
+                } = target
+                else {
+                    panic!("MIT target required")
+                };
+                assert_eq!(kp, 0.0);
+                assert_eq!(kd, 0.0);
+                assert!((torque_nm + damping * velocity).abs() < 1e-12);
+                assert!(
+                    torque_nm * velocity < 0.0,
+                    "damping must oppose both feedback directions"
+                );
+                assert!(!gravity.status.limited);
             }
         }
         assert_eq!(app.experiment_data().samples.len(), 4);
@@ -2188,7 +2900,7 @@ mod tests {
         }
         let mut bytes = [0; 8];
         bytes[..2].copy_from_slice(&pack(-12.56, -12.57, 12.57).to_be_bytes());
-        bytes[2..4].copy_from_slice(&pack(-0.2, -50.0, 50.0).to_be_bytes());
+        bytes[2..4].copy_from_slice(&pack(0.2, -50.0, 50.0).to_be_bytes());
         observe_frame(&app.inner, frame(2, 1, 253, bytes).unwrap());
         let view = app.snapshot();
         assert!((view.unwrapped_position_rad.unwrap() - 12.58).abs() < 0.001);
