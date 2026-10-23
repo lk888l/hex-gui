@@ -405,6 +405,43 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
+  unitreeServo: [
+    {
+      title: { en: "1 · Open USB serial", zh: "1 · 打开 USB 串口" },
+      body: {
+        en: "Choose a USB single-wire TTL adapter (Linux defaults to /dev/ttyACM0) and an ID from 0 to 14. Communication is fixed at 6 Mbps, 8N1. Serial open and Servo online are separate indicators. An unpowered servo cannot reply; opening the port does not enable FOC.",
+        zh: "选择 USB 单总线 TTL 适配器（Linux 默认 /dev/ttyACM0）和 0–14 的 ID，通信固定为 6 Mbps、8N1。「串口已打开」与「舵机在线」分别显示。未上电的舵机不会应答；打开串口不会开启 FOC。",
+      },
+    },
+    {
+      title: { en: "2 · Scan and send targets", zh: "2 · 扫描并发送目标" },
+      body: {
+        en: "Scan IDs 0–14 and select a discovered servo. Select Hybrid FOC (1) and use Enable FOC to confirm the mode with zero torque and gains, then send output-side position, velocity, torque, Kp and Kd. Send also confirms FOC automatically when needed. Position, velocity and torque presets all use hybrid FOC. Delayed first-frame mode feedback is handled automatically. Single targets are followed by lock after about 200 ms.",
+        zh: "扫描 0–14 并选择舵机。工作模式选择「混合 FOC（1）」，可先点击「使能 FOC」以零力矩、零增益确认，再发送输出端位置、速度、力矩、Kp 和 Kd。直接发送目标时也会自动确认 FOC。位置、速度、力矩预设均使用混合 FOC，首帧反馈模式滞后由后台处理。单次目标约 200 ms 后自动锁定。",
+      },
+    },
+    {
+      title: { en: "3 · Monitor and stop", zh: "3 · 监控与停止" },
+      body: {
+        en: "Watch numeric feedback or the position, velocity and torque charts. Stop / clear timeout, or Ctrl+Enter, stops streaming and requests lock mode. The backend stops motion on lost client heartbeat, missing replies or fault feedback. Stop before changing the selected servo or communication settings.",
+        zh: "查看数值反馈或位置、速度、力矩曲线。点击「停止 / 清除超时」或按 Ctrl+Enter 可停止发送目标并请求锁定。后台会在界面心跳丢失、连续应答失败或收到故障反馈后停止控制。修改通信对象和通信设置前先停机。",
+      },
+    },
+    {
+      title: { en: "4 · Session profiles and servo configuration", zh: "4 · 会话配置与舵机配置" },
+      body: {
+        en: "Communication & limits and JSON profiles retain host settings on this computer. To change the physical servo ID, connect one powered servo, stop motion, open Servo settings, enter a different ID (0–14) and click Change ID and save to servo. The app saves to Flash, verifies the new ID and restores APP without starting motion. Failed or interrupted configuration shows whether Flash saving was acknowledged; Restore APP can recover communication at the old or new ID.",
+        zh: "「通信与限制」和 JSON 配置保存电脑上的会话设置。修改舵机本体 ID 时，总线上只接一台已上电舵机，先停止运动，再到「舵机设置」输入不同的新 ID（0–14），点击「修改 ID 并保存到舵机」。程序会保存 Flash、回读新 ID 并恢复 APP，不会启动运动。异常时会明确显示保存是否已确认，可在旧或新 ID 上尝试「恢复 APP」。",
+      },
+    },
+    {
+      title: { en: "5 · Test several servos on one wire", zh: "5 · 一条总线上的一拖多测试" },
+      body: {
+        en: "Give each servo a distinct ID, connect them to the same single-wire bus, scan, and open Multi-servo test. Select 2–15 IDs and a duration. Start with the lock-mode communication test; inspect per-ID loss, rate and response time. For motion, edit each ID's target and start the FOC test explicitly. Stop, completion, a member fault or lost client heartbeat locks all members. Export the JSON report to retain results.",
+        zh: "先分别设置不同的 ID，再将多台舵机接到同一单总线并扫描。打开「一拖多测试」，选择 2–15 个 ID 和时长，先运行锁定模式通信测试，查看各 ID 的丢包率、实际频率和延迟。需要运动时，分别编辑各 ID 目标，再明确启动 FOC 测试。停止、到时、成员故障或界面心跳丢失时逐台锁定；可导出 JSON 测试报告。",
+      },
+    },
+  ],
   el05: [
     {
       title: { en: "1 · Connect and select", zh: "1 · 连接并选择" },

@@ -36,6 +36,10 @@ mod stm32_can_dfu;
 mod stm32_can_profiles;
 mod torque_calibration;
 mod unified_smartknob;
+mod unitree_boot;
+mod unitree_commands;
+mod unitree_protocol;
+mod unitree_servo;
 mod zenoh_arm;
 mod zenoh_base;
 mod zenoh_config;
@@ -243,6 +247,19 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::is_connected,
+            unitree_commands::unitree_list_ports,
+            unitree_commands::unitree_connect,
+            unitree_commands::unitree_disconnect,
+            unitree_commands::unitree_get_state,
+            unitree_commands::unitree_scan,
+            unitree_commands::unitree_select,
+            unitree_commands::unitree_send_target,
+            unitree_commands::unitree_stop,
+            unitree_commands::unitree_set_mode,
+            unitree_commands::unitree_start_bus_test,
+            unitree_commands::unitree_configure,
+            unitree_commands::unitree_change_id,
+            unitree_commands::unitree_restore_app,
             el05_commands::el05_connect,
             el05_commands::el05_disconnect,
             el05_commands::el05_get_state,

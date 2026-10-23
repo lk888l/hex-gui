@@ -27,6 +27,8 @@ import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
 import { El05MotorPanel } from "./components/El05MotorPanel";
 import { el05Api } from "./el05Api";
+import { UnitreeServoPanel } from "./components/UnitreeServoPanel";
+import { unitreeApi } from "./unitreeApi";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
 import { canDfuApi, hpmDfuApi } from "./dfuApi";
 import type { MotorInfo } from "./types";
@@ -51,7 +53,8 @@ type Tool =
   | "console"
   | "damiao"
   | "rollercanControl"
-  | "el05";
+  | "el05"
+  | "unitreeServo";
 
 const DEVICE_POLL_MS = 700;
 
@@ -74,6 +77,7 @@ export default function App() {
   // the one-shot automatic position reads. Keep navigation and disconnect
   // locked until the backend command has actually returned.
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const [unitreeBusy, setUnitreeBusy] = useState(false);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [calibrationUpdateBusy, setCalibrationUpdateBusy] = useState(false);
 
@@ -140,6 +144,7 @@ export default function App() {
   }, []);
 
   const switchTool = useCallback(async () => {
+    if (tool === "unitreeServo" && unitreeBusy) return;
     if (tool === "dfu" && dfuBusy) {
       message.warning(t("dfuBusyLeave"));
       return;
@@ -162,6 +167,8 @@ export default function App() {
     try {
       if (tool === "el05") {
         await el05Api.disconnect();
+      } else if (tool === "unitreeServo") {
+        await unitreeApi.disconnect();
       } else if (tool === "dfu") {
         await Promise.all([hpmDfuApi.leave(), canDfuApi.leave()]);
       } else {
@@ -177,7 +184,7 @@ export default function App() {
     setDevices([]);
     setTutorialOpen(false);
     setTool(null);
-  }, [calibrationBusy, calibrationUpdateBusy, dfuBusy, message, settingsBusy, t, tool]);
+  }, [calibrationBusy, calibrationUpdateBusy, dfuBusy, message, settingsBusy, unitreeBusy, t, tool]);
 
   const onToggleLog = useCallback(
     async (nid: number, on: boolean, meowMotor = false) => {
@@ -233,6 +240,7 @@ export default function App() {
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
     el05: { title: t("toolEl05"), desc: t("toolEl05Desc") },
+    unitreeServo: { title: t("toolUnitreeServo"), desc: t("toolUnitreeServoDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
   const needsHeartbeat =
@@ -258,7 +266,8 @@ export default function App() {
     tool !== "calibrationUpdate" &&
     tool !== "damiao" &&
     tool !== "rollercanControl" &&
-    tool !== "el05";
+    tool !== "el05" &&
+    tool !== "unitreeServo";
   const showConnectBar =
     tool !== "console" &&
     tool !== "zenoh" &&
@@ -267,7 +276,8 @@ export default function App() {
     tool !== "config" &&
     tool !== "canalyzer" &&
     tool !== "dfu" &&
-    tool !== "el05";
+    tool !== "el05" &&
+    tool !== "unitreeServo";
 
   return (
     <Layout className={`app-shell app-shell--${tool}`}>
@@ -279,6 +289,7 @@ export default function App() {
             disabled={
               (tool === "dfu" && dfuBusy) ||
               (tool === "settings" && settingsBusy) ||
+              (tool === "unitreeServo" && unitreeBusy) ||
               ((tool === "calibration" || tool === "torqueCalibration") && calibrationBusy)
               || (tool === "calibrationUpdate" && calibrationUpdateBusy)
             }
@@ -357,6 +368,8 @@ export default function App() {
             <RollerCanControlPanel connected={connected} />
           ) : tool === "el05" ? (
             <El05MotorPanel />
+          ) : tool === "unitreeServo" ? (
+            <UnitreeServoPanel onBusyChange={setUnitreeBusy} />
           ) : tool === "dfu" ? (
             <DfuPanel onBusyChange={setDfuBusy} />
           ) : tool === "authenticity" ? (
@@ -655,6 +668,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                     tag={t("tagRollerCanProtocol")}
                     accent="blue"
                     onClick={() => onPick("rollercanControl")}
+                  />
+                  <ToolCard
+                    title={t("toolUnitreeServo")}
+                    desc={t("toolUnitreeServoDesc")}
+                    tag={t("tagUnitreeServoProtocol")}
+                    accent="cyan"
+                    onClick={() => onPick("unitreeServo")}
                   />
                 </div>
               ),

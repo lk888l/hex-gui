@@ -141,11 +141,11 @@ pub async fn el05_disconnect(state: State<'_, AppState>) -> CmdResult<()> {
     let had_session = state.el05.lock().await.is_some();
     stop_session(&state, false).await?;
     if had_session {
-        // EL05 owned the exclusive CAN permit, so no manager-backed feature
-        // could coexist. Return later tools to their normal dormant path.
+        // CAN ownership is exclusive, but the independent USB serial servo
+        // may still need the native close cleanup path.
         state
             .extension_runtime_active
-            .store(false, Ordering::Release);
+            .store(state.unitree_servo.lock().await.is_some(), Ordering::Release);
     }
     Ok(())
 }

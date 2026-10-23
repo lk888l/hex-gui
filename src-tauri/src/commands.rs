@@ -424,6 +424,9 @@ async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
     if let Err(error) = crate::el05_commands::stop_session(state, false).await {
         failures.push(format!("EL05: {error}"));
     }
+    if let Err(error) = crate::unitree_commands::stop_session(state, false).await {
+        failures.push(format!("Unitree servo: {error}"));
+    }
     if !failures.is_empty() {
         // Keep every failed subsystem handle, the shared feature bus, and the
         // active marker intact so Stop/disconnect can retry confirmed disable.
@@ -465,6 +468,9 @@ async fn collect_extension_stop_failures(
 
 /// Best-effort variant used only after an extended window-close request.
 async fn force_stop_extension_runtime_locked(state: &AppState) {
+    if let Err(error) = crate::unitree_commands::stop_session(state, true).await {
+        log::warn!("Unitree servo stop during forced close failed: {error}");
+    }
     if let Err(error) = crate::el05_commands::stop_session(state, true).await {
         log::warn!("EL05 stop during forced close failed: {error}");
     }

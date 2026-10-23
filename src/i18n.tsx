@@ -433,6 +433,12 @@ const STRINGS = {
     zh: "独立 CAN 控制，支持运控/MIT、PP、CSP、速度与电流模式，以及实时反馈和参数读写。",
   },
   tagEl05Protocol: { en: "RobStride 29-bit · 1 Mbps", zh: "RobStride 29 位 · 1 Mbps" },
+  toolUnitreeServo: { en: "Unitree J288 / S288 Servo Control", zh: "宇树 J288 / S288 舵机控制" },
+  toolUnitreeServoDesc: {
+    en: "Independent USB serial control, hybrid motion targets, live feedback, communication settings and local profiles.",
+    zh: "独立 USB 串口控制，支持混合运动目标、实时反馈、通信设置和本机配置。",
+  },
+  tagUnitreeServoProtocol: { en: "Unitree TTL · 6 Mbps", zh: "宇树单总线 TTL · 6 Mbps" },
   toolRollerCanControl: { en: "Unit RollerCAN Motor Control", zh: "Unit RollerCAN 电机控制" },
   toolRollerCanControlDesc: {
     en: "Stock-firmware speed, position, current and encoder control over extended CAN frames.",

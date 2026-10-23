@@ -43,6 +43,8 @@ env_logger = "0.11"
 anyhow = "1"
 getrandom = "0.3"
 chrono = "0.4"
+# Unitree J288/S288's independent 6 Mbps USB serial workspace.
+serialport = { version = "4.10", default-features = false }
 # Published Meow Motor driver and host services.
 hex-motor = "0.3.1"
 

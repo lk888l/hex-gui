@@ -1,0 +1,33 @@
+.unitree-panel { width: 100%; max-width: 1760px; margin: 0 auto; }
+.unitree-connection, .unitree-form-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.unitree-connection-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.unitree-field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.unitree-field > .ant-input-number { width: 158px; }
+.unitree-field > .ant-switch { align-self: flex-start; margin: 4px 0; }
+.unitree-alert { margin-top: 14px; }
+.unitree-workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 16px; }
+.unitree-workspace > *, .unitree-detail { min-width: 0; }
+.unitree-detail { display: flex; flex-direction: column; gap: 16px; }
+.unitree-workspace aside .ant-card-body { padding: 12px; }
+.unitree-device { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; width: 100%; margin-bottom: 8px; padding: 12px; border: 1px solid transparent; border-radius: 8px; background: rgba(255,255,255,0.025); color: inherit; text-align: left; cursor: pointer; }
+.unitree-device:hover, .unitree-device--selected { border-color: #4f8cff; background: rgba(79,140,255,0.1); }
+.unitree-device:disabled { opacity: 0.65; cursor: default; }
+.unitree-device > span { font-size: 12px; }
+.unitree-manual { display: flex; gap: 8px; margin-top: 12px; }
+.unitree-manual .ant-input-number { width: 100%; min-width: 0; }
+.unitree-summary, .unitree-feedback-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.unitree-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+.unitree-metric { padding: 13px 15px; border: 1px solid rgba(148,163,184,0.16); border-radius: 8px; }
+.unitree-metric > div { margin-top: 6px; font-size: 25px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.unitree-metric small { color: #8a93a3; font-size: 12px; }
+.unitree-note { font-size: 12px; line-height: 1.8; margin-top: 14px; margin-bottom: 0 !important; }
+.unitree-tabs { max-width: 100%; overflow-x: auto; }
+.unitree-tabs .ant-segmented-group { min-width: max-content; }
+.unitree-form-row { margin: 18px 0; }
+.unitree-frame { display: block; margin-top: 8px; padding: 12px; background: rgba(15,23,42,0.4); border: 1px solid rgba(148,163,184,0.16); border-radius: 6px; font-size: 12px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.unitree-diagnostics { margin: 20px 0 10px; }
+.unitree-bus-test { min-width: 0; margin-top: 18px; }
+.unitree-bus-results { margin-top: 12px; }
+@media (max-width: 1000px) { .unitree-metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width: 760px) { .unitree-workspace { grid-template-columns: 1fr; } .unitree-device { display: inline-flex; width: 210px; margin-right: 8px; } }
+@media (max-width: 620px) { .unitree-metric > div { font-size: 19px; } .unitree-field > .ant-input-number { width: 140px; } .unitree-connection .ant-select { max-width: 100%; } }
