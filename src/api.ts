@@ -12,6 +12,9 @@ import type {
   DamiaoMode,
   DamiaoState,
   DamiaoTarget,
+  DamiaoRegisterDefinition,
+  DamiaoRegisterReading,
+  DamiaoRegisterWriteResult,
   SmartKnobDevice,
   SmartKnobProfile,
   SmartKnobStartRequest,
@@ -108,7 +111,7 @@ export const api = {
   applyDeviceSettings: (request: DeviceSettingsRequest) =>
     invoke<DeviceSettingsResult>("apply_device_settings", { request }),
 
-  // DAMIAO DM-J4310-2EC V1.1 (raw standard CAN, independent of CiA 402).
+  // DAMIAO DM-J4310-2EC (raw standard CAN, independent of CiA 402).
   damiaoListDevices: () =>
     invoke<DamiaoDiscoveredDevice[]>("damiao_list_devices"),
   damiaoSafeRescan: () => invoke<void>("damiao_safe_rescan"),
@@ -117,6 +120,11 @@ export const api = {
   damiaoDetach: (motorId: number) => invoke<void>("damiao_detach", { motorId }),
   damiaoGetState: (motorId: number) =>
     invoke<DamiaoState>("damiao_get_state", { motorId }),
+  damiaoListRegisters: () => invoke<DamiaoRegisterDefinition[]>("damiao_list_registers"),
+  damiaoReadRegister: (motorId: number, address: number) =>
+    invoke<DamiaoRegisterReading>("damiao_read_register", { motorId, address }),
+  damiaoWriteRegister: (motorId: number, address: number, value: number) =>
+    invoke<DamiaoRegisterWriteResult>("damiao_write_register", { motorId, address, value }),
   damiaoSetMotorId: (motorId: number, newMotorId: number, save: boolean) =>
     invoke<DamiaoIdChangeResult>("damiao_set_motor_id", { motorId, newMotorId, save }),
   damiaoSetMode: (motorId: number, mode: DamiaoMode) =>
@@ -127,7 +135,8 @@ export const api = {
     invoke<DamiaoBitrateState>("damiao_set_bitrate", { motorId, bitrate }),
   damiaoSaveParameters: (motorId: number) =>
     invoke<void>("damiao_save_parameters", { motorId }),
-  damiaoEnable: (motorId: number) => invoke<void>("damiao_enable", { motorId }),
+  damiaoEnable: (motorId: number) => invoke<DamiaoState>("damiao_enable", { motorId }),
+  damiaoReadPositions: (motorId: number) => invoke<DamiaoState>("damiao_read_positions", { motorId }),
   damiaoDisable: (motorId: number) => invoke<void>("damiao_disable", { motorId }),
   damiaoDisableAll: () => invoke<void>("damiao_disable_all"),
   damiaoClearFault: (motorId: number) =>

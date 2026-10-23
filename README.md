@@ -129,15 +129,90 @@ cd src-tauri && cargo run
 (Repeat `npm run build` after frontend changes, since `cargo run` embeds the
 built `dist/` rather than talking to the Vite dev server.)
 
+### DAMIAO standalone app: control and configuration
+
+The top **Control / Configuration** selector follows the EL05 workspace layout.
+Both views share the selected motor, feedback, and **Stop & disable** action.
+Control contains mode selection, motion targets and live measurements;
+Configuration contains motor ID, CAN bitrate, position zero and Flash storage.
+
+Connect CAN and select a discovered motor to initialize it automatically
+(read mapping parameters, safely disable, and read precise position). Automatic
+initialization never enables the drive. Click **Enable** to prepare the selected
+mode and confirm enabled feedback, then send a target. Manual IDs also support
+**Initialize & enable** in one action. Initialization failures remain visible
+and require an explicit retry. Opening Configuration reads the current bitrate
+automatically.
+
+Enabling and mode changes stop the old stream, confirm disabled and stationary
+feedback, acknowledge the mode write, preload a neutral target, and verify
+enabled feedback. Position modes use precise `p_m` (0x50), including multi-turn
+positions, instead of a zero or wrapped feedback position. A failed transaction
+attempts a confirmed disable. **Use current position** updates the editor without
+sending a motion target. **Stop periodic send** only stops target refresh;
+**Stop & disable** also disables the drive. Stale or faulted feedback stops a
+periodic stream and requires a new explicit enable/send operation.
+
+24 V and 48 V motors use the same control and configuration protocol. There is
+no voltage selector or hardcoded 200 rpm / 7 Nm command cap. MIT uses the drive's
+actual PMAX / VMAX / TMAX mapping and the documented gain ranges. Position and
+velocity modes send finite float values independently of the feedback mapping;
+position-mode maximum speed must be nonnegative.
+
+Protocol reference: **DM-J4310-2EC V1.2 减速电机使用说明书 V1.4
+(2026-09-14)**, pp. 11–19 (control, configuration, mode change and registers),
+and **DM-H3510轮毂电机说明书**, pp. 10–12 (parameter reads/writes, Flash,
+mode change and bitrate). Both specify bitrate codes 0–9 in their bitrate
+tables; the older H3510 register summary's 0–4 range is inconsistent with that
+table. The app uses the matching 0–9 tables and the J4310 register list.
+
+### DAMIAO standalone app: registers and force-position control
+
+**Configuration → All registers** covers all 49 entries from the V1.4 manual,
+pp. 17–19: 26 RW and 23 RO. Search by name/address, filter by group or access,
+read one entry, or read all / filtered entries with progress and cancellation.
+The table shows last-read values; the editor includes raw 32-bit values, types,
+units, ranges and relevant manual notes. Reserved `hw_ver` and `SN` are shown
+without inventing a format. Unlisted addresses cannot be accessed through this API.
+
+Read-only permissions, uint32 types, float32 encoding and open/closed range
+endpoints are enforced in the backend as well as the UI. `OV_Value` has range
+`TBD` in the manual, so only finite float32 is enforced. `ACC`/`DEC` use rotor-side
+krad/s² (negative `DEC`), `MAX_SPD` uses rotor-side rad/s, and `TIMEOUT` counts
+50 µs periods. Protocol scales are independent of 24 V / 48 V hardware ratings.
+
+Writes stop streaming, confirm disabled feedback and verify by a separate read.
+`ESC_ID` and bitrate reuse the address-migration / reconnect transactions;
+`MST_ID` is verified on its new feedback address. Mapping writes synchronize
+command encoding and feedback decoding. Uncertain mode, address or mapping
+writes block motion until reconnect. No generic register write saves Flash;
+use **Disable & save all parameters** explicitly. Bitrate changes must be read
+back after reconnecting at the new rate. At `MST_ID=0x7FF`, Flash acknowledgements
+cannot be distinguished from local request echoes, so choose another feedback
+ID before saving. `CTRL_MODE=0` is writable per the
+register range but has no documented motion behavior; enabling is blocked until
+one of the four defined modes is selected.
+
+**Control → Force + position** selects `CTRL_MODE=4` and sends an 8-byte
+`0x300 + (ESC_ID & 0xFF)` target: little-endian float32 position (rad), uint16
+maximum speed ×100 (0–100 rad/s), and uint16 current-limit ratio ×10000 (0–1).
+The UI expresses current limit as 0–100% of maximum phase current, not Nm.
+Initialization reads multi-turn `p_m` and preloads current position with zero
+speed/current limit. Position targets are sent once; edit and send again to
+change position, speed or current limit.
+
 ### DAMIAO standalone app: motor ID
 
-Attach the motor, enter a decimal or `0x`-prefixed hexadecimal ID under
+Open **Configuration**, enter a decimal or `0x`-prefixed hexadecimal ID under
 **Motor ID**, and click **Disable & change ID**. The app writes the uint32
-`ESC_ID` register (`0x08`) using the DM-J4310-2EC V1.1 manual V1.3
+`ESC_ID` register (`0x08`) using the DM-J4310-2EC V1.2 manual V1.4
 (2026-09-14), stops periodic targets, requires fresh disabled feedback,
 and reads the register back at the new address before updating the selected
 motor and its live session. The feedback `MST_ID` is preserved. Supported
-IDs are `0x00`–`0xFF`; the manual recommends `0x00`–`0x0F`.
+IDs are `0x000`–`0x7FF`, matching the register table; the manual recommends
+`0x00`–`0x0F`. Parameter requests carry the full ID. Control frames match the
+low eight ID bits (manual p. 11), with the mode offset added to those bits;
+feedback carries only the low four ID bits.
 
 **Save to Flash** is enabled by default. After confirming disabled feedback
 at the new address, the app sends the disabled-only storage command and
@@ -163,18 +238,19 @@ For example, changing motor 1 to ID 2 writes
 ### DAMIAO standalone app: CAN bitrate
 
 The DM-J4310-2EC app reads and writes the `can_br` register (`0x23`) using
-the DM-J4310-2EC V1.1 manual V1.3 (2026-09-14) and the DM-J3507-2EC manual
-V1.1 (2026-04-13). Supported rates are 125/200/250/500 Kbit/s and
+the DM-J4310-2EC V1.2 manual V1.4 (2026-09-14) and the DM-H3510 manual.
+Supported rates are 125/200/250/500 Kbit/s and
 1/2/2.5/3.2/4/5 Mbit/s. Rates above 1 Mbit/s use CAN FD feedback.
 
-1. Connect the target motor on its own, attach it, and click **Read bitrate**.
+1. Connect the target motor on its own and open **Configuration**. Initialization
+   and the first bitrate read are automatic; **Read bitrate** refreshes the value.
 2. Select a new rate and click **Disable & change bitrate**. The app stops
    periodic targets, requires disabled feedback, then checks the write reply
    at the old rate. Missing replies leave the result explicitly uncertain.
 3. Disconnect CAN, configure the host for the selected rate, and reconnect.
    For direct `gs_usb` connections, use the motor bitrate selector in the
    connection bar. SocketCAN uses the system's existing interface timing.
-4. Attach and read again to verify communication. Click **Disable & save all
+4. Select the motor and open Configuration to read again and verify communication. Click **Disable & save all
    parameters** if the new rate should survive power loss. This saves all
    current drive parameters, including the runtime control mode.
 
@@ -202,7 +278,7 @@ cargo run --example damiao_bitrate_probe -- can0 3 0x23 set 500000
 
 ### DAMIAO standalone app: position zero
 
-Attach the motor and wait for live feedback. Place the output shaft at the
+Initialize the motor and wait for live feedback. Open **Configuration** and place the output shaft at the
 desired physical reference, then use **Position zero → Set current position
 as zero** and confirm the displayed motor/position. The app stops periodic
 targets, confirms disabled and stationary feedback, and sends the motor's
@@ -221,7 +297,8 @@ again. A shaft still moving after disable is rejected before the zero command.
 Attaching reads the motor's PMAX, VMAX, and TMAX registers before decoding
 feedback or sending targets. Mapping fields show the values read from the
 motor; they do not change its parameters. These are protocol scales, separate
-from the physical speed and torque limits applied to motion commands.
+from the motor's physical ratings. They limit MIT encoding, without imposing
+model-specific speed or torque limits on float motion commands.
 
 **Output-shaft single-turn angle** uses float `xout` (0x51), normalized to
 [-π, π) radians / [-180°, 180°) relative to the current zero. The unmodified

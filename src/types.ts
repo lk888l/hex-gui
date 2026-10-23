@@ -6,8 +6,39 @@ export type MotorMode =
   | "Torque"
   | "Mit";
 
-// DAMIAO DM-J4310-2EC V1.1 direct-CAN protocol (not CiA 402).
-export type DamiaoMode = "Mit" | "PositionVelocity" | "Velocity";
+// DAMIAO DM-J4310-2EC direct-CAN protocol (not CiA 402).
+export type DamiaoMode = "Unspecified" | "Mit" | "PositionVelocity" | "Velocity" | "ForcePosition";
+
+export interface DamiaoRegisterDefinition {
+  address: number;
+  name: string;
+  label_zh: string;
+  label_en: string;
+  group: string;
+  data_type: "Float32" | "Uint32";
+  writable: boolean;
+  min: number | null;
+  max: number | null;
+  min_inclusive: boolean;
+  max_inclusive: boolean;
+  range: string;
+  unit: string;
+  note_zh: string;
+  note_en: string;
+}
+
+export interface DamiaoRegisterReading {
+  address: number;
+  value: number | null;
+  raw: number;
+}
+
+export interface DamiaoRegisterWriteResult {
+  reading: DamiaoRegisterReading | null;
+  state: DamiaoState;
+  id_change: DamiaoIdChangeResult | null;
+  bitrate: DamiaoBitrateState | null;
+}
 
 export interface DamiaoConfig {
   motor_id: number;
@@ -43,7 +74,8 @@ export type DamiaoTarget =
       position_rad: number;
       velocity_rad_s: number;
     }
-  | { kind: "Velocity"; velocity_rad_s: number };
+  | { kind: "Velocity"; velocity_rad_s: number }
+  | { kind: "ForcePosition"; position_rad: number; velocity_rad_s: number; current_limit_ratio: number };
 
 export interface DamiaoState {
   attached: boolean;

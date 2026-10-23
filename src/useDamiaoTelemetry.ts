@@ -33,6 +33,12 @@ export function useDamiaoTelemetry(
   const referenceVersion = useRef(0);
   const [chartVersion, setChartVersion] = useState(0);
 
+  const acceptSnapshot = useCallback((snapshot: DamiaoState) => {
+    // Do not let a poll started before a command overwrite its result.
+    referenceVersion.current += 1;
+    setLatest(snapshot);
+  }, []);
+
   const resetHistory = useCallback((snapshot?: DamiaoState) => {
     // A zero change starts a new physical position reference. Invalidate an
     // in-flight poll too, so its old coordinates cannot re-enter the buffer.
@@ -141,5 +147,5 @@ export function useDamiaoTelemetry(
     return () => window.clearInterval(timer);
   }, [chartActive]);
 
-  return { latest, samples, chartVersion, resetHistory };
+  return { latest, samples, chartVersion, resetHistory, acceptSnapshot };
 }

@@ -23,6 +23,7 @@ use crate::can_lease::{CanOwner, CanTransportGate};
 use crate::damiao::{
     DamiaoBitrateState, DamiaoConfig, DamiaoDiscoveredDevice, DamiaoDiscovery,
     DamiaoIdChangeResult, DamiaoMode, DamiaoSession, DamiaoState, DamiaoTarget,
+    register_definition, DamiaoRegisterDefinition, DamiaoRegisterReading, DamiaoRegisterWriteResult, REGISTERS,
 };
 use crate::diag::{EventsSnapshot, LogLine};
 use crate::dto::{
@@ -1535,9 +1536,9 @@ fn validate_damiao_id_change(
     new_motor_id: u16,
     devices: &[DamiaoDiscoveredDevice],
 ) -> CmdResult<()> {
-    if new_motor_id > 0xFF {
+    if new_motor_id > 0x7FF {
         return Err(
-            "DAMIAO motor CAN ID must be in 0x000..=0x0FF; IDs below 0x10 are recommended".into(),
+            "DAMIAO motor CAN ID must be in 0x000..=0x7FF; IDs below 0x10 are recommended".into(),
         );
     }
     if let Some(device) = devices.iter().find(|device| {
@@ -1577,7 +1578,7 @@ mod damiao_id_tests {
         assert!(validate_damiao_id_change(2, 0x12, &[device.clone()]).is_ok());
         device.online = false;
         assert!(validate_damiao_id_change(1, 2, &[device]).is_ok());
-        assert!(validate_damiao_id_change(1, 0x100, &[]).is_err());
+        assert!(validate_damiao_id_change(1, 0x800, &[]).is_err());
     }
 }
 
@@ -1637,6 +1638,81 @@ pub async fn damiao_set_motor_id(
         }
     }
     Ok(result)
+}
+
+#[tauri::command]
+pub fn damiao_list_registers() -> Vec<DamiaoRegisterDefinition> {
+    REGISTERS.to_vec()
+}
+
+#[tauri::command]
+pub async fn damiao_read_register(
+    state: State<'_, AppState>,
+    motor_id: u16,
+    address: u8,
+) -> CmdResult<DamiaoRegisterReading> {
+    damiao_session(&state, motor_id)
+        .await?
+        .read_register(address)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn damiao_write_register(
+    state: State<'_, AppState>,
+    motor_id: u16,
+    address: u8,
+    value: f64,
+) -> CmdResult<DamiaoRegisterWriteResult> {
+    let definition = register_definition(address).map_err(err)?;
+    let raw = definition.encode(value).map_err(err)?;
+    let session = damiao_session(&state, motor_id).await?;
+    // Reuse the complete app-level transactions, including collision checks,
+    // session-map migration, discovery suspension and bitrate reconnection.
+    if address == 0x08 {
+        let result = damiao_set_motor_id(state, motor_id, raw as u16, false).await?;
+        return Ok(DamiaoRegisterWriteResult {
+            reading: result.verified.then(|| definition.decode(raw.to_le_bytes())),
+            state: result.state.clone(),
+            id_change: Some(result),
+            bitrate: None,
+        });
+    }
+    if address == 0x23 {
+        let rates = [
+            125_000, 200_000, 250_000, 500_000, 1_000_000,
+            2_000_000, 2_500_000, 3_200_000, 4_000_000, 5_000_000,
+        ];
+        let result = damiao_set_bitrate(state, motor_id, rates[raw as usize]).await?;
+        return Ok(DamiaoRegisterWriteResult {
+            // An old-speed write acknowledgement is not readback at the new
+            // speed. Keep the row unverified until the user reconnects.
+            reading: (!result.requires_reconnect).then(|| definition.decode(raw.to_le_bytes())),
+            state: session.snapshot(),
+            id_change: None,
+            bitrate: Some(result),
+        });
+    }
+    let _extension_op = state.extension_op.lock().await;
+    let _operation = state.device_settings_operation.acquire().await;
+    let discovery = state.damiao_discovery.lock().await.clone();
+    let _scan_guard = match &discovery {
+        Some(discovery) => Some(discovery.suspend_scanning().await),
+        None => None,
+    };
+    let result = session.write_register(address, value).await.map_err(err);
+    if session.requires_reconnect() {
+        if let Some(discovery) = state.damiao_discovery.lock().await.take() {
+            discovery.stop_and_wait().await;
+        }
+    }
+    Ok(DamiaoRegisterWriteResult {
+        reading: Some(result?),
+        state: session.snapshot(),
+        id_change: None,
+        bitrate: None,
+    })
 }
 
 #[tauri::command]
@@ -1720,10 +1796,19 @@ pub async fn damiao_set_mode(
 }
 
 #[tauri::command]
-pub async fn damiao_enable(state: State<'_, AppState>, motor_id: u16) -> CmdResult<()> {
+pub async fn damiao_enable(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
     damiao_session(&state, motor_id)
         .await?
         .enable()
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn damiao_read_positions(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
+    damiao_session(&state, motor_id)
+        .await?
+        .read_positions()
         .await
         .map_err(err)
 }
