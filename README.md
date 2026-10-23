@@ -8,6 +8,14 @@ diagnostics, and device-authenticity checks.
 Frontend: **Vite + React + TypeScript + Ant Design + ECharts**.
 Backend: **pure Rust** (Tauri commands over `hex-motor`).
 
+The **G431 FOC Motor / G431 FOC 电机** tool is a separate CANopen host for
+`stm32g431-foc-canfd` firmware. It follows the original Motor Control layout,
+with heartbeat discovery in the device sidebar, numeric/chart views, calibration
+and initialization, five motion modes, Rust-owned 10 ms RPDO streaming, and
+periodic TPDO feedback.
+See [the G431 FOC guide](docs/stm32-foc.md) for connection, units, and the complete
+startup workflow.
+
 ## Layout
 
 ```

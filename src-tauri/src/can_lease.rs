@@ -17,6 +17,7 @@ use can_transport::{
 pub enum CanOwner {
     Manager,
     Analyzer,
+    Stm32Foc,
     DfuDiscovery,
     DfuUpdate,
 }
@@ -26,6 +27,7 @@ impl fmt::Display for CanOwner {
         formatter.write_str(match self {
             Self::Manager => "the normal CAN session",
             Self::Analyzer => "CAN Analyzer",
+            Self::Stm32Foc => "G431 FOC motor control",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
         })

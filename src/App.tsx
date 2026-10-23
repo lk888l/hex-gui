@@ -25,6 +25,8 @@ import { DfuPanel } from "./components/DfuPanel";
 import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
+import { Stm32FocPanel } from "./components/Stm32FocPanel";
+import { stm32FocApi } from "./stm32FocApi";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
 import { canDfuApi, hpmDfuApi } from "./dfuApi";
 import type { MotorInfo } from "./types";
@@ -48,7 +50,8 @@ type Tool =
   | "calibrationUpdate"
   | "console"
   | "damiao"
-  | "rollercanControl";
+  | "rollercanControl"
+  | "stm32Foc";
 
 const DEVICE_POLL_MS = 700;
 
@@ -157,7 +160,11 @@ export default function App() {
       await api.smartknobStop().catch(() => {});
     }
     try {
-      if (tool === "dfu") {
+      if (tool === "stm32Foc") {
+        await stm32FocApi.disconnect().catch((error) => {
+          message.warning(`${t("disconnectFailed")}: ${errMsg(error)}`);
+        });
+      } else if (tool === "dfu") {
         await Promise.all([hpmDfuApi.leave(), canDfuApi.leave()]);
       } else {
         await api.disconnect();
@@ -227,6 +234,7 @@ export default function App() {
     console: { title: t("toolConsole"), desc: t("toolConsoleDesc") },
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
+    stm32Foc: { title: t("toolStm32Foc"), desc: t("toolStm32FocDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
   const needsHeartbeat =
@@ -251,7 +259,8 @@ export default function App() {
     tool !== "torqueCalibration" &&
     tool !== "calibrationUpdate" &&
     tool !== "damiao" &&
-    tool !== "rollercanControl";
+    tool !== "rollercanControl" &&
+    tool !== "stm32Foc";
   const showConnectBar =
     tool !== "console" &&
     tool !== "zenoh" &&
@@ -259,7 +268,8 @@ export default function App() {
     tool !== "liftApi" &&
     tool !== "config" &&
     tool !== "canalyzer" &&
-    tool !== "dfu";
+    tool !== "dfu" &&
+    tool !== "stm32Foc";
 
   return (
     <Layout className={`app-shell app-shell--${tool}`}>
@@ -347,6 +357,8 @@ export default function App() {
             <DamiaoMotorPanel connected={connected} />
           ) : tool === "rollercanControl" ? (
             <RollerCanControlPanel connected={connected} />
+          ) : tool === "stm32Foc" ? (
+            <Stm32FocPanel />
           ) : tool === "dfu" ? (
             <DfuPanel onBusyChange={setDfuBusy} />
           ) : tool === "authenticity" ? (
@@ -491,6 +503,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
         </header>
 
         <ToolSection title={t("catMotorControl")} hint={t("catMotorControlHint")}>
+          <ToolCard
+            title={t("toolStm32Foc")}
+            desc={t("toolStm32FocDesc")}
+            tag="CANopen · PDO"
+            accent="cyan"
+            onClick={() => onPick("stm32Foc")}
+          />
           <ToolCard
             title={t("toolControl")}
             desc={t("toolControlDesc")}

@@ -1,0 +1,131 @@
+.app-shell--stm32Foc .app-content {
+  display: flex;
+  padding: 0;
+  overflow: hidden;
+  flex-direction: column;
+}
+
+.foc-workspace {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.foc-connection.app-command-dock {
+  flex: 0 0 auto;
+  margin: 0 22px 16px;
+}
+
+.foc-interface { width: 140px; }
+.foc-data-rate { width: 112px; }
+
+.foc-motor-layout {
+  display: grid;
+  grid-template-columns: 288px minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.foc-sidebar {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)), #0d1016;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.foc-sidebar__inventory {
+  padding: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.foc-sidebar__heading,
+.foc-device__title {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.foc-sidebar__heading { margin-bottom: 8px; }
+
+.foc-device.ant-list-item {
+  cursor: pointer;
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  border: 1px solid transparent;
+}
+
+.foc-device.ant-list-item:hover { background: rgba(255, 255, 255, 0.035); }
+.foc-device.ant-list-item:focus-visible { outline: 2px solid #e75b2b; outline-offset: 2px; }
+.foc-device.ant-list-item[aria-disabled="true"] { cursor: default; opacity: 0.65; }
+.foc-device.ant-list-item.foc-device--selected {
+  background: rgba(231, 91, 43, 0.16);
+  border-color: rgba(231, 91, 43, 0.72);
+}
+
+.foc-device__body { width: 100%; min-width: 0; }
+.foc-device__title { margin-bottom: 5px; }
+.foc-device__heartbeat { color: #8a93a3; font-size: 11px; margin-top: 5px; font-variant-numeric: tabular-nums; }
+.foc-manual { margin-top: 10px; }
+.foc-manual .ant-input-number { width: 90px; }
+.foc-sidebar__footer { flex: 0 0 auto; border-top: 1px solid #262b35; padding: 12px; }
+
+.foc-detail {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 22px 22px;
+  overflow: auto;
+}
+
+.foc-selection-empty { display: grid; min-height: 370px; place-items: center; }
+.foc-device-header__row { display: flex; justify-content: space-between; gap: 12px; align-items: start; flex-wrap: wrap; }
+.foc-refresh { margin-left: auto; }
+.foc-identity { display: flex; flex-wrap: wrap; gap: 5px 14px; font-size: 12px; overflow-wrap: anywhere; }
+.foc-live-table { font-variant-numeric: tabular-nums; }
+.foc-live-table .ant-descriptions-item-label { width: 23%; }
+.foc-live-table .ant-descriptions-item-content { overflow-wrap: anywhere; }
+.foc-mode-row { width: 100%; }
+.foc-mode-row .ant-segmented { max-width: 100%; }
+.foc-mode-row .ant-segmented-group { flex-wrap: wrap; }
+.foc-divider.ant-divider { margin: 12px 0; }
+.foc-control-error { margin-bottom: 12px; }
+
+.foc-field { color: #8a93a3; font-size: 12px; min-width: 0; }
+.foc-field > div:first-child { margin-bottom: 2px; }
+.foc-field .ant-input-number { width: 140px; }
+.foc-parameter-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.foc-parameter-fields .ant-input-number { width: 100%; }
+.foc-settings-actions { margin-top: 14px; }
+
+.foc-hint { margin: 12px 0 0 !important; font-size: 12px; line-height: 1.7; }
+.foc-protocol-hint { font-size: 12px; }
+.foc-phase { color: #9aa4b2; font-size: 12px; overflow-wrap: anywhere; margin-top: 12px; }
+
+.foc-events { max-height: 240px; overflow: auto; font-size: 12px; margin-top: 10px; }
+.foc-events > div { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 8px; padding-block: 5px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); overflow-wrap: anywhere; }
+.foc-events time { color: #9aa4b2; font-variant-numeric: tabular-nums; }
+.foc-events__error { color: #ff7875; }
+
+@media (max-width: 900px) {
+  .foc-connection.app-command-dock { margin: 0 16px 16px; }
+  .foc-motor-layout { grid-template-columns: 250px minmax(0, 1fr); }
+  .foc-detail { padding: 0 16px 20px; }
+}
+
+@media (max-width: 700px) {
+  .foc-motor-layout { grid-template-columns: 1fr; grid-template-rows: minmax(150px, 35%) minmax(0, 1fr); }
+  .foc-sidebar { border-right: 0; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+  .foc-detail { padding: 0 16px 20px; }
+}

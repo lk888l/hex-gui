@@ -405,6 +405,36 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
+  stm32Foc: [
+    {
+      title: { en: "1 · Connect and select a heartbeat node", zh: "1 · 连接并选择心跳节点" },
+      body: {
+        en: "Choose the interface and current FD data rate in the top bar, connect, then select a heartbeat node in the left device list. The firmware defaults to node 1 at 1 Mbit/s arbitration and 5 Mbit/s data. Discovery only listens; selecting a node does not initialize or enable it. SocketCAN timing is configured externally.",
+        zh: "在顶部选择接口和当前 FD 数据段速率，连接后从左侧设备列表选择心跳节点。固件默认节点 1、仲裁段 1 Mbit/s、数据段 5 Mbit/s。发现只监听报文，选择节点不会初始化或使能；SocketCAN 位时序需在系统中配置。",
+      },
+    },
+    {
+      title: { en: "2 · Calibrate and initialize", zh: "2 · 校准与初始化" },
+      body: {
+        en: "For an uncalibrated motor, run Calibrate and save: it rotates the motor for about seven seconds and polls the calibration result before saving. Select the mode and limits, then initialize. Initialization disables the bridge, reads identity and status, prepares targets and configures PDOs; it leaves the motor disabled.",
+        zh: "首次使用未校准电机时，执行「校准并保存」：电机会转动约 7 秒，程序轮询校准结果，成功后保存。选择模式和限值后执行初始化：撤销功率输出、读取身份与状态、准备目标并配置 PDO。初始化完成后仍不使能。",
+      },
+    },
+    {
+      title: { en: "3 · View feedback and send PDO targets", zh: "3 · 查看反馈并发送 PDO 目标" },
+      body: {
+        en: "The detail view follows Motor Control: switch Display between numeric values and charts, then use the mode and target controls below. Enable waits for the 6 → 7 → F handshake. Rust sends RPDOs every 10 ms independently of display refresh. Position uses rev, velocity rev/s and torque a current-limit ratio in permille; MIT uses rev, rev/s and Nm in a complete 20-byte FD frame.",
+        zh: "详情沿用 Motor Control：显示区可切换数值和曲线，下方控制区选择模式并发送目标。使能等待 6 → 7 → F 握手。Rust 每 10 ms 发送 RPDO，与界面刷新独立。位置单位 rev、速度 rev/s，力矩为电流上限千分比；MIT 使用 rev、rev/s、Nm，以 20 字节 FD 帧完整更新。",
+      },
+    },
+    {
+      title: { en: "4 · Stop and recover", zh: "4 · 停止与恢复" },
+      body: {
+        en: "Halt retains enable and command streaming. Quick stop decelerates using the configured rate. Disable removes bridge power and returns to Pre-operational. Resolve a fault cause before explicit fault reset. Switching nodes stops the previous session; Disconnect, Back and closing the window also stop it. A heartbeat node silent for three seconds is shown offline and returns online on its next heartbeat.",
+        zh: "Halt 保持使能并持续发令；Quick stop 按设置的减速度停止；失能撤销功率输出并回到 Pre-operational。故障原因处理后再显式复位。切换节点会停止旧会话，断开、返回工具列表和关闭窗口也会停止。节点超过 3 秒无心跳显示离线，重新收到心跳后恢复在线。",
+      },
+    },
+  ],
   rollercanControl: [
     {
       title: { en: "1 · Connect and discover", zh: "1 · 连接并发现" },

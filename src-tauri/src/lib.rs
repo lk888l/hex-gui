@@ -32,6 +32,9 @@ mod smartknob;
 mod state;
 mod stm32_can_dfu;
 mod stm32_can_profiles;
+mod stm32_foc;
+mod stm32_foc_commands;
+mod stm32_foc_discovery;
 mod torque_calibration;
 mod unified_smartknob;
 mod zenoh_arm;
@@ -166,6 +169,13 @@ fn begin_extension_safe_shutdown<R: tauri::Runtime>(
     tauri::async_runtime::spawn(async move {
         let state = app_handle.state::<AppState>();
         let cleanup = async {
+            if let Err(error) = app_handle
+                .state::<stm32_foc_commands::FocRuntime>()
+                .disconnect()
+                .await
+            {
+                log::warn!("G431 FOC shutdown: {error}");
+            }
             match tokio::time::timeout(LIFT_CLOSE_STOP_BUDGET, commands::stop_lift_session(&state))
                 .await
             {
@@ -220,6 +230,7 @@ pub fn run() {
         .manage(dfu_gate::DfuMutationGate::default())
         .manage(hpm_dfu::DfuState::default())
         .manage(stm32_can_dfu::CanDfuState::default())
+        .manage(stm32_foc_commands::FocRuntime::default())
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if close_phase.load(Ordering::SeqCst) == SHUTDOWN_COMPLETE {
@@ -230,6 +241,10 @@ pub fn run() {
                     .app_handle()
                     .state::<AppState>()
                     .extension_runtime_active()
+                    || window
+                        .app_handle()
+                        .state::<stm32_foc_commands::FocRuntime>()
+                        .is_active()
                 {
                     request_extension_safe_close(window.clone(), &close_phase);
                 } else {
@@ -238,6 +253,21 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            stm32_foc_commands::stm32_foc_connect,
+            stm32_foc_commands::stm32_foc_disconnect,
+            stm32_foc_commands::stm32_foc_list_devices,
+            stm32_foc_commands::stm32_foc_select_node,
+            stm32_foc_commands::stm32_foc_forget_offline,
+            stm32_foc_commands::stm32_foc_get_state,
+            stm32_foc_commands::stm32_foc_initialize,
+            stm32_foc_commands::stm32_foc_calibrate,
+            stm32_foc_commands::stm32_foc_enable,
+            stm32_foc_commands::stm32_foc_set_target,
+            stm32_foc_commands::stm32_foc_halt,
+            stm32_foc_commands::stm32_foc_quick_stop,
+            stm32_foc_commands::stm32_foc_disable,
+            stm32_foc_commands::stm32_foc_reset_fault,
+            stm32_foc_commands::stm32_foc_save,
             commands::connect,
             commands::disconnect,
             commands::is_connected,

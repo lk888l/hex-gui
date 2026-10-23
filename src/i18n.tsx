@@ -8,6 +8,11 @@ export type Lang = "en" | "zh";
 type Entry = { en: string; zh: string };
 
 const STRINGS = {
+  toolStm32Foc: { en: "G431 FOC Motor", zh: "G431 FOC 电机" },
+  toolStm32FocDesc: {
+    en: "Initialize, calibrate and control stm32g431-foc-canfd motors with CANopen PDOs.",
+    zh: "通过 CANopen PDO 初始化、校准和控制 stm32g431-foc-canfd 电机。",
+  },
   // ConnectBar
   bus: { en: "Bus", zh: "总线" },
   ourNid: { en: "Our NID", zh: "本机 NID" },
