@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Alert, Card, Collapse, Descriptions, Empty, Segmented, Space, Table, Tag, Typography } from "antd";
 import ReactECharts from "echarts-for-react";
-import type { El05ExperimentData, El05ExperimentStatus } from "../el05Api";
+import type { El05ExperimentData, El05ExperimentStatus, El05Protocol } from "../el05Api";
+import { LEGACY_HISTORY_KEY, readWorkspaceHistory, writeWorkspaceHistory } from "../motorWorkspaceHistory";
 import { analyzeExperiment, deriveExperimentSamples, EL05_TORQUE_UNIT, experimentTorqueLimitNm, staticFrictionPasses } from "../el05Experiment";
 import { LEGACY_VELOCITY_ANALYSIS_NOTE, normalizeExperimentFeedbackVelocity } from "../el05Velocity";
 import { feedbackVelocityBits } from "../el05Protocol";
@@ -16,7 +17,7 @@ export interface ExperimentRecord {
   source_samples: number;
   reduced: boolean;
 }
-export const HISTORY_KEY = "hexmeow.el05.pendulum-history.v2";
+export const HISTORY_KEY = LEGACY_HISTORY_KEY;
 const HISTORY_BUDGET = 1_350_000; // UTF-16 localStorage: roughly 2.7 MB, including JSON metadata.
 
 /** Preserve endpoints and the whole time span when reducing a plot/archive. */
@@ -45,12 +46,9 @@ function isAnalysis(value: unknown): value is ExperimentAnalysis {
         && typeof metric.unit === "string" && (metric.value === null || Number.isFinite(metric.value))
         && (metric.digits == null || (Number.isInteger(metric.digits) && metric.digits >= 0 && metric.digits <= 8))));
 }
-export function loadRecords(): ExperimentRecord[] {
+export function loadRecords(protocol: El05Protocol = "Native"): ExperimentRecord[] {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw || raw.length > HISTORY_BUDGET + 1000) return [];
-    const records = JSON.parse(raw);
-    if (!Array.isArray(records)) return [];
+    const records = readWorkspaceHistory(protocol, localStorage) as ExperimentRecord[];
     return records.filter(record => record?.id && record?.data?.status?.config && Array.isArray(record?.data?.samples) && isAnalysis(record?.analysis)).slice(0, 6).flatMap(record => {
       try {
         const parsed = parseExperimentValue(record);
@@ -61,7 +59,7 @@ export function loadRecords(): ExperimentRecord[] {
   } catch { return []; }
 }
 /** A small, explicit localStorage budget avoids growing browser storage without bounds. */
-export function storeRecords(records: ExperimentRecord[]): { records: ExperimentRecord[]; persisted: boolean } {
+export function storeRecords(records: ExperimentRecord[], protocol: El05Protocol = "Native"): { records: ExperimentRecord[]; persisted: boolean } {
   let compact = records.slice(0, 6);
   let serialized = JSON.stringify(compact);
   for (let attempt = 0; serialized.length > HISTORY_BUDGET && attempt < 8; attempt++) {
@@ -71,10 +69,10 @@ export function storeRecords(records: ExperimentRecord[]): { records: Experiment
     serialized = JSON.stringify(compact);
   }
   if (serialized.length > HISTORY_BUDGET) compact = compact.slice(0, 3);
-  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(compact)); }
+  try { writeWorkspaceHistory(protocol, compact, localStorage); }
   catch {
     compact = compact.map(record => ({ ...record, reduced: true, data: { ...record.data, samples: thin(record.data.samples, 180), commands: thin(record.data.commands, 100) } }));
-    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(compact)); }
+    try { writeWorkspaceHistory(protocol, compact, localStorage); }
     catch { return { records: compact, persisted: false }; }
   }
   return { records: compact, persisted: true };

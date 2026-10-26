@@ -351,9 +351,8 @@ bus with the right settings:
 - **Other → EL05 Motor Control** — independent RobStride EDULITE 05 workspace
   based on the EL05 manual dated 2026-09-22. Open `can0` / `socketcan:can0`
   on Linux or `gs_usb` with Classic CAN at 1 Mbps, scan, and select the motor.
-  Select **RobStride native · 29-bit** or **Standard MIT compatible · 11-bit**
-  before connecting. The native protocol's default host ID is `253` (`0xFD`);
-  standard MIT learns the reply CAN ID from the selected motor. The workspace
+  This app uses the native 29-bit protocol with default host ID `253` (`0xFD`).
+  Use the separate **Standard MIT Motor Control** app for 11-bit MIT motors. The workspace
   owns its connection; SocketCAN timing is configured by the operating system.
 
   The native protocol provides all five motor modes: motion control / MIT (`0`, position,
@@ -386,8 +385,19 @@ bus with the right settings:
   parameter-read failures are shown explicitly, since older EL05 firmware may
   not implement every optional parameter in the current manual.
 
-  **Standard MIT compatibility** supports the MIT-only motor on `can0`, ID `1`.
-  Select the 11-bit protocol, connect, then scan or select ID `1` manually.
+- **Other → Standard MIT Motor Control** — a separate app for 11-bit standard-frame
+  motors with the EL05-compatible MIT format. It has its own connection, IPC
+  commands, operator heartbeat, CAN ownership and experiment history. Native
+  EL05 and standard MIT cannot open the physical adapter simultaneously.
+  The window starts in **Manual control & monitor**; pendulum tests,
+  zero-gravity hold and device settings have separate tabs. Connect, then scan
+  or enter a motor ID (the tested compatible motor is `can0`, ID `1`).
+  Reply CAN IDs are learned automatically. Both apps use the same validated
+  control/experiment engine and window components.
+
+  Choose **Basic MIT compatible** for MIT-only motors. The fixed ranges are
+  position ±12.57 rad, velocity ±50 rad/s, torque ±6 Nm, Kp 0–500 and Kd 0–5.
+  This profile does not send vendor configuration or dictionary commands.
   Discovery and stopped sampling send `FF FF FF FF FF FF FF FD`; motion uses
   p16/v12/Kp12/Kd12/torque12 standard frames at a target 500 Hz during control
   and recording, with stopped idle sampling at 50 Hz. Scanning is unavailable
@@ -408,7 +418,7 @@ bus with the right settings:
   the motor's coordinate zero and invalidates old references. Place the pendulum
   vertically down and capture its reference again before starting compensation.
 
-  Standard MIT does not require UID/version queries, parameter reads or watchdog
+  Basic MIT does not require UID/version queries, parameter reads or watchdog
   configuration. Unsupported native settings and non-MIT modes are unavailable.
   Iq, voltage and dictionary velocity stay missing; current-based regressions
   cannot be produced by this protocol. Position, velocity, drive-estimated torque,
@@ -422,6 +432,39 @@ bus with the right settings:
   session retries only Stop at 250 ms intervals and requires an explicit successful
   Stop before enabling again. Device watchdog behavior is not established;
   process death or a disconnected CAN cable cannot guarantee torque removal.
+
+  Choose **EL05 manual extensions (260922)** only for a drive implementing
+  the MIT chapter, printed pp.51–56, of
+  [EL05使用说明书260922.pdf](smb://nas.local/home/archive/docs/robstride/rob-stride_release/产品资料/EL05/EL05使用说明书260922.pdf).
+  In addition to basic MIT control, this profile provides:
+
+  - Position CSP (manual mode `1`): standard CAN ID `0x100 | motor_id`,
+    little-endian float position and maximum speed. Set position-mode current
+    limits separately with `0x7018`. Enabling reads absolute `0x7019` first,
+    requiring firmware that supports dictionary reads.
+  - Velocity (manual mode `2`): CAN ID `0x200 | motor_id`, little-endian float
+    speed and current limit. Acceleration is not part of this control frame.
+  - Fault reset (`FF FF FF FF FF FF FF FB`), stopped motor-ID changes
+    (`… new_id FA`, new IDs `0..127`), parameter saving (`… FF F8`) and
+    reporting (`… 00/01 F9`). ID changes probe for conflicts, require a UID
+    acknowledgement and fresh Stop replies at the new address; an unconfirmed
+    write clears selection so the operator can scan and recover.
+  - Parameter reads/writes at CAN IDs `0x300 | motor_id` / `0x400 | motor_id`,
+    with readback verification. Mode parameter `0x7005` maps to MIT `0`,
+    position CSP `1`, velocity `2`, unlike native CSP mode `5`. Dictionary
+    and UID replies are handled separately from motion feedback.
+
+  Save, reporting and parameter access require firmware **1.0.5.0.4** or a
+  compatible implementation. Synchronous reads and configuration edits require
+  stopped control; unsupported commands report their failures. Writes are
+  volatile until **Save parameters** acknowledges. UID acknowledgements require
+  distinct motor and motion-reply IDs. The MIT chapter defines no version query.
+  Protocol switching and host-ID writes are not exposed in this app.
+
+  MIT and native EL05 histories are kept separately. Existing MIT runs in the
+  former shared history are copied before that source can be overwritten.
+  Import JSON in the matching protocol's app; both retain CSV/JSON/report
+  exports, frozen analysis and run comparisons.
 
   The production-session hardware check is:
 

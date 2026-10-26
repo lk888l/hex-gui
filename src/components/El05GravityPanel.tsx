@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Alert, Button, Card, Descriptions, InputNumber, Popconfirm, Space, Tag, Typography } from "antd";
-import { el05Api, type El05GravityCompensationConfig, type El05State } from "../el05Api";
+import { el05Api, type MotorWorkspaceApi, type El05GravityCompensationConfig, type El05State } from "../el05Api";
 import { pendulumModel } from "../el05Experiment";
 import { gravityReadiness, type GravityBlocker } from "../el05Gravity";
 
@@ -17,7 +17,8 @@ const DEFAULT_SETTINGS: Settings = {
   ramp_s: 1,
 };
 
-export function El05GravityPanel({ state, zh, busy, stopping, run, stop, setZero }: {
+export function El05GravityPanel({ state, zh, busy, stopping, run, stop, setZero, api = el05Api }: {
+  api?: MotorWorkspaceApi;
   state: El05State | null;
   zh: boolean;
   busy: boolean;
@@ -73,10 +74,10 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop, setZero
         onChange={value => { if (value != null) setSettings(previous => ({ ...previous, [key]: value / factor })); }} />
     </label>
   );
-  const capture = () => run(() => el05Api.captureGravityReference(), tr("下垂参考已记录", "Downward reference captured"));
+  const capture = () => run(() => api.captureGravityReference(), tr("下垂参考已记录", "Downward reference captured"));
   const start = () => {
     if (!reference || !canStart) return;
-    return run(() => el05Api.startGravityCompensation({ ...settings, reference_id: reference.id }),
+    return run(() => api.startGravityCompensation({ ...settings, reference_id: reference.id }),
       tr("零重力保持已开启", "Zero-gravity hold started"));
   };
 

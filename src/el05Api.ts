@@ -32,6 +32,7 @@ export interface El05Version {
 
 export interface El05State {
   protocol: El05Protocol;
+  manual_extensions?: boolean;
   reply_id: number | null;
   status_reliable: boolean;
   connected: boolean;
@@ -210,26 +211,39 @@ export interface El05ParameterValue {
   kind: "Float" | "U8" | "U16" | "U32";
 }
 
+// Common UI components receive an API explicitly; each app keeps its own IPC
+// namespace, connection, operator heartbeat and shutdown path.
+function motorApi(prefix: "el05" | "mit") {
+  return {
+    connect: (iface: string, hostId: number, manualExtensions = false) => invoke<El05State>(`${prefix}_connect`, { iface, hostId, manualExtensions }),
+    disconnect: () => invoke<void>(`${prefix}_disconnect`),
+    getState: () => invoke<El05State | null>(`${prefix}_get_state`),
+    scan: () => invoke<El05Device[]>(`${prefix}_scan`),
+    selectMotor: (motorId: number) => invoke<El05State>(`${prefix}_select_motor`, { motorId }),
+    setMode: (mode: El05Mode) => invoke<El05State>(`${prefix}_set_mode`, { mode }),
+    enable: () => invoke<void>(`${prefix}_enable`),
+    stop: () => invoke<void>(`${prefix}_stop`),
+    clearFault: () => invoke<void>(`${prefix}_clear_fault`),
+    setZero: () => invoke<void>(`${prefix}_set_zero`),
+    changeId: (newId: number) => invoke<El05Identity>(`${prefix}_change_id`, { newId }),
+    sendTarget: (target: El05Target, repeat: boolean) => invoke<void>(`${prefix}_send_target`, { target, repeat }),
+    readParameter: (index: number) => invoke<El05ParameterValue>(`${prefix}_read_parameter`, { index }),
+    writeParameter: (index: number, value: number) => invoke<void>(`${prefix}_write_parameter`, { index, value }),
+    startExperiment: (config: El05ExperimentConfig) => invoke<void>(`${prefix}_start_experiment`, { config }),
+    experimentData: (afterSequence?: number) => invoke<El05ExperimentData>(`${prefix}_experiment_data`, { afterSequence }),
+    captureGravityReference: () => invoke<El05GravityReference>(`${prefix}_capture_gravity_reference`),
+    startGravityCompensation: (config: El05GravityCompensationConfig) => invoke<void>(`${prefix}_start_gravity_compensation`, { config }),
+    stopGravityCompensation: () => invoke<void>(`${prefix}_stop_gravity_compensation`),
+  };
+}
 export const el05Api = {
-  connect: (iface: string, hostId: number, protocol: El05Protocol = "Native") => invoke<El05State>("el05_connect", { iface, hostId, protocol }),
-  disconnect: () => invoke<void>("el05_disconnect"),
-  getState: () => invoke<El05State | null>("el05_get_state"),
-  scan: () => invoke<El05Device[]>("el05_scan"),
-  selectMotor: (motorId: number) => invoke<El05State>("el05_select_motor", { motorId }),
-  setMode: (mode: El05Mode) => invoke<El05State>("el05_set_mode", { mode }),
-  enable: () => invoke<void>("el05_enable"),
-  stop: () => invoke<void>("el05_stop"),
-  clearFault: () => invoke<void>("el05_clear_fault"),
-  setZero: () => invoke<void>("el05_set_zero"),
+  ...motorApi("el05"),
   readIdentity: () => invoke<El05Identity>("el05_read_identity"),
-  changeId: (newId: number) => invoke<El05Identity>("el05_change_id", { newId }),
   readVersion: () => invoke<El05Version>("el05_read_version"),
-  sendTarget: (target: El05Target, repeat: boolean) => invoke<void>("el05_send_target", { target, repeat }),
-  readParameter: (index: number) => invoke<El05ParameterValue>("el05_read_parameter", { index }),
-  writeParameter: (index: number, value: number) => invoke<void>("el05_write_parameter", { index, value }),
-  startExperiment: (config: El05ExperimentConfig) => invoke<void>("el05_start_experiment", { config }),
-  experimentData: (afterSequence?: number) => invoke<El05ExperimentData>("el05_experiment_data", { afterSequence }),
-  captureGravityReference: () => invoke<El05GravityReference>("el05_capture_gravity_reference"),
-  startGravityCompensation: (config: El05GravityCompensationConfig) => invoke<void>("el05_start_gravity_compensation", { config }),
-  stopGravityCompensation: () => invoke<void>("el05_stop_gravity_compensation"),
+};
+export type MotorWorkspaceApi = ReturnType<typeof motorApi>;
+export const standardMitApi = {
+  ...motorApi("mit"),
+  saveParameters: () => invoke<El05Identity>("mit_save_parameters"),
+  setReporting: (enabled: boolean) => invoke<void>("mit_set_reporting", { enabled }),
 };

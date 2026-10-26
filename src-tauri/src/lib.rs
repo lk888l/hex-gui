@@ -18,6 +18,7 @@ mod diag;
 mod dto;
 mod el05;
 mod el05_commands;
+mod standard_mit_commands;
 mod friction_calibration;
 mod hopea3;
 mod hpm_dfu;
@@ -282,6 +283,27 @@ pub fn run() {
             el05_commands::el05_capture_gravity_reference,
             el05_commands::el05_start_gravity_compensation,
             el05_commands::el05_stop_gravity_compensation,
+            standard_mit_commands::mit_connect,
+            standard_mit_commands::mit_disconnect,
+            standard_mit_commands::mit_get_state,
+            standard_mit_commands::mit_scan,
+            standard_mit_commands::mit_select_motor,
+            standard_mit_commands::mit_set_mode,
+            standard_mit_commands::mit_enable,
+            standard_mit_commands::mit_stop,
+            standard_mit_commands::mit_clear_fault,
+            standard_mit_commands::mit_set_zero,
+            standard_mit_commands::mit_change_id,
+            standard_mit_commands::mit_send_target,
+            standard_mit_commands::mit_read_parameter,
+            standard_mit_commands::mit_write_parameter,
+            standard_mit_commands::mit_save_parameters,
+            standard_mit_commands::mit_set_reporting,
+            standard_mit_commands::mit_start_experiment,
+            standard_mit_commands::mit_experiment_data,
+            standard_mit_commands::mit_capture_gravity_reference,
+            standard_mit_commands::mit_start_gravity_compensation,
+            standard_mit_commands::mit_stop_gravity_compensation,
             commands::list_devices,
             authenticity::authenticity_inspect,
             authenticity::authenticity_verify_online,

@@ -18,6 +18,7 @@ pub enum CanOwner {
     Manager,
     Analyzer,
     El05,
+    StandardMit,
     DfuDiscovery,
     DfuUpdate,
 }
@@ -28,6 +29,7 @@ impl fmt::Display for CanOwner {
             Self::Manager => "the normal CAN session",
             Self::Analyzer => "CAN Analyzer",
             Self::El05 => "EL05 Motor Control",
+            Self::StandardMit => "Standard MIT Motor Control",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
         })

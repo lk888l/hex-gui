@@ -429,10 +429,16 @@ const STRINGS = {
   tagDamiaoProtocol: { en: "DAMIAO CAN 1 Mbps", zh: "达妙 CAN 1 Mbps" },
   toolEl05: { en: "RobStride EL05 Motor Control", zh: "RobStride EL05 电机控制" },
   toolEl05Desc: {
-    en: "Native RobStride and standard MIT control, pendulum performance tests, zero-gravity hold and live feedback.",
-    zh: "支持 RobStride 原生与标准帧 MIT 电机控制、摆锤性能测试、零重力保持和实时反馈。",
+    en: "Native RobStride control, pendulum performance tests, zero-gravity hold and live feedback.",
+    zh: "支持 RobStride 原生电机控制、摆锤性能测试、零重力保持和实时反馈。",
   },
-  tagEl05Protocol: { en: "RobStride / MIT · 1 Mbps", zh: "RobStride / MIT · 1 Mbps" },
+  tagEl05Protocol: { en: "RobStride 29-bit · 1 Mbps", zh: "RobStride 29 位 · 1 Mbps" },
+  toolStandardMit: { en: "Standard MIT Motor Control", zh: "标准 MIT 电机控制" },
+  toolStandardMitDesc: {
+    en: "Independent 11-bit MIT control, live charts, pendulum tests, gravity support and optional EL05 manual settings.",
+    zh: "独立的 11 位 MIT 控制，支持实时曲线、摆锤测试、重力补偿及可选的 EL05 手册扩展设置。",
+  },
+  tagStandardMitProtocol: { en: "Standard MIT 11-bit · 1 Mbps", zh: "标准 MIT 11 位 · 1 Mbps" },
   toolUnitreeServo: { en: "Unitree J288 / S288 Servo Control", zh: "宇树 J288 / S288 舵机控制" },
   toolUnitreeServoDesc: {
     en: "Independent USB serial control, hybrid motion targets, live feedback, communication settings and local profiles.",

@@ -422,7 +422,7 @@ async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
     )
     .await;
     if let Err(error) = crate::el05_commands::stop_session(state, false).await {
-        failures.push(format!("EL05: {error}"));
+        failures.push(error);
     }
     if let Err(error) = crate::unitree_commands::stop_session(state, false).await {
         failures.push(format!("Unitree servo: {error}"));
@@ -472,7 +472,7 @@ async fn force_stop_extension_runtime_locked(state: &AppState) {
         log::warn!("Unitree servo stop during forced close failed: {error}");
     }
     if let Err(error) = crate::el05_commands::stop_session(state, true).await {
-        log::warn!("EL05 stop during forced close failed: {error}");
+        log::warn!("CAN motor workspace stop during forced close failed: {error}");
     }
     if let Err(error) = stop_rollercan_control(state, true).await {
         log::warn!(

@@ -34,6 +34,51 @@ fn frame(id: u8, payload: [u8; 8]) -> Result<CanFrame> {
         .map_err(|error| anyhow!("build standard MIT frame: {error}"))
 }
 
+/// Manual 260922 pp.52–55: six FF bytes, an argument, then the opcode.
+pub(super) fn configuration_frame(id: u8, argument: u8, opcode: u8) -> Result<CanFrame> {
+    let mut payload = [0xff; 8];
+    payload[6] = argument;
+    payload[7] = opcode;
+    frame(id, payload)
+}
+
+pub(super) fn parameter_frame(id: u8, index: u16, value: Option<f64>) -> Result<CanFrame> {
+    super::parameter_kind(index)?;
+    let mut payload = [0; 8];
+    payload[..2].copy_from_slice(&index.to_le_bytes());
+    if let Some(value) = value {
+        payload[4..].copy_from_slice(&super::encode_parameter(index, value)?);
+    }
+    CanFrame::new_data(
+        CanId::Standard((if value.is_some() { 4 } else { 3 } << 8) | u16::from(id)),
+        &payload,
+    )
+    .map_err(|error| anyhow!("build standard MIT parameter frame: {error}"))
+}
+
+pub(super) fn extended_target_frame(id: u8, target: El05Target) -> Result<CanFrame> {
+    super::validate_target(target)?;
+    let (mode, first, second) = match target {
+        El05Target::Mit { .. } => return target_frame(id, target),
+        El05Target::PositionCsp {
+            position_rad,
+            velocity_rad_s,
+            ..
+        } => (1, position_rad, velocity_rad_s),
+        El05Target::Velocity {
+            velocity_rad_s,
+            current_limit_a,
+            ..
+        } => (2, velocity_rad_s, current_limit_a),
+        _ => bail!("standard MIT supports MIT, position CSP and velocity modes"),
+    };
+    let mut payload = [0; 8];
+    payload[..4].copy_from_slice(&(first as f32).to_le_bytes());
+    payload[4..].copy_from_slice(&(second as f32).to_le_bytes());
+    CanFrame::new_data(CanId::Standard((mode << 8) | u16::from(id)), &payload)
+        .map_err(|error| anyhow!("build standard MIT target frame: {error}"))
+}
+
 pub(super) fn stop_frame(id: u8) -> Result<CanFrame> {
     frame(id, STOP)
 }
@@ -103,7 +148,7 @@ pub(super) fn decode_feedback(frame: &CanFrame) -> Option<Feedback> {
     let data: [u8; 8] = frame.data().try_into().ok()?;
     // The fixed enable/disable sentinels are never normal telemetry. Avoid
     // broad temperature/state plausibility filters: those hide real faults.
-    if data == STOP || data == ENABLE || data == ZERO {
+    if data[..6] == [0xff; 6] && matches!(data[7], 0xf8..=0xfe | 0x01) {
         return None;
     }
     Some(Feedback {
@@ -219,5 +264,70 @@ mod tests {
         ] {
             assert!(decode_feedback(&invalid).is_none());
         }
+    }
+
+    #[test]
+    fn manual_extension_vectors_match_the_documented_examples() {
+        let position = extended_target_frame(
+            0x7f,
+            El05Target::PositionCsp {
+                position_rad: 5.0,
+                velocity_rad_s: 5.0,
+                current_limit_a: 2.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(position.id(), CanId::Standard(0x17f));
+        assert_eq!(position.data(), [0, 0, 0xa0, 0x40, 0, 0, 0xa0, 0x40]);
+        let velocity = extended_target_frame(
+            0x7f,
+            El05Target::Velocity {
+                velocity_rad_s: 5.0,
+                current_limit_a: 2.0,
+                acceleration_rad_s2: 1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(velocity.id(), CanId::Standard(0x27f));
+        assert_eq!(velocity.data(), [0, 0, 0xa0, 0x40, 0, 0, 0, 0x40]);
+        let read = parameter_frame(0x7f, 0x7005, None).unwrap();
+        assert_eq!(read.id(), CanId::Standard(0x37f));
+        assert_eq!(read.data(), [5, 0x70, 0, 0, 0, 0, 0, 0]);
+        let write = parameter_frame(0x7f, 0x7029, Some(1.0)).unwrap();
+        assert_eq!(write.id(), CanId::Standard(0x47f));
+        assert_eq!(write.data(), [0x29, 0x70, 0, 0, 1, 0, 0, 0]);
+        for (argument, opcode) in [
+            (0, 0xfc),
+            (1, 0xfc),
+            (2, 0xfc),
+            (0xff, 0xfb),
+            (1, 0xfa),
+            (0xff, 0xf8),
+            (1, 0xf9),
+        ] {
+            let command = configuration_frame(0x7f, argument, opcode).unwrap();
+            assert_eq!(command.id(), CanId::Standard(0x7f));
+            assert_eq!(
+                command.data(),
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, argument, opcode]
+            );
+            assert!(decode_feedback(&command).is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_extended_targets_and_read_only_writes_are_rejected() {
+        assert!(extended_target_frame(
+            1,
+            El05Target::Velocity {
+                velocity_rad_s: f64::INFINITY,
+                current_limit_a: 2.0,
+                acceleration_rad_s2: 1.0,
+            }
+        )
+        .is_err());
+        assert!(extended_target_frame(1, El05Target::Current { current_a: 1.0 }).is_err());
+        assert!(parameter_frame(1, 0x7019, Some(0.0)).is_err());
+        assert!(parameter_frame(1, 0x7029, Some(1.5)).is_err());
     }
 }

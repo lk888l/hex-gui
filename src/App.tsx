@@ -26,7 +26,8 @@ import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
 import { El05MotorPanel } from "./components/El05MotorPanel";
-import { el05Api } from "./el05Api";
+import { StandardMitMotorPanel } from "./components/StandardMitMotorPanel";
+import { el05Api, standardMitApi } from "./el05Api";
 import { UnitreeServoPanel } from "./components/UnitreeServoPanel";
 import { unitreeApi } from "./unitreeApi";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
@@ -54,6 +55,7 @@ type Tool =
   | "damiao"
   | "rollercanControl"
   | "el05"
+  | "standardMit"
   | "unitreeServo";
 
 const DEVICE_POLL_MS = 700;
@@ -167,6 +169,8 @@ export default function App() {
     try {
       if (tool === "el05") {
         await el05Api.disconnect();
+      } else if (tool === "standardMit") {
+        await standardMitApi.disconnect();
       } else if (tool === "unitreeServo") {
         await unitreeApi.disconnect();
       } else if (tool === "dfu") {
@@ -240,6 +244,7 @@ export default function App() {
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
     el05: { title: t("toolEl05"), desc: t("toolEl05Desc") },
+    standardMit: { title: t("toolStandardMit"), desc: t("toolStandardMitDesc") },
     unitreeServo: { title: t("toolUnitreeServo"), desc: t("toolUnitreeServoDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
@@ -267,6 +272,7 @@ export default function App() {
     tool !== "damiao" &&
     tool !== "rollercanControl" &&
     tool !== "el05" &&
+    tool !== "standardMit" &&
     tool !== "unitreeServo";
   const showConnectBar =
     tool !== "console" &&
@@ -277,6 +283,7 @@ export default function App() {
     tool !== "canalyzer" &&
     tool !== "dfu" &&
     tool !== "el05" &&
+    tool !== "standardMit" &&
     tool !== "unitreeServo";
 
   return (
@@ -368,6 +375,8 @@ export default function App() {
             <RollerCanControlPanel connected={connected} />
           ) : tool === "el05" ? (
             <El05MotorPanel />
+          ) : tool === "standardMit" ? (
+            <StandardMitMotorPanel />
           ) : tool === "unitreeServo" ? (
             <UnitreeServoPanel onBusyChange={setUnitreeBusy} />
           ) : tool === "dfu" ? (
@@ -661,6 +670,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                     tag={t("tagEl05Protocol")}
                     accent="cyan"
                     onClick={() => onPick("el05")}
+                  />
+                  <ToolCard
+                    title={t("toolStandardMit")}
+                    desc={t("toolStandardMitDesc")}
+                    tag={t("tagStandardMitProtocol")}
+                    accent="blue"
+                    onClick={() => onPick("standardMit")}
                   />
                   <ToolCard
                     title={t("toolRollerCanControl")}

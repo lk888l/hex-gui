@@ -87,26 +87,57 @@ pub async fn el05_connect(
     can_gate: State<'_, CanTransportGate>,
     iface: String,
     host_id: u8,
-    protocol: Option<El05Protocol>,
+) -> CmdResult<El05State> {
+    connect_workspace(
+        &state,
+        &can_gate,
+        iface,
+        host_id,
+        El05Protocol::Native,
+        false,
+    )
+    .await
+}
+
+pub(crate) fn workspace_slot(
+    state: &AppState,
+    protocol: El05Protocol,
+) -> &tokio::sync::Mutex<Option<Arc<El05Session>>> {
+    match protocol {
+        El05Protocol::Native => &state.el05,
+        El05Protocol::StandardMit => &state.standard_mit,
+    }
+}
+
+pub(crate) async fn connect_workspace(
+    state: &AppState,
+    can_gate: &CanTransportGate,
+    iface: String,
+    host_id: u8,
+    protocol: El05Protocol,
+    manual_extensions: bool,
 ) -> CmdResult<El05State> {
     let _lifecycle = state.extension_op.lock().await;
     if state.shutdown_requested.load(Ordering::Acquire) {
         return Err("Application is shutting down".into());
     }
-    let mut guard = state.el05.lock().await;
+    let mut guard = workspace_slot(state, protocol).lock().await;
     if guard.is_some() {
-        return Err("EL05 is already connected".into());
+        return Err("Motor workspace is already connected".into());
     }
     // Mark before opening: native close must wait for this lifecycle lock.
     state
         .extension_runtime_active
         .store(true, Ordering::Release);
-    let permit = can_gate.try_acquire(CanOwner::El05)?;
+    let permit = can_gate.try_acquire(match protocol {
+        El05Protocol::Native => CanOwner::El05,
+        El05Protocol::StandardMit => CanOwner::StandardMit,
+    })?;
     let bus = crate::backend::open_classic_1m_bus(&iface, permit)
         .await
         .map_err(error)?;
     let bus = crate::backend::protect_feature_bus(bus);
-    let app = El05Session::start_with_protocol(bus, host_id, protocol.unwrap_or_default())
+    let app = El05Session::start_with_options(bus, host_id, protocol, manual_extensions)
         .await
         .map_err(error)?;
     if state.shutdown_requested.load(Ordering::Acquire) {
@@ -124,7 +155,28 @@ pub async fn el05_connect(
 /// Retain the session on a failed manual stop so the operator can retry.
 /// On native close, always terminate its workers after the bounded stop.
 pub(crate) async fn stop_session(state: &AppState, force: bool) -> CmdResult<()> {
-    let mut guard = state.el05.lock().await;
+    let native = stop_workspace(state, El05Protocol::Native, force).await;
+    let mit = stop_workspace(state, El05Protocol::StandardMit, force).await;
+    let mut errors = Vec::new();
+    if let Err(error) = native {
+        errors.push(format!("EL05: {error}"));
+    }
+    if let Err(error) = mit {
+        errors.push(format!("Standard MIT: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+pub(crate) async fn stop_workspace(
+    state: &AppState,
+    protocol: El05Protocol,
+    force: bool,
+) -> CmdResult<()> {
+    let mut guard = workspace_slot(state, protocol).lock().await;
     let Some(app) = guard.as_ref() else {
         return Ok(());
     };
@@ -140,14 +192,23 @@ pub(crate) async fn stop_session(state: &AppState, force: bool) -> CmdResult<()>
 
 #[tauri::command]
 pub async fn el05_disconnect(state: State<'_, AppState>) -> CmdResult<()> {
+    disconnect_workspace(&state, El05Protocol::Native).await
+}
+
+pub(crate) async fn disconnect_workspace(
+    state: &AppState,
+    protocol: El05Protocol,
+) -> CmdResult<()> {
     let _lifecycle = state.extension_op.lock().await;
-    let had_session = state.el05.lock().await.is_some();
-    stop_session(&state, false).await?;
+    let had_session = workspace_slot(state, protocol).lock().await.is_some();
+    stop_workspace(state, protocol, false).await?;
     if had_session {
         // CAN ownership is exclusive, but the independent USB serial servo
         // may still need the native close cleanup path.
         state.extension_runtime_active.store(
-            state.unitree_servo.lock().await.is_some(),
+            state.unitree_servo.lock().await.is_some()
+                || state.el05.lock().await.is_some()
+                || state.standard_mit.lock().await.is_some(),
             Ordering::Release,
         );
     }

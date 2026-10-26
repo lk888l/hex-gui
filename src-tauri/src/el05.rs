@@ -1,6 +1,6 @@
 //! RobStride EL05 native and standard-frame MIT control (manual 260922).
 //! Both wire protocols share telemetry, experiments, gravity compensation and
-//! the host control lifecycle. Optional native dictionary services stay native.
+//! the host control lifecycle. Manual extensions are opt-in for compatible drives.
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -18,6 +18,9 @@ pub mod experiment;
 pub mod gravity;
 #[path = "el05_mit.rs"]
 mod mit;
+#[path = "el05_mit_extensions.rs"]
+mod mit_extensions;
+use mit_extensions::{mit_mode_from_raw, mit_mode_raw, observe_standard_extension};
 #[cfg(test)]
 #[path = "el05_standard_tests.rs"]
 mod standard_tests;
@@ -153,6 +156,7 @@ pub struct El05Version {
 #[derive(Clone, Debug, Serialize)]
 pub struct El05State {
     pub protocol: El05Protocol,
+    pub manual_extensions: bool,
     /// Standard MIT replies use a configured host CAN ID, learned on attach.
     pub reply_id: Option<u16>,
     /// Compatible MIT firmware may leave the raw status at zero while moving.
@@ -203,6 +207,7 @@ impl El05State {
     fn with_protocol(host_id: u8, connected: bool, protocol: El05Protocol) -> Self {
         Self {
             protocol,
+            manual_extensions: false,
             reply_id: None,
             status_reliable: protocol == El05Protocol::Native,
             connected,
@@ -342,6 +347,7 @@ impl Shared {
 struct Inner {
     bus: Arc<dyn CanBus>,
     protocol: El05Protocol,
+    manual_extensions: bool,
     state: StdMutex<Shared>,
     gate: Mutex<()>,
     running: AtomicBool,
@@ -361,6 +367,14 @@ impl El05Session {
         host_id: u8,
         protocol: El05Protocol,
     ) -> Result<Arc<Self>> {
+        Self::start_with_options(bus, host_id, protocol, false).await
+    }
+    pub async fn start_with_options(
+        bus: Arc<dyn CanBus>,
+        host_id: u8,
+        protocol: El05Protocol,
+        manual_extensions: bool,
+    ) -> Result<Arc<Self>> {
         if protocol == El05Protocol::Native && host_id == 0xFE {
             bail!("EL05 host ID 254 is reserved for discovery replies");
         }
@@ -374,6 +388,7 @@ impl El05Session {
         let inner = Arc::new(Inner {
             bus,
             protocol,
+            manual_extensions: protocol == El05Protocol::StandardMit && manual_extensions,
             state: StdMutex::new(Shared {
                 view: El05State::with_protocol(host_id, true, protocol),
                 devices: BTreeMap::new(),
@@ -426,6 +441,7 @@ impl El05Session {
         let state = self.inner.state.lock().unwrap();
         let now = Instant::now();
         let mut view = state.view.clone();
+        view.manual_extensions = self.inner.manual_extensions;
         view.experiment = state.experiment.status.clone();
         view.gravity_compensation = state.gravity.status.clone();
         if view.gravity_compensation.active {
@@ -535,6 +551,9 @@ impl El05Session {
         }
         self.inner.stop_locked(false).await?;
         if self.inner.protocol == El05Protocol::StandardMit {
+            if self.inner.manual_extensions {
+                return self.set_mode_locked(El05Mode::Mit).await;
+            }
             self.inner.state.lock().unwrap().mode_confirmed = true;
             return Ok(self.snapshot());
         }
@@ -556,12 +575,30 @@ impl El05Session {
     }
     async fn set_mode_locked(&self, mode: El05Mode) -> Result<El05State> {
         self.inner.selected()?;
-        if self.inner.protocol == El05Protocol::StandardMit && mode != El05Mode::Mit {
-            bail!("standard MIT compatibility supports MIT control only");
+        if self.inner.protocol == El05Protocol::StandardMit {
+            if mode != El05Mode::Mit && !self.inner.manual_extensions {
+                bail!("enable EL05 manual extensions to use position or velocity mode");
+            }
+            if !matches!(
+                mode,
+                El05Mode::Mit | El05Mode::PositionCsp | El05Mode::Velocity
+            ) {
+                bail!("standard MIT supports MIT, position CSP and velocity modes");
+            }
         }
         self.inner.stop_locked(false).await?;
         if self.inner.protocol == El05Protocol::StandardMit {
+            if self.inner.manual_extensions {
+                let (id, _, _) = self.inner.selected()?;
+                let sequence = self.inner.state.lock().unwrap().feedback_sequence;
+                self.inner.state.lock().unwrap().mode_confirmed = false;
+                self.inner
+                    .send(mit::configuration_frame(id, mit_mode_raw(mode)?, 0xfc)?)
+                    .await?;
+                self.inner.wait_status(sequence, 0, true).await?;
+            }
             let mut s = self.inner.state.lock().unwrap();
+            s.view.mode = mode;
             s.mode_confirmed = true;
             s.receive_error = None;
             s.view.last_error = None;
@@ -701,7 +738,7 @@ impl El05Session {
             let _ = self.inner.stop_locked(false).await;
             return Err(error);
         }
-        if mode == El05Mode::Mit {
+        if mode == El05Mode::Mit || self.inner.protocol == El05Protocol::StandardMit {
             self.inner.state.lock().unwrap().target = Some(neutral);
         }
         Ok(())
@@ -717,9 +754,19 @@ impl El05Session {
         self.inner.stop_locked(false).await
     }
     pub async fn clear_fault(&self) -> Result<()> {
-        self.inner.require_native("clear fault")?;
         let _guard = self.inner.gate.lock().await;
-        self.inner.stop_locked(true).await?;
+        if self.inner.protocol == El05Protocol::StandardMit {
+            self.inner.require_manual_extensions()?;
+            self.inner.stop_locked(false).await?;
+            let (id, _, _) = self.inner.selected()?;
+            let sequence = self.inner.state.lock().unwrap().feedback_sequence;
+            self.inner
+                .send(mit::configuration_frame(id, 0xff, 0xfb)?)
+                .await?;
+            self.inner.wait_status(sequence, 0, true).await?;
+        } else {
+            self.inner.stop_locked(true).await?;
+        }
         let mut s = self.inner.state.lock().unwrap();
         s.view.fault_code = 0;
         s.view.warning_code = 0;
@@ -770,6 +817,9 @@ impl El05Session {
         result
     }
     pub async fn change_id(&self, new_id: u8) -> Result<El05Identity> {
+        if self.inner.protocol == El05Protocol::StandardMit {
+            return self.change_standard_id(new_id).await;
+        }
         self.inner.require_native("change motor ID")?;
         let _guard = self.inner.gate.lock().await;
         let (old_id, host, _) = self.inner.selected()?;
@@ -896,8 +946,12 @@ impl El05Session {
     pub async fn set_zero(&self) -> Result<()> {
         let _guard = self.inner.gate.lock().await;
         let (id, host, mode) = self.inner.selected()?;
-        if !matches!(mode, El05Mode::Mit | El05Mode::PositionCsp) {
-            bail!("EL05 mechanical zero is supported in MIT and CSP modes; switch mode first");
+        let can_zero = match self.inner.protocol {
+            El05Protocol::Native => matches!(mode, El05Mode::Mit | El05Mode::PositionCsp),
+            El05Protocol::StandardMit => matches!(mode, El05Mode::Mit | El05Mode::Velocity),
+        };
+        if !can_zero {
+            bail!("switch to MIT mode before setting mechanical zero");
         }
         if !self.inner.state.lock().unwrap().mode_confirmed {
             bail!("select the EL05 motor again before setting mechanical zero; its mode is not confirmed");
@@ -1303,18 +1357,26 @@ impl El05Session {
         let _guard = self.inner.gate.lock().await;
         if {
             let s = self.inner.state.lock().unwrap();
-            s.experiment.status.active || s.gravity.status.active
+            s.experiment.status.active
+                || s.gravity.status.active
+                || (self.inner.protocol == El05Protocol::StandardMit && (s.armed || s.safety_hold))
         } {
-            bail!("stop the EL05 experiment or gravity compensation before a synchronous parameter read");
+            bail!("confirm the motor is stopped before a synchronous parameter read during experiments, gravity compensation or MIT control");
         }
         self.inner.read_locked(index).await
     }
     pub async fn write_parameter(&self, index: u16, value: f64) -> Result<()> {
-        self.inner.require_native("parameter write")?;
+        if self.inner.protocol == El05Protocol::StandardMit {
+            self.inner.require_manual_extensions()?;
+        }
         if index == 0x7005 {
             let payload = encode_parameter(index, value)?;
-            let mode =
-                El05Mode::from_raw(payload[0]).ok_or_else(|| anyhow!("unsupported EL05 mode"))?;
+            let mode = if self.inner.protocol == El05Protocol::StandardMit {
+                mit_mode_from_raw(payload[0])
+            } else {
+                El05Mode::from_raw(payload[0])
+            }
+            .ok_or_else(|| anyhow!("unsupported motor mode"))?;
             self.set_mode(mode).await?;
             return Ok(());
         }
@@ -1511,7 +1573,13 @@ impl Inner {
     async fn reporting_locked(&self, enabled: bool) -> Result<()> {
         let (id, host, _) = self.selected()?;
         if self.protocol == El05Protocol::StandardMit {
-            // Request/reply sampling is driven by service_loop, not type-24 configuration.
+            if self.manual_extensions && (enabled || self.state.lock().unwrap().view.reporting) {
+                let sequence = self.state.lock().unwrap().feedback_sequence;
+                self.send(mit::configuration_frame(id, u8::from(enabled), 0xf9)?)
+                    .await?;
+                self.wait_status(sequence, 0, false).await?;
+                self.state.lock().unwrap().view.reporting = enabled;
+            }
             return Ok(());
         }
         self.send(frame(
@@ -1525,12 +1593,18 @@ impl Inner {
         Ok(())
     }
     async fn read_locked(&self, index: u16) -> Result<El05ParameterValue> {
-        self.require_native("parameter read")?;
+        if self.protocol == El05Protocol::StandardMit {
+            self.require_manual_extensions()?;
+        }
         parameter_kind(index)?;
         let (id, host, _) = self.selected()?;
         let (tx, rx) = oneshot::channel();
         self.state.lock().unwrap().pending = Some((id, index, tx));
-        let result = self.send(read_frame(id, host, index)?).await;
+        let request = match self.protocol {
+            El05Protocol::Native => read_frame(id, host, index)?,
+            El05Protocol::StandardMit => mit::parameter_frame(id, index, None)?,
+        };
+        let result = self.send(request).await;
         if let Err(error) = result {
             self.state.lock().unwrap().pending = None;
             return Err(error);
@@ -1573,9 +1647,15 @@ impl Inner {
         result
     }
     async fn write_locked(&self, index: u16, value: f64) -> Result<()> {
-        self.require_native("parameter write")?;
         let (id, host, _) = self.selected()?;
-        self.send(write_frame(id, host, index, value)?).await
+        let request = match self.protocol {
+            El05Protocol::Native => write_frame(id, host, index, value)?,
+            El05Protocol::StandardMit => {
+                self.require_manual_extensions()?;
+                mit::parameter_frame(id, index, Some(value))?
+            }
+        };
+        self.send(request).await
     }
     async fn write_verified_locked(&self, index: u16, value: f64) -> Result<()> {
         let expected = encode_parameter(index, value)?;
@@ -1602,7 +1682,13 @@ impl Inner {
         }
         let frames = match self.protocol {
             El05Protocol::Native => target_frames(id, host, target, limits)?,
-            El05Protocol::StandardMit => vec![mit::target_frame(id, target)?],
+            El05Protocol::StandardMit => {
+                if !self.manual_extensions {
+                    vec![mit::target_frame(id, target)?]
+                } else {
+                    vec![mit::extended_target_frame(id, target)?]
+                }
+            }
         };
         for frame in frames {
             let is_mit = matches!(target, El05Target::Mit { .. });
@@ -2151,6 +2237,12 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
 }
 
 fn observe_standard_frame(inner: &Inner, frame: CanFrame) {
+    // Parameter and UID replies share the standard-frame subscription. They
+    // must be dispatched before the packed motion decoder and never renew its
+    // feedback watchdog or add points to an experiment.
+    if observe_standard_extension(inner, &frame) {
+        return;
+    }
     let Some(feedback) = mit::decode_feedback(&frame) else {
         return;
     };

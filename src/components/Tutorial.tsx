@@ -442,6 +442,36 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
+  standardMit: [
+    {
+      title: { en: "1 · Connect a standard MIT motor", zh: "1 · 连接标准 MIT 电机" },
+      body: {
+        en: "Use the independent Standard MIT Motor Control app for 11-bit classic CAN at 1 Mbps. Open can0 / socketcan:can0 or gs_usb0. The Basic MIT profile supports drives with the EL05-compatible p16/v12/Kp12/Kd12/torque12 format and ranges ±12.57 rad, ±50 rad/s and ±6 Nm. Select EL05 manual extensions only for drives that implement manual 260922.",
+        zh: "本应用使用 1 Mbps、11 位标准帧 Classic CAN。接口支持 can0 / socketcan:can0 或 gs_usb0。「基础 MIT」适用于 EL05 兼容的 p16/v12/Kp12/Kd12/torque12 格式，量程为 ±12.57 rad、±50 rad/s 和 ±6 Nm。电机明确支持 260922 手册时再选择「EL05 手册扩展」。",
+      },
+    },
+    {
+      title: { en: "2 · Discover, select and control", zh: "2 · 扫描、选择与控制" },
+      body: {
+        en: "Scan sends Stop to IDs 0–255. Select a discovered motor or enter its decimal/hex ID. The reply CAN ID is learned automatically. Enable, edit the five MIT targets, then Send target. Velocity needs Kd > 0; fixed position with Kp > 0 resists continuous rotation. The host keeps commands streaming. Stop ends the stream and disables the motor.",
+        zh: "扫描会向 ID 0–255 发送停止帧。选择发现的电机或手动输入十进制/十六进制 ID，回复 CAN ID 自动识别。使能后编辑 MIT 五参数，再点击「发送目标」。速度目标需 Kd > 0；固定位置且 Kp > 0 会阻碍连续旋转。主机会持续发送目标；停止会结束连续发送并失能。",
+      },
+    },
+    {
+      title: { en: "3 · Monitor and test", zh: "3 · 监视与测试" },
+      body: {
+        en: "Use numeric feedback or position, speed and torque charts. Packed velocity has 12-bit resolution, about 0.02442 rad/s. Pendulum tests include passive decay, bidirectional friction calibration and performance measurements. Enter geometry and capture the downward reference before gravity-based tests or zero-gravity hold. MIT history is stored separately from native EL05 runs; CSV, JSON and reports can be exported.",
+        zh: "数值与曲线显示位置、速度、转矩和温度，速度反馈为 12 位，分辨率约 0.02442 rad/s。摆锤测试包括被动衰减、双向静摩擦标定及性能测试。重力相关测试和零重力保持需填写几何参数并测定下垂参考。MIT 历史与原生 EL05 记录分开保存，可导出 CSV、JSON 和报告。",
+      },
+    },
+    {
+      title: { en: "4 · Zero and optional settings", zh: "4 · 置零与扩展设置" },
+      body: {
+        en: "If position saturates at ±12.57 rad, stop and reset the mechanical zero, then capture a new reference. The extended profile adds mode 1 position CSP, mode 2 velocity, fault reset and ID changes. Parameter read/write, saving and reporting require firmware 1.0.5.0.4 or a compatible implementation. Writes require a stopped motor and verify readback; save parameters explicitly for persistence. Leaving the app stops its motor before releasing CAN.",
+        zh: "位置反馈停在 ±12.57 rad 端点时，先停机并重置机械零点，再重新记录下垂参考。扩展配置提供模式 1 位置 CSP、模式 2 速度、清故障与修改 ID。参数读写、保存和主动上报需固件 1.0.5.0.4 或兼容实现。参数写入需先停机并读回校验，掉电保存需手动点击「保存参数」。离开应用时会先停机再释放 CAN。",
+      },
+    },
+  ],
   el05: [
     {
       title: { en: "1 · Connect and select", zh: "1 · 连接并选择" },

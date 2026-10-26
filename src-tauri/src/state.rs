@@ -160,6 +160,8 @@ pub struct AppState {
     pub analyzer: Mutex<Option<crate::analyzer::CanAnalyzer>>,
     /// Independent RobStride EL05 application, using the native extended CAN protocol.
     pub el05: Mutex<Option<Arc<crate::el05::El05Session>>>,
+    /// Independent standard-frame MIT application, with opt-in manual extensions.
+    pub standard_mit: Mutex<Option<Arc<crate::el05::El05Session>>>,
     /// Independent Unitree J288/S288 USB serial session; never opens CAN.
     pub unitree_servo: Mutex<Option<Arc<crate::unitree_servo::ServoSession>>>,
     /// Unit RollerCAN protocol monitor attached to the manager-owned `CanBus`.

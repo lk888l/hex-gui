@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, App, Button, Card, Checkbox, Collapse, Descriptions, Input, InputNumber, Progress, Select, Space, Table, Tag, Typography } from "antd";
-import { el05Api, type El05ExperimentConfig, type El05ExperimentData, type El05ExperimentKind, type El05State } from "../el05Api";
+import { el05Api, type MotorWorkspaceApi, type El05Protocol, type El05ExperimentConfig, type El05ExperimentData, type El05ExperimentKind, type El05State } from "../el05Api";
 import { analyzeExperiment, EL05_TORQUE_LIMIT_NM, EL05_TORQUE_UNIT, experimentCsv, experimentJson, pendulumModel, staticHoldingTorquePeakNm } from "../el05Experiment";
 import { errMsg } from "../api";
 import { El05ExperimentResults, experimentReport, loadRecords, makeRecord, metricLabel, metricValue, parseExperimentJson, runKey, staticFrictionStatusText, storeRecords, thin, type ExperimentRecord } from "./El05ExperimentResults";
@@ -21,7 +21,7 @@ const KINDS: { value: El05ExperimentKind; cn: string; en: string; description: [
 const DEFAULT_CONFIG: El05ExperimentConfig = { kind: "Record", duration_s: 20, velocity_rad_s: 0.3, torque_nm: 0.3, kp: 8, kd: 0.5, center_angle_rad: 0, position_amplitude_rad: 0.25, frequency_start_hz: 0.1, frequency_end_hz: 2, gravity_compensation: false, disturbance_torque_nm: 0.15, max_temperature_c: 0, torque_ramp_rate_nm_s: 0.02, max_excursion_rad: 3 * Math.PI / 180, motion_threshold_rad: 0.15 * Math.PI / 180, motion_confirm_s: 0.04, settle_time_s: 0.5 };
 const POSITION_KINDS: El05ExperimentKind[] = ["StaticTorque", "PositionSteps", "SineSweep", "Impedance", "ThermalHold", "SlowTriangle"];
 
-export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refresh, onWorkingChange }: { state: El05State | null; zh: boolean; busy: boolean; coordinateRevision: number; refresh: () => Promise<void>; onWorkingChange: (working: boolean) => void }) {
+export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refresh, onWorkingChange, api = el05Api, protocol = "Native" }: { state: El05State | null; zh: boolean; busy: boolean; coordinateRevision: number; refresh: () => Promise<void>; onWorkingChange: (working: boolean) => void; api?: MotorWorkspaceApi; protocol?: El05Protocol }) {
   const tr = (cn: string, en: string) => zh ? cn : en;
   const { message } = App.useApp();
   const [working, setWorkingState] = useState(false);
@@ -36,7 +36,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   const [zeroMeasured, setZeroMeasured] = useState(false);
   const [live, setLive] = useState<El05ExperimentData | null>(null);
   const liveRef = useRef<El05ExperimentData | null>(null);
-  const [records, setRecords] = useState<ExperimentRecord[]>(loadRecords);
+  const [records, setRecords] = useState<ExperimentRecord[]>(() => loadRecords(protocol));
   const recordsRef = useRef(records);
   const [selected, setSelected] = useState("live");
   const [runName, setRunName] = useState("");
@@ -52,7 +52,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
 
   const persist = useCallback((next: ExperimentRecord[]) => {
     try {
-      const stored = storeRecords(next);
+      const stored = storeRecords(next, protocol);
       recordsRef.current = stored.records;
       setRecords(stored.records);
       if (!stored.persisted) message.warning(zh ? "本地历史存储不可用，记录暂存在内存中，请导出 JSON。" : "Local history storage is unavailable. Records remain in memory; export JSON to keep them.");
@@ -61,7 +61,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
       setRecords(recordsRef.current);
       message.warning(zh ? "浏览器本地历史存储已满，本次记录暂存在内存中，请导出 JSON。" : "Local history storage is full. This record remains in memory; export JSON to keep it.");
     }
-  }, [message, zh]);
+  }, [message, zh, protocol]);
   const archive = useCallback((data: El05ExperimentData) => {
     if (!data.samples.length || !data.status.config) return;
     const id = runKey(data);
@@ -92,10 +92,10 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   const readData = useCallback(async (full = false) => {
     const generation = pollGeneration.current;
     const current = liveRef.current;
-    let chunk = await el05Api.experimentData(full ? undefined : current?.samples[current.samples.length - 1]?.sequence);
-    if (!full && current && runKey(current) !== runKey(chunk) && chunk.status.config) chunk = await el05Api.experimentData();
+    let chunk = await api.experimentData(full ? undefined : current?.samples[current.samples.length - 1]?.sequence);
+    if (!full && current && runKey(current) !== runKey(chunk) && chunk.status.config) chunk = await api.experimentData();
     if (generation === pollGeneration.current) acceptChunk(chunk);
-  }, [acceptChunk]);
+  }, [acceptChunk, api]);
   useEffect(() => {
     if (!state?.connected || !state.attached) return;
     let disposed = false;
@@ -161,7 +161,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
     if (!data?.samples.length) return;
     const result = selected === "live" ? analyzeExperiment(data) : selectedRecord!.analysis;
     const name = selected === "live" ? runName.trim() || `${zh ? KINDS.find(item => item.value === data.status.config?.kind)?.cn : data.status.config?.kind}` : selectedRecord!.name;
-    const stem = `el05-${data.motor_id}-${data.status.config?.kind}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    const stem = `${protocol === "StandardMit" ? "mit" : "el05"}-${data.motor_id}-${data.status.config?.kind}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
     if (format === "csv") download(`${stem}.csv`, experimentCsv(data), "text/csv;charset=utf-8");
     else if (format === "md") download(`${stem}-report.md`, experimentReport(data, result, name, zh, selectedRecord?.reduced), "text/markdown;charset=utf-8");
     else {
@@ -179,7 +179,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
         archive(liveRef.current);
       }
       pollGeneration.current++;
-      await el05Api.startExperiment({ ...config, pendulum: { mass_kg: mass, length_m: lengthMm / 1000, arm_mass_kg: armMass,
+      await api.startExperiment({ ...config, pendulum: { mass_kg: mass, length_m: lengthMm / 1000, arm_mass_kg: armMass,
         extra_inertia_kg_m2: extraInertia, downward_zero_rad: downwardZero, zero_measured: zeroMeasured } });
       setSelected("live");
       await refresh();
@@ -189,7 +189,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   };
   const stop = async () => {
     setStopping(true);
-    try { await el05Api.stop(); await refresh(); await readData(); }
+    try { await api.stop(); await refresh(); await readData(); }
     catch (error) { message.error(errMsg(error)); }
     finally { setStopping(false); }
   };
@@ -198,6 +198,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
     setWorking(true);
     try {
       const parsed = parseExperimentJson(await file.text());
+      if ((parsed.data.protocol ?? "Native") !== protocol) throw new Error(tr("记录协议与当前应用不符，请在对应电机应用中导入。", "This run belongs to the other motor protocol. Import it in that motor app."));
       const record = makeRecord(parsed.data, file.name.replace(/\.json$/i, ""));
       record.id = `import-${Date.now()}`;
       if (parsed.analysis) record.analysis = parsed.analysis;
@@ -240,9 +241,9 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
       </div>
       <Typography.Paragraph className="el05-experiment-description">{kind.description[zh ? 0 : 1]}</Typography.Paragraph>
       {staticHoldingPeak !== null && <Alert showIcon type={staticHoldingPeak > EL05_TORQUE_LIMIT_NM ? "warning" : "info"}
-        message={tr(`目标角最大理论保持力矩 ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · EL05 峰值 ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`, `Peak target holding torque ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · EL05 peak ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`)}
+        message={tr(`目标角最大理论保持力矩 ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · ${protocol === "StandardMit" ? "协议量程上限" : "EL05 峰值"} ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`, `Peak target holding torque ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · ${protocol === "StandardMit" ? "Protocol torque range" : "EL05 peak"} ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`)}
         description={staticHoldingPeak > EL05_TORQUE_LIMIT_NM
-          ? tr("部分目标角的重力保持需求已超过 EL05 峰值，请减小摆角或负载。理论力矩与驱动反馈均为 Nm；驱动实际设置的力矩上限还可能更低。", "Some target angles require more gravity holding torque than the EL05 peak. Reduce the angle or load. Theory and drive feedback both use Nm; the configured drive limit may be lower.")
+          ? tr("部分目标角的重力保持需求已超过控制量程，请减小摆角或负载。理论力矩与驱动反馈均为 Nm；驱动实际设置的力矩上限还可能更低。", "Some target angles require more gravity holding torque than the control range. Reduce the angle or load. Theory and drive feedback both use Nm; the configured drive limit may be lower.")
           : tr("理论值按负载几何计算，单位与驱动反馈相同；还需为摩擦和运动加减速留出力矩余量。", "The theoretical value uses load geometry in the same unit as drive feedback. Allow torque margin for friction and acceleration.")} />}
       <div className="el05-target__fields">
         <label className="el05-field el05-experiment-name"><Typography.Text type="secondary">{tr("本组名称（可选）", "Run name (optional)")}</Typography.Text><Input disabled={locked} value={runName} onChange={event => setRunName(event.target.value)} maxLength={100} placeholder={zh ? kind.cn : kind.en} /></label>

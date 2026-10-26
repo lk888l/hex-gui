@@ -18,6 +18,7 @@ struct MitOnlyBus {
     stop_replies: AtomicBool,
     reply_id: AtomicU16,
     flags: AtomicU8,
+    motor_id: AtomicU8,
     position: StdMutex<f64>,
     zero_due: StdMutex<Option<Instant>>,
     zero_applies: AtomicBool,
@@ -34,6 +35,7 @@ impl MitOnlyBus {
             stop_replies: AtomicBool::new(true),
             reply_id: AtomicU16::new(reply_id),
             flags: AtomicU8::new(0),
+            motor_id: AtomicU8::new(1),
             position: StdMutex::new(-2.9333),
             zero_due: StdMutex::new(None),
             zero_applies: AtomicBool::new(true),
@@ -46,7 +48,7 @@ impl MitOnlyBus {
         CanFrame::new_data(
             CanId::Standard(self.reply_id.load(Ordering::Acquire)),
             &[
-                1,
+                self.motor_id.load(Ordering::Acquire),
                 (p >> 8) as u8,
                 p as u8,
                 0x80,
@@ -128,7 +130,7 @@ impl CanBus for MitOnlyBus {
         {
             return Err(invalid());
         }
-        if id != 1 {
+        if id != u16::from(self.motor_id.load(Ordering::Acquire)) {
             // Only Stop scans may address another drive.
             return if request.data() == STOP {
                 Ok(())
@@ -576,4 +578,339 @@ async fn standard_zero_failed_readback_requires_reselection() {
     assert!(app.enable().await.is_err());
     assert!(app.capture_gravity_reference().await.is_err());
     app.shutdown().await.unwrap();
+}
+
+/// Independent manual-extension drive: parameter, configuration and float
+/// target replies are deliberately distinct from packed motion telemetry.
+struct ManualMitBus {
+    basic: Arc<MitOnlyBus>,
+    mode: AtomicU8,
+    parameters: StdMutex<BTreeMap<u16, [u8; 4]>>,
+    apply_writes: AtomicBool,
+    acknowledge_id: AtomicBool,
+    reporting: AtomicBool,
+    occupied: AtomicU8,
+}
+
+impl ManualMitBus {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            basic: MitOnlyBus::new(0xfd),
+            mode: AtomicU8::new(0),
+            parameters: StdMutex::new(BTreeMap::from([(0x700b, 6.0f32.to_le_bytes())])),
+            apply_writes: AtomicBool::new(true),
+            acknowledge_id: AtomicBool::new(true),
+            reporting: AtomicBool::new(false),
+            occupied: AtomicU8::new(0xff),
+        })
+    }
+    fn reply(&self, id: u16, data: [u8; 8]) {
+        let _ = self
+            .basic
+            .tx
+            .send(CanFrame::new_data(CanId::Standard(id), &data).unwrap());
+    }
+    fn uid(&self, id: u8) {
+        self.reply(
+            u16::from(id),
+            [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl CanBus for ManualMitBus {
+    async fn send(&self, request: CanFrame) -> std::result::Result<(), CanIoError> {
+        let CanId::Standard(id) = request.id() else {
+            panic!("manual MIT sent an extended frame");
+        };
+        let source = id as u8;
+        let motor = self.basic.motor_id.load(Ordering::Acquire);
+        let data: [u8; 8] = request.data().try_into().unwrap();
+        if source != motor {
+            self.basic.sent.lock().unwrap().push(request);
+            if source == self.occupied.load(Ordering::Acquire) && data == STOP {
+                self.reply(0xfd, [source, 0x80, 0, 0x80, 8, 0, 1, 0x33]);
+            }
+            return Ok(());
+        }
+        let ty = id >> 8;
+        if matches!(ty, 1..=4) {
+            self.basic.sent.lock().unwrap().push(request);
+            match ty {
+                3 => {
+                    let index = u16::from_le_bytes([data[0], data[1]]);
+                    let value = match index {
+                        0x7005 => [self.mode.load(Ordering::Acquire), 0, 0, 0],
+                        0x7019 => (*self.basic.position.lock().unwrap() as f32).to_le_bytes(),
+                        _ => self
+                            .parameters
+                            .lock()
+                            .unwrap()
+                            .get(&index)
+                            .copied()
+                            .unwrap_or([0; 4]),
+                    };
+                    let mut response = data;
+                    response[4..].copy_from_slice(&value);
+                    self.reply(id, response);
+                }
+                4 => {
+                    let index = u16::from_le_bytes([data[0], data[1]]);
+                    if self.apply_writes.load(Ordering::Acquire) {
+                        self.parameters
+                            .lock()
+                            .unwrap()
+                            .insert(index, data[4..].try_into().unwrap());
+                    }
+                    self.reply(id, data);
+                }
+                _ => self.basic.feedback(),
+            }
+            return Ok(());
+        }
+        if data[..6] == [0xff; 6] && data != STOP && data != ENABLE && data != ZERO {
+            self.basic.sent.lock().unwrap().push(request);
+            match data[7] {
+                0xfc => {
+                    self.mode.store(data[6], Ordering::Release);
+                    self.basic.feedback();
+                }
+                0xfb => {
+                    self.basic.flags.store(0, Ordering::Release);
+                    self.basic.feedback();
+                }
+                0xfa => {
+                    self.basic.motor_id.store(data[6], Ordering::Release);
+                    if self.acknowledge_id.load(Ordering::Acquire) {
+                        self.uid(data[6]);
+                    }
+                }
+                0xf8 => self.uid(motor),
+                0xf9 => {
+                    self.reporting.store(data[6] != 0, Ordering::Release);
+                    self.basic.feedback();
+                }
+                _ => panic!("unexpected MIT configuration"),
+            }
+            return Ok(());
+        }
+        self.basic.send(request).await
+    }
+    async fn subscribe(
+        &self,
+        filter: CanFilter,
+    ) -> std::result::Result<Box<dyn CanRx>, CanIoError> {
+        self.basic.subscribe(filter).await
+    }
+    fn capabilities(&self) -> CanCapabilities {
+        self.basic.capabilities()
+    }
+}
+
+async fn manual_attached() -> (Arc<ManualMitBus>, Arc<El05Session>) {
+    let bus = ManualMitBus::new();
+    let app = El05Session::start_with_options(bus.clone(), 0xfd, El05Protocol::StandardMit, true)
+        .await
+        .unwrap();
+    app.attach(1).await.unwrap();
+    (bus, app)
+}
+
+#[tokio::test]
+async fn manual_modes_use_csp_one_and_float_targets_and_require_stopped_parameter_access() {
+    let (bus, app) = manual_attached().await;
+    assert!(app.snapshot().manual_extensions);
+    assert!(app.set_mode(El05Mode::PositionPp).await.is_err());
+    app.set_mode(El05Mode::PositionCsp).await.unwrap();
+    assert_eq!(bus.mode.load(Ordering::Acquire), 1);
+    app.enable().await.unwrap();
+    app.send_target(
+        El05Target::PositionCsp {
+            position_rad: 5.0,
+            velocity_rad_s: 5.0,
+            current_limit_a: 1.0,
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(app.read_parameter(0x7019).await.is_err());
+    app.stop().await.unwrap();
+    app.set_mode(El05Mode::Velocity).await.unwrap();
+    app.enable().await.unwrap();
+    app.send_target(
+        El05Target::Velocity {
+            velocity_rad_s: 5.0,
+            current_limit_a: 2.0,
+            acceleration_rad_s2: 1.0,
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    app.stop().await.unwrap();
+    app.write_parameter(0x7005, 1.0).await.unwrap();
+    assert_eq!(app.snapshot().mode, El05Mode::PositionCsp);
+    assert_eq!(app.read_parameter(0x7005).await.unwrap().value, 1.0);
+    let sent = bus.basic.sent.lock().unwrap();
+    assert!(sent.iter().any(|frame| frame.id() == CanId::Standard(0x101)
+        && frame.data() == [0, 0, 0xa0, 0x40, 0, 0, 0xa0, 0x40]));
+    assert!(sent.iter().any(|frame| frame.id() == CanId::Standard(0x201)
+        && frame.data() == [0, 0, 0xa0, 0x40, 0, 0, 0, 0x40]));
+    drop(sent);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_parameter_write_is_verified_and_extension_responses_never_renew_motion_feedback() {
+    let (bus, app) = manual_attached().await;
+    app.write_parameter(0x700b, 3.0).await.unwrap();
+    assert_eq!(app.read_parameter(0x700b).await.unwrap().value, 3.0);
+    bus.apply_writes.store(false, Ordering::Release);
+    assert!(app
+        .write_parameter(0x700b, 4.0)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("verification failed"));
+    assert!(app.write_parameter(0x7019, 0.0).await.is_err());
+    {
+        let _guard = app.inner.gate.lock().await;
+        let sequence = app.snapshot().feedback_sequence;
+        observe_frame(
+            &app.inner,
+            CanFrame::new_data(CanId::Standard(0x301), &[1, 0x70, 0, 0, 0, 0, 0, 0]).unwrap(),
+        );
+        observe_frame(
+            &app.inner,
+            CanFrame::new_data(CanId::Standard(0x401), &[1, 0x70, 0, 0, 0, 0, 0, 0]).unwrap(),
+        );
+        let identity = app
+            .inner
+            .standard_uid_command(1, 1, 0xff, 0xf8)
+            .await
+            .unwrap();
+        assert_eq!(identity.uid, "123456789abcdef0");
+        assert_eq!(sequence, app.snapshot().feedback_sequence);
+    }
+    bus.basic.stop_replies.store(false, Ordering::Release);
+    assert!(app.stop().await.is_err());
+    let before = bus.basic.sent.lock().unwrap().len();
+    assert!(app.read_parameter(0x700b).await.is_err());
+    assert!(app.write_parameter(0x700b, 2.0).await.is_err());
+    assert!(bus.basic.sent.lock().unwrap()[before..]
+        .iter()
+        .all(|frame| frame.data() == STOP));
+    bus.basic.stop_replies.store(true, Ordering::Release);
+    app.stop().await.unwrap();
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_configuration_confirms_fault_reset_save_and_reporting_and_cleans_up() {
+    let (bus, app) = manual_attached().await;
+    bus.basic.flags.store(0x20, Ordering::Release);
+    bus.basic.feedback();
+    wait_until(&app, |state| state.fault_bits != 0).await;
+    app.clear_fault().await.unwrap();
+    assert_eq!(app.snapshot().fault_bits, 0);
+    let identity = app.save_parameters().await.unwrap();
+    assert_eq!(identity.motor_id, 1);
+    app.set_reporting(true).await.unwrap();
+    assert!(app.snapshot().reporting && bus.reporting.load(Ordering::Acquire));
+    app.enable().await.unwrap();
+    assert!(app.save_parameters().await.is_err());
+    assert!(app.set_reporting(false).await.is_err());
+    app.shutdown().await.unwrap();
+    assert!(!bus.reporting.load(Ordering::Acquire));
+    assert!(!bus.basic.physical_enabled.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn manual_id_change_rejects_collisions_then_selects_the_acknowledged_new_address() {
+    let (bus, app) = manual_attached().await;
+    bus.occupied.store(2, Ordering::Release);
+    assert!(app
+        .change_id(2)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("already responds"));
+    assert_eq!(bus.basic.motor_id.load(Ordering::Acquire), 1);
+    bus.occupied.store(0xff, Ordering::Release);
+    app.change_id(2).await.unwrap();
+    let state = app.snapshot();
+    assert_eq!(state.motor_id, Some(2));
+    assert!(state.online && !state.enabled && !state.streaming);
+    assert_eq!(state.identity.unwrap().uid, "123456789abcdef0");
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_id_change_with_lost_acknowledgement_clears_the_old_selection() {
+    let (bus, app) = manual_attached().await;
+    bus.acknowledge_id.store(false, Ordering::Release);
+    assert!(app.change_id(2).await.is_err());
+    assert_eq!(bus.basic.motor_id.load(Ordering::Acquire), 2);
+    assert_eq!(app.snapshot().motor_id, None);
+    assert!(!app.snapshot().attached && !app.snapshot().enabled);
+    assert!(app.enable().await.is_err());
+    app.attach(2).await.unwrap();
+    assert!(app.snapshot().online);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn basic_profile_rejects_extended_save_and_reporting_before_transmitting() {
+    let (bus, app) = attached(1).await;
+    let _guard = app.inner.gate.lock().await;
+    assert!(app.inner.require_manual_extensions().is_err());
+    assert!(!app.snapshot().manual_extensions);
+    let before = bus.sent.lock().unwrap().len();
+    drop(_guard);
+    assert!(app.save_parameters().await.is_err());
+    assert!(app.set_reporting(true).await.is_err());
+    assert!(bus.sent.lock().unwrap()[before..]
+        .iter()
+        .all(|frame| frame.data() == STOP));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_workspace_disconnect_cannot_stop_the_other_app_and_native_close_stops_mit() {
+    let (bus, app) = attached(0xfd).await;
+    let state = crate::state::AppState::default();
+    *state.standard_mit.lock().await = Some(app.clone());
+    app.enable().await.unwrap();
+    crate::el05_commands::disconnect_workspace(&state, El05Protocol::Native)
+        .await
+        .unwrap();
+    assert!(app.snapshot().connected && app.snapshot().enabled);
+    assert!(state.standard_mit.lock().await.is_some());
+    crate::el05_commands::stop_session(&state, false)
+        .await
+        .unwrap();
+    assert!(state.standard_mit.lock().await.is_none());
+    assert!(!app.snapshot().connected);
+    assert!(!bus.physical_enabled.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn independent_workspace_retains_a_failed_stop_for_retry_and_force_close_releases_it() {
+    let (bus, app) = attached(0xfd).await;
+    let state = crate::state::AppState::default();
+    *state.standard_mit.lock().await = Some(app.clone());
+    bus.stop_replies.store(false, Ordering::Release);
+    let error = crate::el05_commands::stop_session(&state, false)
+        .await
+        .unwrap_err();
+    assert!(error.contains("Standard MIT"));
+    assert!(state.standard_mit.lock().await.is_some());
+    assert!(app.snapshot().connected);
+    assert!(crate::el05_commands::stop_session(&state, true)
+        .await
+        .is_err());
+    assert!(state.standard_mit.lock().await.is_none());
+    assert!(!app.snapshot().connected);
 }
