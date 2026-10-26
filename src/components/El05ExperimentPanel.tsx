@@ -46,7 +46,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   const pollGeneration = useRef(0);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; pollGeneration.current++; }; }, []);
-  useEffect(() => { setZeroMeasured(false); }, [state?.connected, state?.motor_id, state?.identity?.uid, coordinateRevision]);
+  useEffect(() => { setZeroMeasured(false); }, [state?.connected, state?.protocol, state?.motor_id, state?.identity?.uid, coordinateRevision]);
   const runNameRef = useRef(runName);
   runNameRef.current = runName;
 

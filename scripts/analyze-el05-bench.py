@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline EL05 bench analysis; never opens CAN or changes motor settings.
+"""Offline EL05 native/standard-MIT bench analysis; never opens CAN.
 
 Usage: python3 scripts/analyze-el05-bench.py /tmp/el05-bench-can3-20261015 [--png]
 Standard-library JSON/SVG output needs no plotting packages. --png additionally
@@ -82,8 +82,32 @@ def nearest_feedback(samples, instant):
     return min(candidates, key=lambda sample: abs(sample["t_s"] - instant))
 
 
+def protocol_metadata(data):
+    # Legacy recordings predate the protocol field and use native RobStride.
+    protocol = data.get("protocol", "Native")
+    if protocol not in ("Native", "StandardMit"):
+        raise ValueError(f"unsupported motor protocol: {protocol!r}")
+    velocity_bits = 12 if protocol == "StandardMit" else 16
+    if data.get("feedback_velocity_bits", velocity_bits) != velocity_bits:
+        raise ValueError("feedback velocity bit width does not match protocol")
+    return {"protocol": protocol, "can_identifier_bits": 11 if protocol == "StandardMit" else 29,
+            "feedback_velocity_bits": velocity_bits,
+            "feedback_velocity_resolution_rad_s": 100 / ((1 << velocity_bits) - 1)}
+
+
+def feedback_groups(samples, protocol):
+    """Keep native type-number keys; standard MIT has no native type field."""
+    groups = {}
+    for sample in samples:
+        label = "standard_mit" if protocol == "StandardMit" else str((sample["can_id"] >> 24) & 31)
+        groups.setdefault(label, []).append(sample)
+    return {label: groups[label] for label in sorted(groups, key=int if protocol == "Native" else str)}
+
+
 def analyze(path):
     data = json.loads(path.read_text())
+    metadata = protocol_metadata(data)
+    protocol = metadata["protocol"]
     samples = data["samples"]
     if len(samples) < 2:
         raise ValueError(f"{path}: fewer than two feedback samples")
@@ -106,7 +130,10 @@ def analyze(path):
                          if s.get("current_a") is not None and s.get("current_age_ms") is not None and s["current_age_ms"] <= 100]
         windows.append({
             "window_s": [lo, hi], "frames": len(selected), "command_rad_s": command,
-            "feedback_mean_rad_s": feedback, "feedback_by_message_type": {str(ty): {"frames": sum((s["can_id"] >> 24) & 31 == ty for s in selected), "mean_rad_s": mean(s["velocity_rad_s"] for s in selected if (s["can_id"] >> 24) & 31 == ty)} for ty in sorted({(s["can_id"] >> 24) & 31 for s in selected})}, "feedback_std_rad_s": statistics.pstdev(s["velocity_rad_s"] for s in selected),
+            "feedback_mean_rad_s": feedback,
+            "feedback_by_message_type": {label: {"frames": len(group), "mean_rad_s": mean(s["velocity_rad_s"] for s in group)}
+                                         for label, group in feedback_groups(selected, protocol).items()},
+            "feedback_std_rad_s": statistics.pstdev(s["velocity_rad_s"] for s in selected),
             "position_regression": fit, "feedback_minus_position_rad_s": feedback - fit["velocity_rad_s"],
             "feedback_minus_position_percent": 100 * (feedback - fit["velocity_rad_s"]) / abs(fit["velocity_rad_s"]) if abs(fit["velocity_rad_s"]) > 0.05 else None,
             "command_minus_position_rad_s": command - fit["velocity_rad_s"] if command is not None else None,
@@ -124,10 +151,13 @@ def analyze(path):
         command_rate["submission_latency_ms"] = stats((c["completed_t_s"] - c["t_s"]) * 1000 for c in commands)
         command_rate["sequence_gaps"] = sum(max(0, b["sequence"] - a["sequence"] - 1) for a, b in zip(commands, commands[1:]))
     valid_updates = [u for u in updates if u["t_s"] >= 0]
+    groups = feedback_groups(samples, protocol)
     result = {
-        "file": path.name, "motor_id": data.get("motor_id"), "uid": data.get("uid"), "config": config,
+        "file": path.name, **metadata, "motor_id": data.get("motor_id"), "uid": data.get("uid"), "config": config,
         "completion_reason": data["status"].get("reason"), "dropped_frames": data["status"].get("dropped_frames"),
-        "feedback": dict(rate(samples), by_message_type={str(ty): rate([s for s in samples if (s["can_id"] >> 24) & 31 == ty]) for ty in sorted({(s["can_id"] >> 24) & 31 for s in samples})}, message_type_counts={str(ty): sum((s["can_id"] >> 24) & 31 == ty for s in samples) for ty in sorted({(s["can_id"] >> 24) & 31 for s in samples})}), "commands": command_rate,
+        "feedback": dict(rate(samples), by_message_type={label: rate(group) for label, group in groups.items()},
+                         message_type_counts={label: len(group) for label, group in groups.items()}),
+        "commands": command_rate,
         "feedback_sequence_gaps": sum(max(0, b["sequence"] - a["sequence"] - 1) for a, b in zip(samples, samples[1:])),
         "position_span_rad": max(position_values) - min(position_values),
         "max_fault_bits": max(s.get("fault_bits", 0) for s in samples),
@@ -136,7 +166,9 @@ def analyze(path):
         "parameters": data.get("parameters", []), "version": data.get("version"), "windows": windows,
         "limitations": [
             "CAN motion feedback and position regression use the same encoder; this is internal consistency, not independent speed calibration.",
-            "mechVel is sampled sparsely; repeated cached readings are not independent samples. Compare age-aligned updates, not held-value means.",
+            ("Standard MIT has no dictionary current/mechVel measurements or verified run-state bits; unavailable readings remain missing."
+             if protocol == "StandardMit" else
+             "mechVel is sampled sparsely; repeated cached readings are not independent samples. Compare age-aligned updates, not held-value means."),
             "Timestamps and command completions are host observations, not drive execution timestamps or a bus analyzer capture.",
             "Torque is a drive estimate, not a force sensor. No-load effort is only apparent friction, not final static/dynamic calibration.",
         ],
@@ -203,7 +235,8 @@ def plot(trials, destination, effort=False):
             svg.line(x(t), ytop, x(t), bottom)
             svg.text(x(t) - 6, bottom + 19, f"{t:g}", 13)
         svg.text(13, top + 25, "Nm" if effort else "rad/s", 13)
-        svg.text(left, top + 23, f'{result["file"]} | target +/- {config["velocity_rad_s"]:g} rad/s, Kd={config["kd"]:g} | RX={result["feedback"]["hz"]:.3f} Hz', 16)
+        protocol_label = " [Standard MIT, 12-bit speed]" if result["protocol"] == "StandardMit" else ""
+        svg.text(left, top + 23, f'{result["file"]}{protocol_label} | target +/- {config["velocity_rad_s"]:g} rad/s, Kd={config["kd"]:g} | RX={result["feedback"]["hz"]:.3f} Hz', 16)
         if effort:
             svg.path([(x(s["t_s"]), y(s["torque_nm"])) for s in samples], COLORS["feedback"])
             svg.path([(x(s["t_s"]), y(config["kd"] * (s["target"]["velocity_rad_s"] - s["velocity_rad_s"]))) for s in samples if s.get("target")], COLORS["command"], 1.4, "5 3")

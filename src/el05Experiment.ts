@@ -1,6 +1,7 @@
 import type { El05ExperimentConfig, El05ExperimentData, El05StaticFrictionPass, El05TelemetrySample } from "./el05Api";
+import { controlFeedbackEligible, feedbackVelocityBits, feedbackVelocityResolution } from "./el05Protocol.ts";
 
-/** Native type-2/type-24 torque: uint16 0..65535 maps to -6..6 Nm (manual pp.30, 34). */
+/** Native uint16 and standard MIT uint12 torque both map to -6..6 Nm. */
 export const EL05_TORQUE_UNIT = "Nm";
 export const EL05_TORQUE_LIMIT_NM = 6;
 
@@ -134,12 +135,14 @@ export interface El05ExperimentAnalysis {
   duration_s: number;
   quality: {
     sample_rate_hz: number | null;
+    /** Measured command cadence; absent in older frozen analyses. */
+    command_rate_hz?: number | null;
     median_interval_s: number | null;
     max_gap_s: number | null;
     duplicate_samples: number;
     dropped_frames: number;
     fresh_current_samples: number;
-    inactive_drive_samples: number;
+    inactive_drive_samples: number | null;
     inactive_drive_fraction: number | null;
     notes: string[];
   };
@@ -236,6 +239,34 @@ const deviation = (a: number[]): number | null => {
   return avg === null ? null : rms(a.map(n => n - avg));
 };
 const present = (a: (number | null | undefined)[]): number[] => a.filter(finite);
+
+/**
+ * Use actual send completion times; sparse archives preserve sequence deltas.
+ * Older recordings can fall back to the target receipt evidenced by telemetry.
+ * Feedback cadence alone never establishes the controller's update frequency.
+ */
+export function observedCommandRateHz(data: El05ExperimentData): number | null {
+  const estimate = (events: { sequence: number; time: number }[]) => {
+    const ordered = events.filter(event => Number.isInteger(event.sequence) && event.sequence > 0 && finite(event.time))
+      .sort((a, b) => a.sequence - b.sequence || a.time - b.time);
+    const intervals: number[] = [];
+    let previous: { sequence: number; time: number } | undefined;
+    for (const event of ordered) {
+      if (previous && event.sequence > previous.sequence && event.time > previous.time) {
+        intervals.push((event.time - previous.time) / (event.sequence - previous.sequence));
+      }
+      if (!previous || event.sequence > previous.sequence) previous = event;
+    }
+    const interval = median(intervals);
+    return interval != null && interval > 0 ? 1 / interval : null;
+  };
+  const sent = estimate(data.commands.map(command => ({ sequence: command.sequence,
+    time: finite(command.completed_t_s) ? command.completed_t_s : command.t_s })));
+  if (sent != null) return sent;
+  return estimate(data.samples.filter(sample => sample.target?.kind === "Mit"
+    && finite(sample.target_age_ms) && sample.target_age_ms >= 0 && sample.target_age_ms <= 250)
+    .map(sample => ({ sequence: sample.target_sequence, time: sample.t_s - sample.target_age_ms! / 1000 })));
+}
 
 function regression(x: number[], y: number[]) {
   const mx = mean(x), my = mean(y);
@@ -349,7 +380,7 @@ type Segment = { start: number; end: number; target: number; previous: number | 
 function targetSegments(points: Point[], mode: "position" | "velocity"): Segment[] {
   const segments: Segment[] = [];
   const tolerance = mode === "position" ? 1e-4 : 1e-3;
-  const medianInterval = median(points.slice(1).map((p, i) => p.s.t_s - points[i].s.t_s)) ?? 0.02;
+  const medianInterval = median(points.slice(1).map((p, i) => p.s.t_s - points[i].s.t_s)) ?? 0;
   const gapLimit = Math.max(0.15, medianInterval * 5);
   for (const p of points) {
     const target = mode === "position" ? p.d.target_position_rad : p.s.target?.kind === "Mit"
@@ -575,7 +606,7 @@ function harmonicFit(points: Point[], phase: (t: number) => number, value: (p: P
   return { amplitude: Math.hypot(coefficients[0], coefficients[1]), phase: Math.atan2(coefficients[1], coefficients[0]), r2: total > 1e-12 ? 1 - residual / total : 0 };
 }
 
-function frequencyAnalysis(points: Point[], config: RunConfig | null): El05ExperimentAnalysis["frequency_response"] {
+function frequencyAnalysis(points: Point[], config: RunConfig | null, commandHz: number | null): El05ExperimentAnalysis["frequency_response"] {
   const result: El05ExperimentAnalysis["frequency_response"] = { points: [], bandwidth_hz: null, reason: null };
   if (!config || config.kind as string !== "SineSweep") return { ...result, reason: "仅扫频工况计算频响。" };
   const f0 = config.frequency_start_hz ?? 0.1, f1 = config.frequency_end_hz ?? 2;
@@ -584,11 +615,8 @@ function frequencyAnalysis(points: Point[], config: RunConfig | null): El05Exper
   const phase = (t: number) => 2 * Math.PI * (f0 * t + 0.5 * slope * t * t);
   const usable = points.filter(p => p.d.target_position_rad !== null);
   if (usable.length < 30) return { ...result, reason: "实际位置命令覆盖不足。" };
-  // The command loop is 50 Hz. Enforce >= 10 commands/cycle, even if CAN
-  // feedback is faster; 500 Hz telemetry does not create a 500 Hz controller.
-  const commandTimes = points.filter((p, i) => !i || p.s.target_sequence !== points[i - 1].s.target_sequence).map(p => p.s.t_s);
-  const commandIntervals = commandTimes.slice(1).map((t, i) => t - commandTimes[i]);
-  const commandHz = Math.min(50, 1 / (median(commandIntervals) ?? 0.02));
+  // Enforce >= 10 actual commands/cycle independently of feedback cadence.
+  if (commandHz == null) return { ...result, reason: "缺少可核对的指令时序，不能从反馈采样率推测控制更新率。" };
   const maximumFrequency = Math.min(f1, commandHz / 10);
   const binCount = Math.max(12, Math.ceil(Math.log(f1 / f0) / Math.log(1.35)));
   const ratio = Math.pow(f1 / f0, 1 / binCount);
@@ -743,10 +771,10 @@ export function staticFrictionPasses(data: El05ExperimentData): El05StaticFricti
 }
 
 /** Use captured event frames, even when the plot samples have been thinned. */
-function staticFrictionPassAnalysis(state: El05StaticFrictionPass | undefined, config: RunConfig | null, active: boolean): El05StaticFrictionPassAnalysis {
+function staticFrictionPassAnalysis(state: El05StaticFrictionPass | undefined, config: RunConfig | null, active: boolean, data: El05ExperimentData): El05StaticFrictionPassAnalysis {
   const onset = state?.onset_sample, confirmation = state?.confirmation_sample;
   const reference = finite(state?.reference_position_rad) ? state.reference_position_rad : null;
-  const driveEvidenceValid = onset?.status_code === 2 && confirmation?.status_code === 2
+  const driveEvidenceValid = !!onset && !!confirmation && controlFeedbackEligible(onset, data) && controlFeedbackEligible(confirmation, data)
     && onset.fault_bits === 0 && confirmation.fault_bits === 0;
   const valid = Boolean(state?.outcome === "BreakawayDetected" && onset && confirmation && reference !== null
     && driveEvidenceValid
@@ -790,7 +818,7 @@ function staticFrictionPassAnalysis(state: El05StaticFrictionPass | undefined, c
     onset_time_s: acceptedOnset?.t_s ?? null, confirmation_time_s: acceptedConfirmation?.t_s ?? null,
     ramp_rate_nm_s: finite(config?.torque_ramp_rate_nm_s) ? Math.abs(config.torque_ramp_rate_nm_s) : null,
     reason: valid ? null : state?.outcome === "BreakawayDetected" && onset && confirmation && !driveEvidenceValid
-      ? "起动证据包含驱动非运行状态或故障，未得到有效静摩擦标定。"
+      ? data.protocol === "StandardMit" ? "起动证据缺少新鲜 MIT 控制指令或包含故障，未得到有效静摩擦标定。" : "起动证据包含驱动非运行状态或故障，未得到有效静摩擦标定。"
       : state?.outcome ? reasons[state.outcome] ?? "起动事件记录不完整，未得到有效静摩擦标定。"
       : active ? "标定正在运行，等待起动确认。" : "缺少后端起动事件记录，未得到有效静摩擦标定。",
   };
@@ -799,7 +827,7 @@ function staticFrictionPassAnalysis(state: El05StaticFrictionPass | undefined, c
 function staticFrictionAnalysis(data: El05ExperimentData, config: RunConfig | null): El05StaticFrictionAnalysis | undefined {
   if (config?.kind as string !== "StaticFriction") return undefined;
   const states = staticFrictionPasses(data);
-  const directions = (states.length ? states : [undefined]).map(state => staticFrictionPassAnalysis(state, config, data.status.active));
+  const directions = (states.length ? states : [undefined]).map(state => staticFrictionPassAnalysis(state, config, data.status.active, data));
   const positive = directions.find(pass => pass.direction === 1 && pass.valid_breakaway);
   const negative = directions.find(pass => pass.direction === -1 && pass.valid_breakaway);
   const magnitudeDifference = (a: number | null | undefined, b: number | null | undefined) => a != null && b != null ? Math.abs(a) - Math.abs(b) : null;
@@ -819,7 +847,7 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
   const config = data.status.config as RunConfig | null, kind = config?.kind as string ?? "Record";
   const duration = points.length ? points[points.length - 1].s.t_s - points[0].s.t_s : 0;
   const intervals = points.slice(1).map((p, i) => p.s.t_s - points[i].s.t_s);
-  const interval = median(intervals), maxGap = maximum(intervals);
+  const interval = median(intervals), maxGap = maximum(intervals), commandHz = observedCommandRateHz(data);
   const qualityNotes: string[] = [];
   if (data.status.samples > data.samples.length) qualityNotes.push("当前数据包含抽样或增量片段；指标仅基于已载入样本，历史原始帧数多于当前样本。");
   if (maxGap !== null && interval !== null && maxGap > Math.max(interval * 5, 0.1)) qualityNotes.push("存在明显采样间断；缺口附近的导数和动态响应需谨慎解读。");
@@ -827,13 +855,15 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
   if (data.status.active) qualityNotes.push("实验仍在运行，当前为阶段性分析。");
   else if (config && kind !== "StaticFriction" && (points[points.length - 1]?.s.t_s ?? 0) < config.duration_s * 0.95) qualityNotes.push("实际记录未覆盖计划全程，仅分析已经完成的激励和响应。");
   const freshCount = points.filter(p => p.d.fresh_current_a !== null).length;
-  const inactiveCount = points.filter(p => p.s.status_code !== 2).length;
+  const standardMit = data.protocol === "StandardMit";
+  const inactiveCount = standardMit ? null : points.filter(p => p.s.status_code !== 2).length;
   if (kind !== "Record" && inactiveCount) qualityNotes.push(`驱动非运行状态 ${inactiveCount} 帧（${(inactiveCount / Math.max(1, points.length) * 100).toFixed(1)}%）；这些帧不参与控制性能分析。`);
-  const quality = { sample_rate_hz: interval !== null && interval > 0 ? 1 / interval : null, median_interval_s: interval,
+  if (standardMit) qualityNotes.push(`标准 MIT 状态位不用于判断运行；性能分析使用无故障且具有新鲜 MIT 指令的反馈。速度量化步长为 ${feedbackVelocityResolution(data).toFixed(5)} rad/s（${feedbackVelocityBits(data)} 位）。`);
+  const quality = { sample_rate_hz: interval !== null && interval > 0 ? 1 / interval : null, command_rate_hz: commandHz, median_interval_s: interval,
     max_gap_s: maxGap, duplicate_samples: data.samples.length - indices.length, dropped_frames: data.status.dropped_frames,
     fresh_current_samples: freshCount, inactive_drive_samples: inactiveCount,
-    inactive_drive_fraction: points.length ? inactiveCount / points.length : null, notes: qualityNotes };
-  const performancePoints = kind === "Record" ? points : points.filter(p => p.s.status_code === 2);
+    inactive_drive_fraction: points.length && inactiveCount !== null ? inactiveCount / points.length : null, notes: qualityNotes };
+  const performancePoints = kind === "Record" ? points : points.filter(p => controlFeedbackEligible(p.s, data));
   const positionErrors = present(performancePoints.map(p => p.d.position_error_rad));
   const velocityErrors = present(performancePoints.map(p => p.d.velocity_error_rad_s));
   const positionSteps = kind === "PositionSteps" ? stepResponses(performancePoints, "position") : [];
@@ -853,17 +883,19 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
   const freeDecay = kind === "Record" || kind === "Backdrive" ? decayAnalysis(performancePoints, config)
     : { period_s: null, frequency_hz: null, log_decrement: null, damping_ratio: null, equivalent_viscous_nm_s_rad: null,
       peak_count: 0, envelope_r_squared: null, reason: "仅自由记录或反驱摆动工况分析自由衰减。" };
-  const frequencyResponse = frequencyAnalysis(performancePoints, config), impedance = impedanceAnalysis(performancePoints, config);
+  const frequencyResponse = frequencyAnalysis(performancePoints, config, commandHz), impedance = impedanceAnalysis(performancePoints, config);
   const thermal = thermalAnalysis(performancePoints), motion = motionAnalysis(performancePoints, config);
   const limitations = [
     "转矩为驱动器反馈估计值，未经外部转矩传感器验证。Iq 回归给出输出端有效 Nm/A，不直接等同手册的 0.94 Nm/Arms。",
     "摩擦、阻尼和惯量反映电机与摆臂、轴承及负载组成的整体；负载模型不包含未知电机/减速器反射惯量，应填入附加惯量。",
-    "时间为主机单调 CAN 接收时间，非驱动器采样时钟；动态参数受通讯、量化与约 50 Hz 命令更新率影响。",
+    `时间为主机单调 CAN 接收时间，非驱动器采样时钟；动态参数受通讯、量化和实际命令更新率影响。${commandHz == null ? "本组缺少可核对的指令时序。" : `本组实测命令更新率约 ${commandHz.toFixed(1)} Hz。`}`,
   ];
+  if (standardMit) limitations.push("标准 MIT 未提供 Iq、电压和字典速度；相关指标保留为空，电流回归不可用。原始状态位保留，不构成硬件使能证明。");
   if (!config?.pendulum?.zero_measured) limitations.push("下垂参考未实测：重力矩、真实摆角、静态转矩标定与扣除重力的摩擦参数不输出。");
   const sections: El05AnalysisSection[] = [{ id: "quality", title: "采样质量", title_en: "Sampling quality", metrics: [
     metric("sample_count", "有效反馈样本", "Valid feedback samples", points.length, ""),
     metric("sample_rate_hz", "反馈采样率", "Feedback sample rate", quality.sample_rate_hz, "Hz"),
+    metric("command_rate_hz", "实测命令更新率", "Measured command update rate", commandHz, "Hz"),
     metric("max_gap_s", "最大采样间隔", "Largest sample gap", maxGap, "s"),
     metric("fresh_current_samples", "独立新鲜 Iq 样本", "Independent fresh Iq samples", freshCount, ""),
     metric("dropped_frames", "接收丢帧", "Dropped receive frames", data.status.dropped_frames, ""),
@@ -985,6 +1017,9 @@ export function experimentJson(data: El05ExperimentData, includeDerivedSamples =
   const pendulum = data.status.config?.pendulum;
   return JSON.stringify({
     ...data,
+    protocol: data.protocol ?? "Native",
+    feedback_velocity_bits: feedbackVelocityBits(data),
+    feedback_velocity_resolution_rad_s: feedbackVelocityResolution(data),
     pendulum: pendulum ? { ...pendulum, ...pendulumModel(pendulum.mass_kg, pendulum.length_m, pendulum.arm_mass_kg,
       (pendulum as typeof pendulum & { extra_inertia_kg_m2?: number }).extra_inertia_kg_m2 ?? 0) } : null,
     analysis: analyzeExperiment(data),
@@ -1005,7 +1040,7 @@ export function experimentCsv(data: El05ExperimentData): string {
   const derivedFields = ["relative_position_rad", "angle_rad", "acceleration_rad_s2", "gravity_torque_nm", "target_holding_torque_nm", "inertial_torque_nm",
     "friction_torque_nm", "position_error_rad", "velocity_error_rad_s", "fresh_current_a"] as const;
   const headers = [...fields, "can_id_hex", "payload_hex", "target_position_rad", "target_velocity_rad_s", "target_torque_nm", "kp", "kd", "motor_id", "uid",
-    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields, "static_friction_direction", "static_friction_phase"];
+    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields, "static_friction_direction", "static_friction_phase", "protocol", "feedback_velocity_bits"];
   const passes = staticFrictionPasses(data).reverse();
   const rows = data.samples.map((sample, i) => {
     const target = sample.target?.kind === "Mit" ? sample.target : null;
@@ -1015,7 +1050,7 @@ export function experimentCsv(data: El05ExperimentData): string {
     return [...fields.map(field => sample[field] ?? ""), sample.can_id.toString(16).padStart(8, "0"), sample.payload.map(byte => byte.toString(16).padStart(2, "0")).join(" "), target?.position_rad ?? "", target?.velocity_rad_s ?? "",
       target?.torque_nm ?? "", target?.kp ?? "", target?.kd ?? "", data.motor_id ?? "", data.uid ?? "",
       derived[i].velocity_rad_s ?? "", derived[i].target_position_rad ?? "", ...derivedFields.map(field => derived[i][field] ?? ""),
-      pass ? pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1) : "", phase].join(",");
+      pass ? pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1) : "", phase, data.protocol ?? "Native", feedbackVelocityBits(data)].join(",");
   });
   return [headers.join(","), ...rows].join("\r\n") + "\r\n";
 }

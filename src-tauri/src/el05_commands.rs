@@ -6,8 +6,8 @@ use tauri::State;
 
 use crate::can_lease::{CanOwner, CanTransportGate};
 use crate::el05::{
-    El05Device, El05Identity, El05Mode, El05ParameterValue, El05Session, El05State, El05Target,
-    El05Version,
+    El05Device, El05Identity, El05Mode, El05ParameterValue, El05Protocol, El05Session, El05State,
+    El05Target, El05Version,
 };
 use crate::state::AppState;
 
@@ -87,6 +87,7 @@ pub async fn el05_connect(
     can_gate: State<'_, CanTransportGate>,
     iface: String,
     host_id: u8,
+    protocol: Option<El05Protocol>,
 ) -> CmdResult<El05State> {
     let _lifecycle = state.extension_op.lock().await;
     if state.shutdown_requested.load(Ordering::Acquire) {
@@ -105,7 +106,9 @@ pub async fn el05_connect(
         .await
         .map_err(error)?;
     let bus = crate::backend::protect_feature_bus(bus);
-    let app = El05Session::start(bus, host_id).await.map_err(error)?;
+    let app = El05Session::start_with_protocol(bus, host_id, protocol.unwrap_or_default())
+        .await
+        .map_err(error)?;
     if state.shutdown_requested.load(Ordering::Acquire) {
         let result = app.shutdown().await;
         if result.is_err() {
@@ -143,9 +146,10 @@ pub async fn el05_disconnect(state: State<'_, AppState>) -> CmdResult<()> {
     if had_session {
         // CAN ownership is exclusive, but the independent USB serial servo
         // may still need the native close cleanup path.
-        state
-            .extension_runtime_active
-            .store(state.unitree_servo.lock().await.is_some(), Ordering::Release);
+        state.extension_runtime_active.store(
+            state.unitree_servo.lock().await.is_some(),
+            Ordering::Release,
+        );
     }
     Ok(())
 }

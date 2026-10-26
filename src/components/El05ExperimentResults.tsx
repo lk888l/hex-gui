@@ -4,6 +4,7 @@ import ReactECharts from "echarts-for-react";
 import type { El05ExperimentData, El05ExperimentStatus } from "../el05Api";
 import { analyzeExperiment, deriveExperimentSamples, EL05_TORQUE_UNIT, experimentTorqueLimitNm, staticFrictionPasses } from "../el05Experiment";
 import { LEGACY_VELOCITY_ANALYSIS_NOTE, normalizeExperimentFeedbackVelocity } from "../el05Velocity";
+import { feedbackVelocityBits } from "../el05Protocol";
 
 export type ExperimentAnalysis = ReturnType<typeof analyzeExperiment>;
 export interface ExperimentRecord {
@@ -24,7 +25,7 @@ export function thin<T>(items: T[], limit: number): T[] {
   return Array.from({ length: limit }, (_, i) => items[Math.round(i * (items.length - 1) / (limit - 1))]);
 }
 export function runKey(data: El05ExperimentData): string {
-  return `${data.uid ?? data.motor_id ?? "motor"}:${data.status.run_id ?? `legacy-${data.samples[0]?.sequence ?? 0}-${data.samples[0]?.t_s ?? 0}`}`;
+  return `${data.protocol ?? "Native"}:${data.uid ?? data.motor_id ?? "motor"}:${data.status.run_id ?? `legacy-${data.samples[0]?.sequence ?? 0}-${data.samples[0]?.t_s ?? 0}`}`;
 }
 export function makeRecord(data: El05ExperimentData, name: string): ExperimentRecord {
   return { id: runKey(data), name, saved_at: new Date().toISOString(),
@@ -86,6 +87,13 @@ function parseExperimentValue(parsed: any): { data: El05ExperimentData; analysis
   const data = parsed?.data?.samples ? parsed.data : parsed;
   if (!data?.status || !Array.isArray(data.samples) || !data.samples.length || data.samples.length > 250_000) {
     throw new Error("JSON needs status and 1–250000 telemetry samples / JSON 需要 status 和 1–250000 条遥测数据");
+  }
+  if (data.protocol != null && !["Native", "StandardMit"].includes(data.protocol)) {
+    throw new Error("Unsupported motor protocol / 不支持的电机协议");
+  }
+  const expectedBits = data.protocol === "StandardMit" ? 12 : 16;
+  if (data.feedback_velocity_bits != null && data.feedback_velocity_bits !== expectedBits) {
+    throw new Error("Feedback bit width does not match protocol / 反馈位宽与协议不一致");
   }
   const kinds = ["Record", "VelocitySteps", "TorqueRamp", "StaticTorque", "PositionSteps", "SineSweep", "Impedance", "Backdrive", "ThermalHold", "SlowTriangle", "StaticFriction"];
   if (!kinds.includes(data.status.config?.kind)) throw new Error("Missing or unsupported experiment configuration / 缺少或不支持的测试配置");
@@ -202,6 +210,7 @@ export function experimentReport(data: El05ExperimentData, analysis: ExperimentA
   const geometry = data.status.config?.pendulum;
   const lines = [`# ${name}`, "", `${tr("导出时间", "Exported")}: ${new Date().toISOString()}`, "",
     `${tr("电机", "Motor")}: ${data.motor_id ?? "—"} · UID ${data.uid ?? "—"}`,
+    `${tr("协议", "Protocol")}: ${data.protocol === "StandardMit" ? "Standard MIT (11-bit CAN)" : "RobStride native (29-bit CAN)"} · ${feedbackVelocityBits(data)}-bit ${tr("速度反馈", "velocity feedback")}`,
     `${tr("力矩单位", "Torque unit")}: ${EL05_TORQUE_UNIT} (N·m) · ${tr("理论保持力矩、驱动反馈与指令使用相同单位", "Theoretical holding torque, drive feedback and commands use the same unit")}`,
     `${tr("工况", "Experiment")}: ${data.status.config?.kind ?? "—"} · ${data.status.elapsed_s.toFixed(3)} s · ${data.samples.length} ${tr("保留样本", "retained samples")}`,
     `${tr("状态", "Status")}: ${data.status.static_friction ? staticFrictionStatusText(data.status, zh) : data.status.reason ?? (data.status.active ? tr("进行中", "Running") : tr("完成", "Complete"))}`, "",
@@ -235,7 +244,7 @@ export function experimentReport(data: El05ExperimentData, analysis: ExperimentA
     [tr("起始 (s)", "Start (s)"), tr("结束 (s)", "End (s)"), tr("峰值角偏移 (rad)", "Peak deflection (rad)"), tr("恢复时间 (s)", "Recovery (s)")],
     (analysis.impedance?.responses ?? []).map(response => [fmt(response.start_s, 2), fmt(response.end_s, 2), fmt(response.peak_displacement_rad), fmt(response.recovery_s)]));
   lines.push("## " + tr("数据质量与分析边界", "Data quality and interpretation"), "",
-    `${tr("平均记录频率", "Recorded rate")}: ${analysis.quality.sample_rate_hz?.toFixed(2) ?? "—"} Hz; ${tr("最大采样间隔", "Maximum gap")}: ${analysis.quality.max_gap_s?.toFixed(4) ?? "—"} s`,
+    `${tr("平均记录频率", "Recorded rate")}: ${analysis.quality.sample_rate_hz?.toFixed(2) ?? "—"} Hz; ${tr("实测命令更新率", "Measured command rate")}: ${analysis.quality.command_rate_hz?.toFixed(2) ?? "—"} Hz; ${tr("最大采样间隔", "Maximum gap")}: ${analysis.quality.max_gap_s?.toFixed(4) ?? "—"} s`,
     ...analysis.quality.notes.map(note => `- ${note}`), ...analysis.limitations.map(note => `- ${note}`));
   return lines.join("\n") + "\n";
 }
@@ -360,7 +369,7 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
     {data.status.static_friction && <Alert showIcon type={data.status.active ? "info" : staticFrictionPasses(data).every(pass => pass.outcome === "BreakawayDetected" && pass.return_settled !== false)
       && (data.status.config?.friction_direction !== "Both" || analysis.static_friction?.both_directions_valid) ? "success" : "warning"} message={staticFrictionStatusText(data.status, zh)} description={tr("正反方向分别保存最后静止、首次起动和确认帧，图中标记各自的斜坡、起动和回位。起动力矩保留正负号，统一为 Nm；回位数据不参与起动力矩计算。", "Each direction preserves its last-rest, first-motion and confirmation frames; the chart marks each ramp, onset and return. Breakaway torque retains its sign in Nm; return samples are excluded from the calculation.")} />}
     <div className="el05-experiment-quality">
-      <Space wrap><Tag>{analysis.sample_count} {tr("分析样本", "analyzed samples")}</Tag><Tag>{analysis.duration_s.toFixed(2)} s</Tag><Tag>{analysis.quality.sample_rate_hz?.toFixed(1) ?? "—"} Hz</Tag><Tag>{tr("最大间隔", "Max gap")} {analysis.quality.max_gap_s?.toFixed(3) ?? "—"} s</Tag><Tag>{tr("丢弃帧", "Dropped")} {analysis.quality.dropped_frames}</Tag></Space>
+      <Space wrap><Tag>{analysis.sample_count} {tr("分析样本", "analyzed samples")}</Tag><Tag>{analysis.duration_s.toFixed(2)} s</Tag><Tag>{tr("反馈", "Feedback")} {analysis.quality.sample_rate_hz?.toFixed(1) ?? "—"} Hz</Tag><Tag>{tr("指令", "Commands")} {analysis.quality.command_rate_hz?.toFixed(1) ?? "—"} Hz</Tag><Tag>{tr("最大间隔", "Max gap")} {analysis.quality.max_gap_s?.toFixed(3) ?? "—"} s</Tag><Tag>{tr("丢弃帧", "Dropped")} {analysis.quality.dropped_frames}</Tag></Space>
     </div>
     <Segmented value={chart} onChange={value => setChart(String(value))} options={[
       ...(data.status.config?.kind === "StaticFriction" ? [{ value: "friction", label: tr("小角度静摩擦标定", "Small-angle static friction") }] : []),

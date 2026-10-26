@@ -819,6 +819,8 @@ pub struct ExperimentStatus {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ExperimentData {
+    pub protocol: super::El05Protocol,
+    pub feedback_velocity_bits: u8,
     /// Multiplier already applied to packed feedback velocity. CAN payloads
     /// remain unchanged, allowing old exports to be normalized on import.
     pub feedback_velocity_sign: i8,

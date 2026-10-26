@@ -351,11 +351,12 @@ bus with the right settings:
 - **Other → EL05 Motor Control** — independent RobStride EDULITE 05 workspace
   based on the EL05 manual dated 2026-09-22. Open `can0` / `socketcan:can0`
   on Linux or `gs_usb` with Classic CAN at 1 Mbps, scan, and select the motor.
-  The default host ID is `253` (`0xFD`). This app uses RobStride's native
-  29-bit extended CAN protocol and its own connection. SocketCAN timing is
-  configured by the operating system.
+  Select **RobStride native · 29-bit** or **Standard MIT compatible · 11-bit**
+  before connecting. The native protocol's default host ID is `253` (`0xFD`);
+  standard MIT learns the reply CAN ID from the selected motor. The workspace
+  owns its connection; SocketCAN timing is configured by the operating system.
 
-  All five motor modes are available: motion control / MIT (`0`, position,
+  The native protocol provides all five motor modes: motion control / MIT (`0`, position,
   velocity, Kp, Kd, torque feedforward), profile position PP (`1`, position,
   speed and acceleration), velocity (`2`, speed, acceleration and current
   limit), current (`3`, Iq), and cyclic position CSP (`5`, position and speed
@@ -364,7 +365,7 @@ bus with the right settings:
   Send a target after enabling. Stop, fault reset, mechanical zero, parameter
   read/write, live feedback and telemetry charts are provided in the workspace.
 
-  **Device settings & information** provides fresh CAN ID / MCU UID queries
+  Native **Device settings & information** provides fresh CAN ID / MCU UID queries
   (type `0`), ID changes (type `7`, new IDs `0..127`), and the motor version
   query (type `4`, payload `00 C4 00 00 00 00 00 00`). ID changes stop the
   motor, probe for address conflicts, verify the same UID at the new address,
@@ -380,13 +381,99 @@ bus with the right settings:
   and refreshes the position target and chart for the new coordinate system.
 
   The backend owns command streaming and stops on stale feedback or a missing
-  UI heartbeat. Enabling sets the volatile `canTimeout` to one second; leaving
+  UI heartbeat. Native enabling sets the volatile `canTimeout` to one second; leaving
   the workspace or closing the window stops the selected motor. Firmware
   parameter-read failures are shown explicitly, since older EL05 firmware may
-  not implement every optional parameter in the current manual. This workspace
-  requires the native RobStride protocol; a motor configured for CANopen or
-  the alternative standard-frame MIT protocol must first be switched back.
-  An attended hardware check is available with
+  not implement every optional parameter in the current manual.
+
+  **Standard MIT compatibility** supports the MIT-only motor on `can0`, ID `1`.
+  Select the 11-bit protocol, connect, then scan or select ID `1` manually.
+  Discovery and stopped sampling send `FF FF FF FF FF FF FF FD`; motion uses
+  p16/v12/Kp12/Kd12/torque12 standard frames at a target 500 Hz during control
+  and recording, with stopped idle sampling at 50 Hz. Scanning is unavailable
+  during active control because it sends Stop. The same host algorithms drive
+  all eleven pendulum experiments, static-friction calibration and zero-gravity
+  hold. Captured downward references belong to the current selection and are
+  invalidated on reselect, disconnect or a feedback gap; no MCU UID is invented.
+  Raw status bits stay visible even on compatible firmware that reports zero
+  during motion. Host enable/Stop acknowledgements govern the control lifecycle.
+
+  The compatible motor can clamp its reported position at the MIT range limits
+  (`-12.57` or `+12.57 rad`) after enough shaft turns. This is not a CAN timeout:
+  fresh replies can contain a saturated angle. Zero-gravity capture and control
+  reject these endpoints. While stopped, use **Stop and reset position zero**
+  in the gravity panel to send `FF FF FF FF FF FF FF FE`. The backend waits for
+  the zero to take effect and verifies a new near-zero position with Stop polls;
+  the first zero-command reply can still contain the old angle. This changes
+  the motor's coordinate zero and invalidates old references. Place the pendulum
+  vertically down and capture its reference again before starting compensation.
+
+  Standard MIT does not require UID/version queries, parameter reads or watchdog
+  configuration. Unsupported native settings and non-MIT modes are unavailable.
+  Iq, voltage and dictionary velocity stay missing; current-based regressions
+  cannot be produced by this protocol. Position, velocity, drive-estimated torque,
+  temperature, timing, pendulum analysis and JSON/CSV export remain available.
+  Exports retain the protocol, raw payload and 12-bit velocity resolution
+  (`100/4095 ≈ 0.02442 rad/s`); existing native recordings keep their 16-bit scale.
+  Active standard-MIT control stops on a feedback gap over 30 ms; late replies
+  cannot erase that gap. Frequency-response analysis uses recorded command
+  timing rather than assuming either a 50 Hz or 500 Hz control rate.
+  Standard Stop is retried three times. If it remains unacknowledged, the running
+  session retries only Stop at 250 ms intervals and requires an explicit successful
+  Stop before enabling again. Device watchdog behavior is not established;
+  process death or a disconnected CAN cable cannot guarantee torque removal.
+
+  The production-session hardware check is:
+
+  ```sh
+  cargo run --offline --manifest-path src-tauri/Cargo.toml --example el05_mit_smoke -- can0 1 --motion /tmp/el05-mit-app
+  ```
+
+  For a short stopped-position/reference check with no enable or motion targets,
+  replace `--motion` with `--capture-only`.
+
+  On 2026-10-23 it discovered and attached ID `1`, completed all eleven short
+  unloaded experiment runs at about 50 Hz, and verified zero-gravity reference,
+  startup, Stop, UI-heartbeat expiry and reference invalidation on reselection.
+  The initial 0.03 Nm friction run reached its torque limit in both directions;
+  that outcome is retained as a limit, not a successful breakaway measurement.
+  A focused 500 Hz run subsequently detected positive breakaway without the
+  50 Hz low-inertia return oscillation (peak speed about 0.13 rad/s). Its small
+  remaining return error was reported and prevented the reverse pass. Moving
+  about 0.17 rad from a captured reference also verified nonzero gravity
+  feedforward on the wire, followed by Stop and UI-heartbeat expiry checks.
+  These checks validate the control and recording paths. Loaded compensation
+  accuracy still requires the actual pendulum and its measured geometry.
+
+  For a motor that implements only the **11-bit standard-frame MIT protocol**,
+  the independent Python 3 SocketCAN tool below is also available. It does not require native
+  UID discovery or dictionary reads. `scan` and `status` send Stop to obtain
+  feedback; `demo` explicitly enables and moves the unloaded motor in both
+  directions, then sends Stop. The interface must already be configured at
+  1 Mbps. Speeds are in rad/s; MIT damping controls speed through torque,
+  so friction can cause steady speed and position errors.
+
+  ```sh
+  python3 scripts/el05-mit.py scan
+  python3 scripts/el05-mit.py status 1
+  python3 scripts/el05-mit.py --log /tmp/el05-mit.jsonl demo 1 --motion
+  python3 scripts/el05-mit.py hold 1 --motion --offset 0.2 --kp 3 --kd 0.5
+  python3 scripts/el05-mit.py stop 1
+  ```
+
+  On 2026-10-23, the compatible motor on `can0` answered at motor ID `1`,
+  with reply CAN ID `0x001` rather than the manual's example `0x0FD`.
+  Native UID/Stop queries and the standard dictionary read had no reply.
+  At target speeds of +1/-1 rad/s with Kd=0.5, measured steady feedback was
+  about +0.88/-0.93 rad/s, consistent with encoder position changes.
+  Its raw status stayed zero during motion, so the tool records that field
+  without using it to confirm enable or disable. It monitors feedback age,
+  reported faults, temperature, speed and displacement, and attempts repeated
+  Stop commands on normal exit, Ctrl+C or errors. Device watchdog support
+  has not been established; process termination that bypasses cleanup cannot
+  guarantee Stop delivery. No ID, zero, protocol or flash settings are changed.
+
+  An attended native-protocol hardware check is available with
   `cargo run --manifest-path src-tauri/Cargo.toml --example el05_smoke -- can0 1 --motion`.
   It deliberately moves motor ID 1 with small targets in all five modes,
   checks the UI timeout stop, and restores the original mode and volatile limits.
@@ -438,8 +525,14 @@ bus with the right settings:
   zero or CAN ID change, or lost feedback. It is independent of the test bench's
   reference and does not change the motor's mechanical zero.
 
+  The live encoder position is visible before a downward reference is captured;
+  the relative pendulum angle becomes available after capture. If capture or
+  start is unavailable, the panel shows the blocking condition, such as stale
+  feedback, an enabled motor or a pendulum that is still moving.
+
   Start automatically prepares MIT and enables continuous support without a
-  fixed duration. At 50 Hz, the backend computes
+  fixed duration. At 50 Hz for native motors or a target 500 Hz for standard
+  MIT motors, the backend computes
   `tau = scale * (m + arm_mass/2) * 9.80665 * L * sin(q - q_down) - damping * velocity`
   using current feedback, with MIT Kp and Kd both zero. There is no commanded
   holding angle: damping and friction let the pendulum settle after release,
@@ -500,9 +593,10 @@ bus with the right settings:
   drive-estimated torque; they do not independently measure dynamic shaft
   torque, backlash, or efficiency. The manual's 0.94 Nm/Arms torque constant
   must not be treated as an independently calibrated conversion from `iqf`.
-  All torque traces, static plateau results and exports use the native drive's
+  All torque traces, static plateau results and exports use the drive's
   **Nm (N·m)** unit. The EL05 260922 manual (printed pp.30, 34) maps type-2
-  and type-24 feedback torque words from `0..65535` to `-6..6 Nm`. Theoretical
+  and type-24 feedback torque words from `0..65535` to `-6..6 Nm`; standard MIT
+  uses `0..4095` for the same torque range (pp.51–52). Theoretical
   holding torque `(m + arm_mass/2) * g * L * sin(theta)`, with mass in kg and
   length in m, already uses this same unit; no gear-ratio or current-constant
   conversion is applied. CSV torque columns retain their `_nm` suffix and JSON

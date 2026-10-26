@@ -132,7 +132,7 @@ pub(super) struct GravityCompensation {
     pub status: GravityCompensationStatus,
     started: Option<Instant>,
     /// Kept server-side so an old/UI-supplied angle cannot authorize motion.
-    reference_uid: Option<String>,
+    reference_binding: Option<String>,
 }
 
 impl GravityCompensation {
@@ -144,7 +144,7 @@ impl GravityCompensation {
     pub fn capture(
         &mut self,
         motor_id: u8,
-        uid: String,
+        binding: String,
         position_rad: f64,
         captured_at_s: f64,
     ) -> GravityReference {
@@ -165,24 +165,24 @@ impl GravityCompensation {
             reference: Some(reference.clone()),
             ..Default::default()
         };
-        self.reference_uid = Some(uid);
+        self.reference_binding = Some(binding);
         reference
     }
 
-    pub fn reference_matches(&self, id: &str, motor_id: u8, uid: Option<&str>) -> bool {
+    pub fn reference_matches(&self, id: &str, motor_id: u8, binding: Option<&str>) -> bool {
         self.status
             .reference
             .as_ref()
             .is_some_and(|r| r.id == id && r.motor_id == motor_id)
-            && uid.is_some()
-            && self.reference_uid.as_deref() == uid
+            && binding.is_some()
+            && self.reference_binding.as_deref() == binding
     }
 
     pub fn invalidate_reference(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         self.finish(reason.clone());
         self.status.reference = None;
-        self.reference_uid = None;
+        self.reference_binding = None;
         self.status.reason = Some(reason);
     }
 

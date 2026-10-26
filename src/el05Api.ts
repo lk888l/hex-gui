@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type El05Mode = "Mit" | "PositionPp" | "Velocity" | "Current" | "PositionCsp";
+export type El05Protocol = "Native" | "StandardMit";
 export type El05Target =
   | { kind: "Mit"; position_rad: number; velocity_rad_s: number; torque_nm: number; kp: number; kd: number }
   | { kind: "PositionPp"; position_rad: number; velocity_rad_s: number; acceleration_rad_s2: number; deceleration_rad_s2?: number; current_limit_a: number }
@@ -30,6 +31,9 @@ export interface El05Version {
 }
 
 export interface El05State {
+  protocol: El05Protocol;
+  reply_id: number | null;
+  status_reliable: boolean;
   connected: boolean;
   attached: boolean;
   host_id: number;
@@ -186,6 +190,9 @@ export interface El05TelemetrySample {
   target_age_ms: number | null;
 }
 export interface El05ExperimentData {
+  /** Absent in historical recordings, which used the native protocol. */
+  protocol?: El05Protocol;
+  feedback_velocity_bits?: 12 | 16;
   /** Multiplier applied to packed CAN feedback velocity; current recordings use +1. */
   feedback_velocity_sign?: -1 | 1;
   status: El05ExperimentStatus;
@@ -204,7 +211,7 @@ export interface El05ParameterValue {
 }
 
 export const el05Api = {
-  connect: (iface: string, hostId: number) => invoke<El05State>("el05_connect", { iface, hostId }),
+  connect: (iface: string, hostId: number, protocol: El05Protocol = "Native") => invoke<El05State>("el05_connect", { iface, hostId, protocol }),
   disconnect: () => invoke<void>("el05_disconnect"),
   getState: () => invoke<El05State | null>("el05_get_state"),
   scan: () => invoke<El05Device[]>("el05_scan"),

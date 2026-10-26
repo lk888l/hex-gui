@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Input, InputNumber, Popconfirm, Segmented, Select, Space, Switch, Tag, Typography } from "antd";
 import ReactECharts from "echarts-for-react";
 import { errMsg } from "../api";
-import { el05Api, type El05Mode, type El05State, type El05Target } from "../el05Api";
+import { el05Api, type El05Mode, type El05Protocol, type El05State, type El05Target } from "../el05Api";
 import { useI18n } from "../i18n";
 import "./El05MotorPanel.css";
 import { El05ExperimentPanel } from "./El05ExperimentPanel";
@@ -77,6 +77,7 @@ export function El05MotorPanel() {
   const zh = lang === "zh";
   const tr = (cn: string, en: string) => zh ? cn : en;
   const [iface, setIface] = useState(defaultInterface);
+  const [protocol, setProtocol] = useState<El05Protocol>("Native");
   const [hostId, setHostId] = useState("0xFD");
   const [manualId, setManualId] = useState("0x01");
   const [newMotorId, setNewMotorId] = useState("");
@@ -110,20 +111,23 @@ export function El05MotorPanel() {
   const actionInFlight = useRef(false);
   const connectionEpoch = useRef(0);
   const connected = !!state?.connected;
+  const activeProtocol = connected ? state.protocol ?? protocol : protocol;
+  const standardMit = activeProtocol === "StandardMit";
   const selected = connected && state?.attached && state.motor_id != null;
   const mode = state?.mode ?? "Mit";
-  const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0);
+  const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0 || (standardMit && state.warning_code !== 0));
   const enabled = !!state?.enabled;
   const gravityActive = !!state?.gravity_compensation?.active;
   const controlLocked = busy || gravityActive || benchWorking || stopping;
   const motionReady = selected && !!state?.online && enabled && !faulted && !state?.experiment.active && !gravityActive && !benchWorking && !stopping;
   const parameter = PARAMETERS.find((item) => item.index === parameterIndex)!;
   const proposedId = /^(?:0x[0-9a-f]+|\d+)$/i.test(newMotorId.trim()) ? Number(newMotorId) : NaN;
-  const canChangeId = selected && !controlLocked && Number.isInteger(proposedId) && proposedId >= 0 && proposedId <= 127
+  const canChangeId = !standardMit && selected && !controlLocked && Number.isInteger(proposedId) && proposedId >= 0 && proposedId <= 127
     && proposedId !== state?.motor_id && proposedId !== state?.host_id;
 
   const acceptState = useCallback((next: El05State | null) => {
     if (!alive.current) return;
+    if (next?.protocol) setProtocol(next.protocol);
     const motor = next?.motor_id ?? null;
     const previous = lastSample.current;
     if (previous.motor !== motor) {
@@ -213,10 +217,10 @@ export function El05MotorPanel() {
   };
 
   const connect = () => void run(async () => {
-    const id = parseId(hostId, 0xff);
+    const id = protocol === "Native" ? parseId(hostId, 0xff) : 0xfd;
     if (!iface.trim()) throw new Error(tr("请输入 CAN 接口", "Enter a CAN interface"));
     connectionEpoch.current++;
-    await el05Api.connect(iface.trim(), id);
+    await el05Api.connect(iface.trim(), id, protocol);
   }, tr("EL05 CAN 已连接", "EL05 CAN connected"));
 
   const disconnect = () => void run(async () => {
@@ -308,7 +312,9 @@ export function El05MotorPanel() {
   }, tr("ID 已修改并通过 MCU UID 核对，已选择新地址", "ID changed and MCU UID verified; new address selected"));
 
   const modeHint: Record<El05Mode, string> = {
-    Mit: tr("τ = Kp·(目标位置−实际位置) + Kd·(目标速度−实际速度) + 前馈转矩。速度单位 rad/s（1 rad/s ≈ 9.5493 rpm）；Kd=0 时速度目标不起作用，Kp>0 且固定位置时不适合连续匀速转动。速度反馈范围 ±50 rad/s，16 位分辨率约 0.001526 rad/s。", "τ = Kp·(position target−position) + Kd·(velocity target−velocity) + feedforward. Speed is rad/s (1 rad/s ≈ 9.5493 rpm). Kd=0 ignores velocity; a fixed position with Kp>0 opposes continuous rotation. Feedback is ±50 rad/s, with 16-bit resolution ≈0.001526 rad/s."),
+    Mit: tr("τ = Kp·(目标位置−实际位置) + Kd·(目标速度−实际速度) + 前馈转矩。速度单位 rad/s（1 rad/s ≈ 9.5493 rpm）；Kd=0 时速度目标不起作用，Kp>0 且固定位置时不适合连续匀速转动。", "τ = Kp·(position target−position) + Kd·(velocity target−velocity) + feedforward. Speed is rad/s (1 rad/s ≈ 9.5493 rpm). Kd=0 ignores velocity; a fixed position with Kp>0 opposes continuous rotation.") + " " + (standardMit
+      ? tr("速度反馈范围 ±50 rad/s，12 位分辨率约 0.02442 rad/s。", "Feedback is ±50 rad/s, with 12-bit resolution ≈0.02442 rad/s.")
+      : tr("速度反馈范围 ±50 rad/s，16 位分辨率约 0.001526 rad/s。", "Feedback is ±50 rad/s, with 16-bit resolution ≈0.001526 rad/s.")),
     PositionPp: tr("一次发送位置、最高速度和加速度，电机内部完成轨迹。加速度同时用于加速和减速。", "Send position, maximum speed and acceleration once; the motor plans the trajectory. Acceleration also controls deceleration."),
     Velocity: tr("先应用电流限制和加速度，再发送目标速度。速度单位为 rad/s。", "Applies current limit and acceleration before the velocity target, in rad/s."),
     Current: tr("直接控制 Iq 电流。正负号决定输出方向，范围为 ±11 A。", "Direct Iq current control. The sign sets output direction; the range is ±11 A."),
@@ -338,21 +344,28 @@ export function El05MotorPanel() {
     setParameterReadback(`${hexId(result.index, 4)} = ${result.value} (${result.kind})`);
   }, tr("参数已写入并读回", "Parameter written and read back"));
 
-  const statusLabel = !state?.online ? tr("离线", "Offline") : enabled ? tr("运行", "Running") : state.status_code === 1 ? tr("标定", "Calibrating") : tr("已停止", "Stopped");
+  const statusLabel = !state?.online ? tr("离线", "Offline") : state.status_reliable === false
+    ? enabled ? tr("控制已使能", "Control enabled") : tr("停止已应答", "Stop acknowledged")
+    : enabled ? tr("运行", "Running") : state.status_code === 1 ? tr("标定", "Calibrating") : tr("已停止", "Stopped");
 
   return (
     <div className="el05-panel">
       <Card size="small">
         <div className="el05-connection">
+          <Field label={tr("电机协议", "Motor protocol")}><Select aria-label={tr("电机协议", "Motor protocol")} value={activeProtocol} disabled={connected || busy} style={{ width: 240 }} onChange={setProtocol} options={[
+            { value: "Native", label: tr("RobStride 原生 · 29 位", "RobStride native · 29-bit") },
+            { value: "StandardMit", label: tr("标准帧 MIT 兼容 · 11 位", "Standard MIT compatible · 11-bit") },
+          ]} /></Field>
           <Field label={tr("CAN 接口", "CAN interface")}><Input value={iface} disabled={connected || busy} onChange={(event) => setIface(event.target.value)} style={{ width: 150 }} placeholder={defaultInterface()} /></Field>
-          <Field label={tr("主机 CAN ID", "Host CAN ID")}><Input value={hostId} disabled={connected || busy} onChange={(event) => setHostId(event.target.value)} style={{ width: 110 }} /></Field>
+          {!standardMit && <Field label={tr("主机 CAN ID", "Host CAN ID")}><Input value={hostId} disabled={connected || busy} onChange={(event) => setHostId(event.target.value)} style={{ width: 110 }} /></Field>}
           {connected ? <Button danger loading={busy} onClick={disconnect}>{tr("停止并断开", "Stop & disconnect")}</Button> : <Button type="primary" loading={busy} onClick={connect}>{tr("连接", "Connect")}</Button>}
           <Space wrap>
             <Tag color={connected ? "green" : "default"}>{connected ? tr("已连接", "Connected") : tr("未连接", "Disconnected")}</Tag>
-            <Tag>CAN 2.0B · 1 Mbps</Tag>
-            <Typography.Text type="secondary">{tr("RobStride 私有协议 · 29 位扩展帧", "RobStride native protocol · 29-bit extended frames")}</Typography.Text>
+            <Tag>Classic CAN · 1 Mbps</Tag>
+            <Typography.Text type="secondary">{standardMit ? tr("标准帧 MIT · 回复 ID 自动识别", "Standard MIT · reply ID detected automatically") : tr("RobStride 私有协议 · 29 位扩展帧", "RobStride native protocol · 29-bit extended frames")}</Typography.Text>
           </Space>
         </div>
+        {standardMit && <Typography.Paragraph type="secondary" style={{ margin: "12px 0 0" }}>{tr("连接后扫描或输入电机 ID。扫描会向各地址发送停止命令；支持 MIT 手动控制、全部摆锤测试与零重力保持。", "Connect, then scan or enter the motor ID. Scanning sends Stop to each address. MIT manual control, all pendulum tests and zero-gravity hold are available.")}</Typography.Paragraph>}
         {pollError && <Alert style={{ marginTop: 12 }} type="error" showIcon message={pollError} />}
       </Card>
 
@@ -363,7 +376,7 @@ export function El05MotorPanel() {
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={connected ? tr("点击扫描发现电机", "Scan to discover motors") : tr("先连接 CAN", "Connect CAN first")} />
             ) : state?.devices.map((device) => (
               <button key={device.motor_id} className={`el05-device${device.selected ? " el05-device--selected" : ""}`} type="button" disabled={controlLocked} onClick={() => selectMotor(device.motor_id)}>
-                <span className="el05-device__title"><strong>RobStride EL05</strong><code>{hexId(device.motor_id)}</code></span>
+                <span className="el05-device__title"><strong>{standardMit ? tr("MIT 兼容电机", "MIT compatible motor") : "RobStride EL05"}</strong><code>{hexId(device.motor_id)}</code></span>
                 <span><Tag color={device.online ? "green" : "default"}>{device.online ? tr("在线", "Online") : tr("已发现", "Discovered")}</Tag>{device.selected && <Tag color="blue">{tr("已选择", "Selected")}</Tag>}</span>
                 {device.uid && <Typography.Text type="secondary" className="el05-device__uid">UID {device.uid}</Typography.Text>}
               </button>
@@ -383,7 +396,7 @@ export function El05MotorPanel() {
               <div className="el05-summary">
                 <div>
                   <Space wrap><Typography.Title level={4} style={{ margin: 0 }}>RobStride EL05</Typography.Title>{state?.motor_id != null && <Typography.Text code>{hexId(state.motor_id)}</Typography.Text>}<Tag color={faulted ? "red" : enabled ? "green" : state?.online ? "blue" : "default"}>{statusLabel}</Tag>{selected && <Tag>{MODE_LABELS[mode][zh ? 0 : 1]}</Tag>}</Space>
-                  <Typography.Text className="el05-description" type="secondary">48 V · {tr("额定 1.8 Nm · 峰值 6 Nm · 峰值相电流 11 A", "Rated 1.8 Nm · Peak 6 Nm · Peak phase current 11 A")}</Typography.Text>
+                  <Typography.Text className="el05-description" type="secondary">{standardMit ? tr("EL05 兼容量程：位置 ±12.57 rad · 速度 ±50 rad/s · 转矩 ±6 Nm", "EL05-compatible ranges: position ±12.57 rad · velocity ±50 rad/s · torque ±6 Nm") : <>48 V · {tr("额定 1.8 Nm · 峰值 6 Nm · 峰值相电流 11 A", "Rated 1.8 Nm · Peak 6 Nm · Peak phase current 11 A")}</>}</Typography.Text>
                 </div>
                 <Space wrap><Space size={5}><Typography.Text type="secondary">{tr("界面刷新", "UI refresh")}</Typography.Text><Segmented size="small" value={refreshHz} onChange={(value) => setRefreshHz(Number(value))} options={[{ label: "20 Hz", value: 20 }, { label: "50 Hz", value: 50 }]} /></Space><Button danger disabled={!selected} loading={stopping} onClick={() => void stop()}>{tr("停止电机", "Stop motor")}</Button></Space>
               </div>
@@ -392,7 +405,7 @@ export function El05MotorPanel() {
             {!selected && <Alert type="info" showIcon message={tr("连接总线后扫描并选择电机，或手动输入电机 ID。", "Connect the bus, then scan and select a motor, or enter its ID manually.")} />}
             {selected && !state?.online && <Alert type="warning" showIcon message={tr("尚无有效反馈，请检查电源、1 Mbps 总线速率、接线及电机当前协议。", "No fresh feedback. Check power, 1 Mbps bus timing, wiring and the motor's current protocol.")} />}
             {state?.last_error && <Alert type="error" showIcon message={state.last_error} />}
-            {faulted && <Alert type="error" showIcon message={tr("电机故障", "Motor fault")} description={<Space wrap>{faultLabels(state!.fault_bits, zh).map((label) => <Tag color="red" key={label}>{label}</Tag>)}<Typography.Text code>{`Fault ${hexId(state!.fault_code, 8)}`}</Typography.Text>{state!.faults.length > 0 && <Typography.Text>{state!.faults.join(" · ")}</Typography.Text>}</Space>} />}
+            {faulted && <Alert type="error" showIcon message={tr("电机故障 / 预警", "Motor fault / warning")} description={<Space wrap>{!standardMit && faultLabels(state!.fault_bits, zh).map((label) => <Tag color="red" key={label}>{label}</Tag>)}<Typography.Text code>{`Fault ${hexId(state!.fault_code, 8)}`}</Typography.Text>{state!.faults.length > 0 && <Typography.Text>{state!.faults.join(" · ")}</Typography.Text>}</Space>} />}
             {gravityActive && workspaceTab !== "gravity" && <Alert type="info" showIcon
               message={tr("零重力保持正在运行；调整控制或开始测试前请先停止。", "Zero-gravity hold is running. Stop it before changing control or starting an experiment.")}
               action={<Button size="small" onClick={() => setWorkspaceTab("gravity")}>{tr("查看补偿", "View compensation")}</Button>} />}
@@ -408,15 +421,15 @@ export function El05MotorPanel() {
               <El05ExperimentPanel state={state} zh={zh} busy={busy || stopping} coordinateRevision={coordinateRevision} refresh={async () => acceptState(await el05Api.getState())} onWorkingChange={setBenchWorking} />
             </div>
             <div hidden={workspaceTab !== "gravity"}>
-              <El05GravityPanel state={state} zh={zh} busy={busy || benchWorking} stopping={stopping} run={run} stop={stop} />
+              <El05GravityPanel state={state} zh={zh} busy={busy || benchWorking} stopping={stopping} run={run} stop={stop} setZero={setZero} />
             </div>
             <div hidden={workspaceTab !== "manual"}><Space direction="vertical" size={12} style={{ width: "100%" }}>
             <Card size="small" title={tr("电机控制", "Motor control")} extra={state?.streaming && <Tag color="processing">{tr("目标连续发送中", "Target streaming")}</Tag>}>
               <Space wrap>
-                <Select aria-label={tr("控制模式", "Control mode")} style={{ width: 200 }} value={mode} disabled={!selected || controlLocked} options={MODES.map((value) => ({ label: MODE_LABELS[value][zh ? 0 : 1], value }))} onChange={changeMode} />
+                <Select aria-label={tr("控制模式", "Control mode")} style={{ width: 200 }} value={mode} disabled={!selected || controlLocked || standardMit} options={(standardMit ? ["Mit" as const] : MODES).map((value) => ({ label: MODE_LABELS[value][zh ? 0 : 1], value }))} onChange={changeMode} />
                 <Button type="primary" disabled={!selected || !state?.online || enabled || faulted || controlLocked || state?.experiment.active} onClick={() => void run(() => el05Api.enable())}>{tr("使能", "Enable")}</Button>
                 <Button type="primary" danger disabled={!selected} loading={stopping} onClick={() => void stop()}>{tr("停止 / 失能", "Stop / disable")}</Button>
-                <Button disabled={!selected || controlLocked} onClick={() => void run(() => el05Api.clearFault())}>{tr("清除故障", "Clear fault")}</Button>
+                {!standardMit && <Button disabled={!selected || controlLocked} onClick={() => void run(() => el05Api.clearFault())}>{tr("清除故障", "Clear fault")}</Button>}
               </Space>
               <Typography.Text className="el05-description" type="secondary">{tr("切换模式会先停止电机；使能后点击「发送目标」执行。", "Changing mode stops the motor. Enable, then press Send target to execute.")}</Typography.Text>
               <div className="el05-target">
@@ -433,9 +446,9 @@ export function El05MotorPanel() {
                 <Typography.Text type="secondary">{modeHint[mode]}</Typography.Text>
               </div>
               <Space wrap style={{ marginTop: 14 }}>
-                <Button type="primary" loading={busy} disabled={!motionReady || state?.experiment.active} onClick={() => void run(() => el05Api.sendTarget(makeTarget(), repeat && mode !== "PositionPp"))}>{tr("发送目标", "Send target")}</Button>
-                <Switch checked={repeat && mode !== "PositionPp"} disabled={mode === "PositionPp" || busy} onChange={setRepeat} />
-                <Typography.Text>{mode === "PositionPp" ? tr("PP 轨迹单次发送", "PP trajectory is sent once") : tr("连续发送目标", "Repeat target")}</Typography.Text>
+                <Button type="primary" loading={busy} disabled={!motionReady || state?.experiment.active} onClick={() => void run(() => el05Api.sendTarget(makeTarget(), standardMit || (repeat && mode !== "PositionPp")))}>{tr("发送目标", "Send target")}</Button>
+                <Switch checked={standardMit || (repeat && mode !== "PositionPp")} disabled={standardMit || mode === "PositionPp" || busy} onChange={setRepeat} />
+                <Typography.Text>{standardMit ? tr("标准 MIT 需要持续通信", "Standard MIT requires continuous commands") : mode === "PositionPp" ? tr("PP 轨迹单次发送", "PP trajectory is sent once") : tr("连续发送目标", "Repeat target")}</Typography.Text>
                 {(mode === "Mit" || mode === "PositionPp" || mode === "PositionCsp") && <Button disabled={!state?.online || (mode !== "Mit" && state.mechanical_position_rad == null)} onClick={() => setPosition((mode === "Mit" ? state?.position_rad : state?.mechanical_position_rad) ?? 0)}>{tr("取当前位置", "Use current position")}</Button>}
               </Space>
             </Card>
@@ -452,20 +465,36 @@ export function El05MotorPanel() {
                 </div>
               )}
               <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 3 }} style={{ marginTop: 16 }}>
-                <Descriptions.Item label={tr("多圈机械位置", "Multi-turn position")}><Numeric value={state?.mechanical_position_rad} /> rad</Descriptions.Item>
+                <Descriptions.Item label={tr("多圈机械位置", "Multi-turn position")}>{standardMit ? tr("协议不提供", "Unavailable in this protocol") : <><Numeric value={state?.mechanical_position_rad} /> rad</>}</Descriptions.Item>
+                {standardMit && <Descriptions.Item label={tr("连接期间累计位置", "Position unwrapped this session")}><Numeric value={state?.unwrapped_position_rad} /> rad</Descriptions.Item>}
                 <Descriptions.Item label={tr("位置差分速度（约 150 ms 窗口）", "Position-derived speed (~150 ms)")}><Numeric value={state?.position_velocity_rad_s} digits={4} /> rad/s</Descriptions.Item>
-                <Descriptions.Item label={tr("mechVel 参数（独立采样）", "mechVel (separate sample)")}><Numeric value={state?.dictionary_velocity_rad_s} digits={4} /> rad/s {state?.dictionary_velocity_age_ms != null ? `(${state.dictionary_velocity_age_ms} ms)` : ""}</Descriptions.Item>
+                <Descriptions.Item label={tr("mechVel 参数（独立采样）", "mechVel (separate sample)")}>{standardMit ? tr("协议不提供", "Unavailable in this protocol") : <><Numeric value={state?.dictionary_velocity_rad_s} digits={4} /> rad/s {state?.dictionary_velocity_age_ms != null ? `(${state.dictionary_velocity_age_ms} ms)` : ""}</>}</Descriptions.Item>
                 <Descriptions.Item label={tr("转速换算", "Speed in rpm")}><Numeric value={state?.velocity_rad_s == null ? null : state.velocity_rad_s * 60 / (2 * Math.PI)} /> rpm</Descriptions.Item>
                 <Descriptions.Item label={tr("反馈频率", "Feedback rate")}><Numeric value={state?.feedback_rate_hz} digits={1} /> Hz</Descriptions.Item>
                 <Descriptions.Item label={tr("反馈年龄", "Feedback age")}>{state?.feedback_age_ms == null ? "—" : `${state.feedback_age_ms} ms`}</Descriptions.Item>
                 <Descriptions.Item label={tr("接收 / 发送帧", "RX / TX frames")}>{state ? `${state.rx_count} / ${state.tx_count}` : "—"}</Descriptions.Item>
-                <Descriptions.Item label={tr("主动上报", "Periodic feedback")}>{state?.reporting ? tr("开启", "On") : tr("关闭", "Off")}</Descriptions.Item>
+                <Descriptions.Item label={tr("反馈方式", "Feedback source")}>{standardMit ? tr("命令应答", "Command replies") : state?.reporting ? tr("主动上报开启", "Periodic reporting on") : tr("主动上报关闭", "Periodic reporting off")}</Descriptions.Item>
+                {standardMit && <Descriptions.Item label={tr("回复 CAN ID", "Reply CAN ID")}>{state?.reply_id == null ? "—" : hexId(state.reply_id, 3)}</Descriptions.Item>}
+                {standardMit && <Descriptions.Item label={tr("原始状态位", "Raw status bits")}>{state?.status_code ?? "—"} · {tr("不用于判定使能", "Not used to confirm enable")}</Descriptions.Item>}
                 <Descriptions.Item label={tr("警告码", "Warning code")}><Typography.Text code>{state ? hexId(state.warning_code, 8) : "—"}</Typography.Text></Descriptions.Item>
               </Descriptions>
+              {standardMit && <Typography.Paragraph type="secondary" style={{ marginTop: 12 }}>{tr("此协议提供位置、速度、估计转矩和温度；Iq、电压、字典速度与硬件多圈位置不可用。控制状态表示主机已完成使能或停止应答，原始状态位可能始终为 0。", "This protocol provides position, velocity, estimated torque and temperature. Iq, voltage, dictionary velocity and hardware multi-turn position are unavailable. Control state reflects the host enable/stop exchange; raw mode bits may stay at zero.")}</Typography.Paragraph>}
             </Card>
 
             </Space></div>
             <div hidden={workspaceTab !== "settings"}><Space direction="vertical" size={12} style={{ width: "100%" }}>
+            {standardMit ? <Card size="small" title={tr("MIT 兼容设备", "MIT compatible device")}>
+              <Descriptions size="small" column={2}>
+                <Descriptions.Item label={tr("电机 CAN ID", "Motor CAN ID")}>{state?.motor_id == null ? "—" : hexId(state.motor_id)}</Descriptions.Item>
+                <Descriptions.Item label={tr("回复 CAN ID", "Reply CAN ID")}>{state?.reply_id == null ? "—" : hexId(state.reply_id, 3)}</Descriptions.Item>
+              </Descriptions>
+              <Typography.Paragraph type="secondary">{tr("兼容模式支持基本 MIT 控制、反馈和位置置零。UID、版本、修改 ID、清故障和参数字典未确认兼容，因此不开放这些操作。摆锤测试与零重力保持使用本次连接内记录的下垂参考；反馈停在 ±12.57 rad 量程端点时，需先停止并重置位置零点，再重新记录下垂参考。", "Compatibility mode supports basic MIT control, feedback and position zero. UID, version, ID changes, fault reset and dictionary commands are not established for this device, so those actions are unavailable. Pendulum tests and zero-gravity hold use a downward reference captured in this connection. If feedback saturates at ±12.57 rad, stop and reset the position zero, then capture the downward reference again.")}</Typography.Paragraph>
+              <Popconfirm title={tr("停止电机并将当前位置设为零点？", "Stop the motor and set the current position to zero?")}
+                description={tr("这会修改电机位置零位，并使旧下垂参考失效；完成后需要重新记录参考。", "This changes the motor position zero and invalidates the previous downward reference. Capture a new reference afterward.")}
+                okText={tr("停止并置零", "Stop & reset zero")} cancelText={tr("取消", "Cancel")} disabled={!selected || controlLocked} onConfirm={setZero}>
+                <Button disabled={!selected || controlLocked}>{tr("停止并重置位置零点", "Stop & reset position zero")}</Button>
+              </Popconfirm>
+            </Card> : <>
             <Card size="small" title={tr("设备设置与信息", "Device settings & information")}>
               <Space direction="vertical" size={16} style={{ width: "100%" }}>
                 <Descriptions size="small" layout="vertical" column={{ xs: 1, sm: 1, md: 2, lg: 2, xl: 2, xxl: 2 }}>
@@ -521,6 +550,7 @@ export function El05MotorPanel() {
               {parameterReadback && <Typography.Text code copyable>{parameterReadback}</Typography.Text>}
               <Typography.Text type="secondary">{parameterHint(parameterIndex, zh)} {tr("参数写入在电机停止后开放。", "Parameter writes are available while the motor is stopped.")}</Typography.Text>
             </Space> }]} />
+            </>}
             </Space></div>
           </Space>
         </section>

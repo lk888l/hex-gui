@@ -1,6 +1,6 @@
-//! RobStride EDULITE 05 private protocol (EL05 使用说明书 260922, pp.29–44).
-//! Classic CAN, 29-bit identifiers; packed motion words are big endian while
-//! dictionary values are little endian. This session owns its control lifecycle.
+//! RobStride EL05 native and standard-frame MIT control (manual 260922).
+//! Both wire protocols share telemetry, experiments, gravity compensation and
+//! the host control lifecycle. Optional native dictionary services stay native.
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -16,6 +16,11 @@ use tokio::task::JoinHandle;
 pub mod experiment;
 #[path = "el05_gravity.rs"]
 pub mod gravity;
+#[path = "el05_mit.rs"]
+mod mit;
+#[cfg(test)]
+#[path = "el05_standard_tests.rs"]
+mod standard_tests;
 use experiment::{
     Experiment, ExperimentConfig, ExperimentData, ExperimentKind, ExperimentStatus, TelemetrySample,
 };
@@ -27,11 +32,22 @@ const FEEDBACK_TIMEOUT: Duration = Duration::from_millis(750);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_millis(350);
 const STEP: Duration = Duration::from_millis(20);
+// Low-inertia MIT-only drives need a faster host damping loop for friction
+// returns and gravity support. Idle Stop sampling remains at 50 Hz.
+const MIT_STEP: Duration = Duration::from_millis(2);
+const MIT_CONTROL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(30);
 const MOTOR_TIMEOUT: u32 = 20_000; // 50 us ticks: one second.
 const POLL: [u16; 5] = [0x7019, 0x701A, 0x701B, 0x701C, 0x7005];
 // Use type-2/type-24 packed velocity directly, following the user's current
 // direction measurements. Targets and dictionary mechVel remain separate.
 const FEEDBACK_VELOCITY_SIGN: i8 = 1;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum El05Protocol {
+    #[default]
+    Native,
+    StandardMit,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum El05Mode {
@@ -136,6 +152,11 @@ pub struct El05Version {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct El05State {
+    pub protocol: El05Protocol,
+    /// Standard MIT replies use a configured host CAN ID, learned on attach.
+    pub reply_id: Option<u16>,
+    /// Compatible MIT firmware may leave the raw status at zero while moving.
+    pub status_reliable: bool,
     pub connected: bool,
     pub attached: bool,
     pub host_id: u8,
@@ -177,7 +198,13 @@ pub struct El05State {
 }
 impl El05State {
     fn new(host_id: u8, connected: bool) -> Self {
+        Self::with_protocol(host_id, connected, El05Protocol::Native)
+    }
+    fn with_protocol(host_id: u8, connected: bool, protocol: El05Protocol) -> Self {
         Self {
+            protocol,
+            reply_id: None,
+            status_reliable: protocol == El05Protocol::Native,
             connected,
             attached: false,
             host_id,
@@ -268,9 +295,53 @@ struct Shared {
     last_sent_target: Option<El05Target>,
     last_target_sent: Option<Instant>,
     target_sequence: u64,
+    /// Bind UID-less gravity references to this selection, never to a fake UID.
+    selection_generation: u64,
+    mit_requests: BTreeMap<u8, Instant>,
+}
+const MIT_SATURATED_POSITION_MESSAGE: &str = "standard MIT position feedback is saturated at ±12.57 rad; stop the motor, set its mechanical zero, then capture the downward reference again";
+
+impl Shared {
+    fn standard_position_saturated(&self) -> bool {
+        self.view.protocol == El05Protocol::StandardMit
+            && self
+                .view
+                .position_rad
+                .is_some_and(|p| p.abs() >= 12.57 - 1e-9)
+    }
+    fn control_feedback_timeout(&self) -> Duration {
+        if self.view.protocol == El05Protocol::StandardMit && self.armed {
+            MIT_CONTROL_FEEDBACK_TIMEOUT
+        } else {
+            FEEDBACK_TIMEOUT
+        }
+    }
+    fn gravity_feedback_timeout(&self) -> Duration {
+        self.control_feedback_timeout()
+            .min(gravity::FEEDBACK_TIMEOUT)
+    }
+    fn drive_faulted(&self) -> bool {
+        self.view.fault_bits != 0
+            || self.view.fault_code != 0
+            || (self.view.protocol == El05Protocol::StandardMit && self.view.warning_code != 0)
+    }
+    fn gravity_binding(&self) -> Option<String> {
+        match self.view.protocol {
+            El05Protocol::Native => self
+                .view
+                .identity
+                .as_ref()
+                .map(|identity| identity.uid.clone()),
+            El05Protocol::StandardMit => self
+                .view
+                .motor_id
+                .map(|id| format!("standard-mit-selection-{}-{id}", self.selection_generation)),
+        }
+    }
 }
 struct Inner {
     bus: Arc<dyn CanBus>,
+    protocol: El05Protocol,
     state: StdMutex<Shared>,
     gate: Mutex<()>,
     running: AtomicBool,
@@ -283,17 +354,28 @@ pub struct El05Session {
 
 impl El05Session {
     pub async fn start(bus: Arc<dyn CanBus>, host_id: u8) -> Result<Arc<Self>> {
-        if host_id == 0xFE {
+        Self::start_with_protocol(bus, host_id, El05Protocol::Native).await
+    }
+    pub async fn start_with_protocol(
+        bus: Arc<dyn CanBus>,
+        host_id: u8,
+        protocol: El05Protocol,
+    ) -> Result<Arc<Self>> {
+        if protocol == El05Protocol::Native && host_id == 0xFE {
             bail!("EL05 host ID 254 is reserved for discovery replies");
         }
         let rx = bus
-            .subscribe(CanFilter::pass_all_extended())
+            .subscribe(match protocol {
+                El05Protocol::Native => CanFilter::pass_all_extended(),
+                El05Protocol::StandardMit => CanFilter::pass_all_standard(),
+            })
             .await
             .map_err(|e| anyhow!("subscribe EL05: {e}"))?;
         let inner = Arc::new(Inner {
             bus,
+            protocol,
             state: StdMutex::new(Shared {
-                view: El05State::new(host_id, true),
+                view: El05State::with_protocol(host_id, true, protocol),
                 devices: BTreeMap::new(),
                 last_seen: None,
                 feedback_times: VecDeque::new(),
@@ -319,6 +401,8 @@ impl El05Session {
                 last_sent_target: None,
                 last_target_sent: None,
                 target_sequence: 0,
+                selection_generation: 0,
+                mit_requests: BTreeMap::new(),
             }),
             gate: Mutex::new(()),
             running: AtomicBool::new(true),
@@ -384,29 +468,49 @@ impl El05Session {
                 rx_count: entry.count,
             })
             .collect();
-        view.faults = fault_names(view.fault_bits, view.fault_code, view.warning_code);
+        view.faults = if view.protocol == El05Protocol::StandardMit {
+            let mut faults = Vec::new();
+            if view.fault_bits != 0 {
+                faults.push("MIT drive fault / 电机故障".into());
+            }
+            if view.warning_code != 0 {
+                faults.push("MIT drive warning / 电机预警".into());
+            }
+            faults
+        } else {
+            fault_names(view.fault_bits, view.fault_code, view.warning_code)
+        };
         view
     }
     pub fn devices(&self) -> Vec<El05Device> {
         self.snapshot().devices
     }
     pub async fn discover(&self) -> Result<()> {
+        let _guard = self.inner.gate.lock().await;
         self.inner.check_running()?;
-        self.inner.state.lock().unwrap().scan_next = Some(0);
+        let mut s = self.inner.state.lock().unwrap();
+        if self.inner.protocol == El05Protocol::StandardMit
+            && (s.armed || s.safety_hold || s.experiment.status.active || s.gravity.status.active)
+        {
+            bail!("stop standard MIT control before scanning; discovery sends Stop frames");
+        }
+        s.scan_next = Some(0);
         Ok(())
     }
     pub async fn attach(&self, motor_id: u8) -> Result<El05State> {
         let _guard = self.inner.gate.lock().await;
         self.inner.check_running()?;
         let host_id = self.inner.state.lock().unwrap().view.host_id;
-        validate_motor_id(motor_id, host_id)?;
+        if self.inner.protocol == El05Protocol::Native {
+            validate_motor_id(motor_id, host_id)?;
+        }
         if self.inner.state.lock().unwrap().view.motor_id.is_some() {
             self.inner.stop_locked(false).await?;
         }
         {
             let mut s = self.inner.state.lock().unwrap();
             let tx_count = s.view.tx_count;
-            s.view = El05State::new(host_id, true);
+            s.view = El05State::with_protocol(host_id, true, self.inner.protocol);
             s.view.tx_count = tx_count;
             s.view.attached = true;
             s.view.motor_id = Some(motor_id);
@@ -418,6 +522,11 @@ impl El05Session {
             s.last_sent_target = None;
             s.last_target_sent = None;
             s.mode_confirmed = false;
+            s.selection_generation = s.selection_generation.wrapping_add(1);
+            if self.inner.protocol == El05Protocol::StandardMit {
+                s.scan_next = None;
+                s.mit_requests.clear();
+            }
             s.receive_error = None;
             s.gravity.invalidate_reference(
                 "motor selection changed; capture the downward reference again",
@@ -425,6 +534,10 @@ impl El05Session {
             s.client_seen = Instant::now();
         }
         self.inner.stop_locked(false).await?;
+        if self.inner.protocol == El05Protocol::StandardMit {
+            self.inner.state.lock().unwrap().mode_confirmed = true;
+            return Ok(self.snapshot());
+        }
         let mode = self.inner.read_locked(0x7005).await?;
         let Some(mode) = El05Mode::from_raw(mode.value as u8) else {
             bail!("unsupported EL05 run_mode {}", mode.value);
@@ -443,7 +556,18 @@ impl El05Session {
     }
     async fn set_mode_locked(&self, mode: El05Mode) -> Result<El05State> {
         self.inner.selected()?;
+        if self.inner.protocol == El05Protocol::StandardMit && mode != El05Mode::Mit {
+            bail!("standard MIT compatibility supports MIT control only");
+        }
         self.inner.stop_locked(false).await?;
+        if self.inner.protocol == El05Protocol::StandardMit {
+            let mut s = self.inner.state.lock().unwrap();
+            s.mode_confirmed = true;
+            s.receive_error = None;
+            s.view.last_error = None;
+            drop(s);
+            return Ok(self.snapshot());
+        }
         self.inner.state.lock().unwrap().mode_confirmed = false;
         tokio::time::sleep(Duration::from_millis(30)).await;
         self.inner
@@ -499,11 +623,11 @@ impl El05Session {
             }
             if s.feedback_times
                 .back()
-                .is_none_or(|t| t.elapsed() > FEEDBACK_TIMEOUT)
+                .is_none_or(|t| t.elapsed() > s.control_feedback_timeout())
             {
                 bail!("EL05 is offline; select the motor again");
             }
-            if s.view.fault_bits != 0 || s.view.fault_code != 0 {
+            if s.drive_faulted() {
                 bail!("clear EL05 faults before enabling");
             }
         }
@@ -536,17 +660,23 @@ impl El05Session {
                 current_limit_a: 1.0,
             },
         };
-        self.inner
-            .write_verified_locked(0x7028, f64::from(MOTOR_TIMEOUT))
-            .await?;
+        if self.inner.protocol == El05Protocol::Native {
+            self.inner
+                .write_verified_locked(0x7028, f64::from(MOTOR_TIMEOUT))
+                .await?;
+        } else {
+            self.inner.state.lock().unwrap().scan_next = None;
+        }
         self.inner.check_stop_request(stop_request_revision)?;
         self.inner.target_locked(neutral, true).await?;
         self.inner.check_stop_request(stop_request_revision)?;
         let sequence = self.inner.state.lock().unwrap().feedback_sequence;
         let enabled = async {
-            self.inner
-                .send(frame(3, u16::from(host), id, [0; 8])?)
-                .await?;
+            let command = match self.inner.protocol {
+                El05Protocol::Native => frame(3, u16::from(host), id, [0; 8])?,
+                El05Protocol::StandardMit => mit::enable_frame(id)?,
+            };
+            self.inner.send(command).await?;
             self.inner.wait_status(sequence, 2, true).await
         }
         .await;
@@ -561,6 +691,9 @@ impl El05Session {
         {
             let mut s = self.inner.state.lock().unwrap();
             s.armed = true;
+            if self.inner.protocol == El05Protocol::StandardMit {
+                s.view.enabled = true;
+            }
             s.client_seen = Instant::now();
             s.view.last_error = None;
         }
@@ -584,6 +717,7 @@ impl El05Session {
         self.inner.stop_locked(false).await
     }
     pub async fn clear_fault(&self) -> Result<()> {
+        self.inner.require_native("clear fault")?;
         let _guard = self.inner.gate.lock().await;
         self.inner.stop_locked(true).await?;
         let mut s = self.inner.state.lock().unwrap();
@@ -593,6 +727,7 @@ impl El05Session {
         Ok(())
     }
     pub async fn read_identity(&self) -> Result<El05Identity> {
+        self.inner.require_native("UID query")?;
         let _guard = self.inner.gate.lock().await;
         if {
             let s = self.inner.state.lock().unwrap();
@@ -607,6 +742,7 @@ impl El05Session {
             .ok_or_else(|| anyhow!("EL05 ID/UID query timed out for motor {id}"))
     }
     pub async fn read_version(&self) -> Result<El05Version> {
+        self.inner.require_native("version query")?;
         let _guard = self.inner.gate.lock().await;
         let (id, host, _) = self.inner.selected()?;
         // This query is a special Stop frame, so end target streaming first.
@@ -634,6 +770,7 @@ impl El05Session {
         result
     }
     pub async fn change_id(&self, new_id: u8) -> Result<El05Identity> {
+        self.inner.require_native("change motor ID")?;
         let _guard = self.inner.gate.lock().await;
         let (old_id, host, _) = self.inner.selected()?;
         // The 0x200A CAN_ID table explicitly limits configured IDs to 0..127.
@@ -779,15 +916,70 @@ impl El05Session {
             );
             s.feedback_sequence
         };
-        let result = async {
-            self.inner
-                .send(frame(6, u16::from(host), id, [1, 0, 0, 0, 0, 0, 0, 0])?)
-                .await?;
-            self.inner.wait_status(sequence, 0, true).await?;
-            self.inner.read_locked(0x7019).await?;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
+        let result = if self.inner.protocol == El05Protocol::StandardMit {
+            async {
+                {
+                    let mut s = self.inner.state.lock().unwrap();
+                    s.feedback_times.clear();
+                    s.last_sent_target = None;
+                    s.last_target_sent = None;
+                    s.target_sequence = 0;
+                }
+                self.inner.send(mit::zero_frame(id)?).await?;
+                // This compatible drive acknowledges Zero with the OLD angle.
+                // A later Stop request is the first useful coordinate readback.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let sequence = {
+                    let mut s = self.inner.state.lock().unwrap();
+                    s.view.position_rad = None;
+                    s.view.unwrapped_position_rad = None;
+                    s.view.position_velocity_rad_s = None;
+                    s.position_window.clear();
+                    s.feedback_times.clear();
+                    s.feedback_sequence
+                };
+                self.inner.send(mit::stop_frame(id)?).await?;
+                self.inner.wait_status(sequence, 0, true).await?;
+                let mut s = self.inner.state.lock().unwrap();
+                let position = s
+                    .view
+                    .position_rad
+                    .ok_or_else(|| anyhow!("standard MIT zero has no position readback"))?;
+                if !position.is_finite() || position.abs() > 0.01 {
+                    bail!("standard MIT zero readback is {position:.6} rad, expected near zero");
+                }
+                // Rebase from the confirmed new angle, never unwrap an old
+                // acknowledgement across the coordinate-system change.
+                s.view.unwrapped_position_rad = Some(position);
+                s.view.position_velocity_rad_s = None;
+                s.position_window.clear();
+                s.position_window.push_back((Instant::now(), position));
+                s.view.enabled = false;
+                if s.receive_error.as_deref().is_some_and(|error| {
+                    matches!(
+                        error,
+                        "standard MIT control feedback gap exceeded 30 ms; motor stopped"
+                            | "EL05 gravity feedback gap; motor stopped"
+                    )
+                }) {
+                    // These are latched failures from the old coordinate run.
+                    // Transport errors are deliberately retained.
+                    s.receive_error = None;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
+        } else {
+            async {
+                self.inner
+                    .send(frame(6, u16::from(host), id, [1, 0, 0, 0, 0, 0, 0, 0])?)
+                    .await?;
+                self.inner.wait_status(sequence, 0, true).await?;
+                self.inner.read_locked(0x7019).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
+        };
         if let Err(error) = result {
             let error = format!("EL05 mechanical zero/readback was not confirmed: {error}. Select the motor again to refresh its coordinates before enabling");
             self.inner.state.lock().unwrap().view.last_error = Some(error.clone());
@@ -795,7 +987,11 @@ impl El05Session {
         }
         let mut s = self.inner.state.lock().unwrap();
         s.mode_confirmed = true;
-        s.view.last_error = None;
+        s.view.last_error = if self.inner.protocol == El05Protocol::StandardMit {
+            s.receive_error.clone()
+        } else {
+            None
+        };
         Ok(())
     }
     pub async fn send_target(&self, target: El05Target, repeat: bool) -> Result<()> {
@@ -820,7 +1016,11 @@ impl El05Session {
             return Err(error);
         }
         let mut s = self.inner.state.lock().unwrap();
-        s.target = (repeat && mode != El05Mode::PositionPp).then_some(target);
+        // Standard MIT feedback is request/response; keep sending the target
+        // to maintain telemetry and host-side stopping even for a single UI send.
+        s.target = (self.inner.protocol == El05Protocol::StandardMit
+            || (repeat && mode != El05Mode::PositionPp))
+            .then_some(target);
         Ok(())
     }
     /// Stopping transmission alone leaves a drive's last target active. The UI
@@ -836,18 +1036,22 @@ impl El05Session {
             let s = self.inner.state.lock().unwrap();
             validate_gravity_capture(&s)?;
         }
-        let identity = self
-            .inner
-            .query_identity_locked(id, host)
-            .await?
-            .ok_or_else(|| {
-                anyhow!("EL05 UID must be verified before capturing the gravity reference")
-            })?;
+        if self.inner.protocol == El05Protocol::Native {
+            self.inner
+                .query_identity_locked(id, host)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("EL05 UID must be verified before capturing the gravity reference")
+                })?;
+        }
         let mut s = self.inner.state.lock().unwrap();
         validate_gravity_capture(&s)?;
+        let binding = s
+            .gravity_binding()
+            .ok_or_else(|| anyhow!("select an EL05 motor first"))?;
         let position = s.view.unwrapped_position_rad.unwrap();
         let captured_at_s = s.epoch.elapsed().as_secs_f64();
-        Ok(s.gravity.capture(id, identity.uid, position, captured_at_s))
+        Ok(s.gravity.capture(id, binding, position, captured_at_s))
     }
 
     pub async fn start_gravity_compensation(
@@ -967,7 +1171,10 @@ impl El05Session {
             };
 
             let mut parameters = Vec::new();
-            for index in [0x700B, 0x7026, 0x7028] {
+            for index in [0x700B, 0x7026, 0x7028]
+                .into_iter()
+                .filter(|_| self.inner.protocol == El05Protocol::Native)
+            {
                 let _guard = self.inner.gate.lock().await;
                 self.inner.check_stop_request(Some(stop_request_revision))?;
                 if self.inner.state.lock().unwrap().stop_revision != stop_revision {
@@ -989,9 +1196,8 @@ impl El05Session {
                 if s.receive_error.is_some()
                     || s.feedback_times
                         .back()
-                        .is_none_or(|t| t.elapsed() > FEEDBACK_TIMEOUT)
-                    || s.view.fault_bits != 0
-                    || s.view.fault_code != 0
+                        .is_none_or(|t| t.elapsed() > s.control_feedback_timeout())
+                    || s.drive_faulted()
                 {
                     bail!("EL05 experiment requires fresh feedback and no faults");
                 }
@@ -1065,6 +1271,12 @@ impl El05Session {
             .map(|sample| sample.t_s)
             .unwrap_or(-1.0);
         ExperimentData {
+            protocol: self.inner.protocol,
+            feedback_velocity_bits: if self.inner.protocol == El05Protocol::StandardMit {
+                12
+            } else {
+                16
+            },
             feedback_velocity_sign: FEEDBACK_VELOCITY_SIGN,
             status: s.experiment.status.clone(),
             motor_id: s.experiment.motor_id,
@@ -1098,6 +1310,7 @@ impl El05Session {
         self.inner.read_locked(index).await
     }
     pub async fn write_parameter(&self, index: u16, value: f64) -> Result<()> {
+        self.inner.require_native("parameter write")?;
         if index == 0x7005 {
             let payload = encode_parameter(index, value)?;
             let mode =
@@ -1155,6 +1368,13 @@ impl Drop for El05Session {
 }
 
 impl Inner {
+    fn require_native(&self, operation: &str) -> Result<()> {
+        self.check_running()?;
+        if self.protocol != El05Protocol::Native {
+            bail!("{operation} is unavailable in standard MIT compatibility mode");
+        }
+        Ok(())
+    }
     fn check_stop_request(&self, expected: Option<u64>) -> Result<()> {
         self.check_running()?;
         if expected
@@ -1182,6 +1402,17 @@ impl Inner {
         ))
     }
     async fn send(&self, frame: CanFrame) -> Result<()> {
+        if self.protocol == El05Protocol::StandardMit {
+            let CanId::Standard(id) = frame.id() else {
+                bail!("standard MIT session cannot send native extended frames");
+            };
+            // Record before awaiting TX, since an immediate reply can race send completion.
+            self.state
+                .lock()
+                .unwrap()
+                .mit_requests
+                .insert(id as u8, Instant::now());
+        }
         self.bus
             .send(frame)
             .await
@@ -1195,8 +1426,17 @@ impl Inner {
         loop {
             {
                 let s = self.state.lock().unwrap();
-                if s.feedback_sequence > sequence && s.view.status_code == expected {
-                    if !require_no_fault || s.view.fault_bits == 0 {
+                if s.feedback_sequence > sequence
+                    && (self.protocol == El05Protocol::StandardMit
+                        || s.view.status_code == expected)
+                {
+                    // Native clear-fault acknowledges through type-2 before
+                    // clear_fault() discards the previous type-21 fault code.
+                    let clean = match self.protocol {
+                        El05Protocol::Native => s.view.fault_bits == 0,
+                        El05Protocol::StandardMit => !s.drive_faulted(),
+                    };
+                    if !require_no_fault || clean {
                         return Ok(());
                     }
                     bail!("EL05 reported fault bits 0x{:02X}", s.view.fault_bits);
@@ -1208,6 +1448,9 @@ impl Inner {
                 }
             }
             if Instant::now() >= deadline {
+                if self.protocol == El05Protocol::StandardMit {
+                    bail!("standard MIT command did not receive fresh feedback before timeout");
+                }
                 bail!("EL05 did not confirm state {expected} before timeout");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1225,31 +1468,52 @@ impl Inner {
             s.safety_hold = true;
             s.feedback_sequence
         };
-        let result = async {
-            self.send(frame(
-                4,
-                u16::from(host),
-                id,
-                [u8::from(clear), 0, 0, 0, 0, 0, 0, 0],
-            )?)
-            .await?;
-            self.wait_status(sequence, 0, clear).await
-        }
-        .await;
+        let result = if self.protocol == El05Protocol::StandardMit {
+            // Some compatible drives have no useful status bits or configurable
+            // watchdog. Require fresh replies and repeat Stop even after a failure.
+            let mut result = Ok(());
+            for _ in 0..3 {
+                let sequence = self.state.lock().unwrap().feedback_sequence;
+                result = match self.send(mit::stop_frame(id)?).await {
+                    Ok(()) => self.wait_status(sequence, 0, false).await,
+                    Err(error) => Err(error),
+                };
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result
+        } else {
+            async {
+                self.send(frame(
+                    4,
+                    u16::from(host),
+                    id,
+                    [u8::from(clear), 0, 0, 0, 0, 0, 0, 0],
+                )?)
+                .await?;
+                self.wait_status(sequence, 0, clear).await
+            }
+            .await
+        };
         let mut s = self.state.lock().unwrap();
         if result.is_ok() {
             s.view.enabled = false;
             s.safety_hold = false;
         } else {
-            s.view.last_error = Some(
+            s.view.last_error = Some(if self.protocol == El05Protocol::StandardMit {
+                "MIT Stop did not receive fresh feedback; control suspended, retry Stop".into()
+            } else {
                 "EL05 stop was not confirmed; polling suspended so the drive watchdog can expire"
-                    .into(),
-            );
+                    .into()
+            });
         }
         result
     }
     async fn reporting_locked(&self, enabled: bool) -> Result<()> {
         let (id, host, _) = self.selected()?;
+        if self.protocol == El05Protocol::StandardMit {
+            // Request/reply sampling is driven by service_loop, not type-24 configuration.
+            return Ok(());
+        }
         self.send(frame(
             24,
             u16::from(host),
@@ -1261,6 +1525,7 @@ impl Inner {
         Ok(())
     }
     async fn read_locked(&self, index: u16) -> Result<El05ParameterValue> {
+        self.require_native("parameter read")?;
         parameter_kind(index)?;
         let (id, host, _) = self.selected()?;
         let (tx, rx) = oneshot::channel();
@@ -1279,6 +1544,7 @@ impl Inner {
         }
     }
     async fn query_identity_locked(&self, id: u8, host: u8) -> Result<Option<El05Identity>> {
+        self.require_native("UID query")?;
         self.identity_request_locked(id, frame(0, u16::from(host), id, [0; 8])?)
             .await
     }
@@ -1307,6 +1573,7 @@ impl Inner {
         result
     }
     async fn write_locked(&self, index: u16, value: f64) -> Result<()> {
+        self.require_native("parameter write")?;
         let (id, host, _) = self.selected()?;
         self.send(write_frame(id, host, index, value)?).await
     }
@@ -1333,8 +1600,12 @@ impl Inner {
                 self.read_locked(0x702E).await?;
             }
         }
-        for frame in target_frames(id, host, target, limits)? {
-            let is_mit = frame.id().raw() >> 24 == 1;
+        let frames = match self.protocol {
+            El05Protocol::Native => target_frames(id, host, target, limits)?,
+            El05Protocol::StandardMit => vec![mit::target_frame(id, target)?],
+        };
+        for frame in frames {
+            let is_mit = matches!(target, El05Target::Mit { .. });
             let can_id = frame.id().raw();
             let payload = frame.data().try_into().unwrap();
             let started = Instant::now();
@@ -1355,6 +1626,9 @@ impl Inner {
 }
 
 fn validate_gravity_reference(s: &Shared, config: &GravityCompensationConfig) -> Result<()> {
+    if s.standard_position_saturated() {
+        bail!("{MIT_SATURATED_POSITION_MESSAGE}");
+    }
     let motor_id = s
         .view
         .motor_id
@@ -1362,10 +1636,7 @@ fn validate_gravity_reference(s: &Shared, config: &GravityCompensationConfig) ->
     if !s.gravity.reference_matches(
         &config.reference_id,
         motor_id,
-        s.view
-            .identity
-            .as_ref()
-            .map(|identity| identity.uid.as_str()),
+        s.gravity_binding().as_deref(),
     ) {
         bail!("EL05 downward reference is missing or belongs to an older motor/coordinate session; capture it again");
     }
@@ -1382,13 +1653,15 @@ fn validate_gravity_capture(s: &Shared) -> Result<()> {
     {
         bail!("stop EL05 before capturing the pendulum downward reference");
     }
+    if s.standard_position_saturated() {
+        bail!("{MIT_SATURATED_POSITION_MESSAGE}");
+    }
     if s.receive_error.is_some()
         || !s.mode_confirmed
         || s.feedback_times
             .back()
-            .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
-        || s.view.fault_bits != 0
-        || s.view.fault_code != 0
+            .is_none_or(|t| t.elapsed() > s.gravity_feedback_timeout())
+        || s.drive_faulted()
         || s.view.unwrapped_position_rad.is_none_or(|q| !q.is_finite())
     {
         bail!("EL05 downward reference requires fresh feedback, a confirmed mode and no faults");
@@ -1413,13 +1686,15 @@ fn gravity_input_problem(
     if let Some(error) = &s.receive_error {
         return Some(error.clone());
     }
-    let problem = if s
+    let problem = if s.standard_position_saturated() {
+        Some(MIT_SATURATED_POSITION_MESSAGE)
+    } else if s
         .feedback_times
         .back()
-        .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
+        .is_none_or(|t| t.elapsed() > s.gravity_feedback_timeout())
     {
         Some("EL05 gravity compensation feedback timed out; capture the downward reference again")
-    } else if s.view.fault_bits != 0 || s.view.fault_code != 0 {
+    } else if s.drive_faulted() {
         Some("EL05 gravity compensation stopped on a drive fault")
     } else if s.view.mode != El05Mode::Mit || !s.mode_confirmed {
         Some("EL05 gravity compensation requires confirmed MIT mode")
@@ -1451,9 +1726,15 @@ fn gravity_input_problem(
 }
 
 async fn service_loop(inner: Arc<Inner>) {
-    let mut ticker = tokio::time::interval(STEP);
+    let step = if inner.protocol == El05Protocol::StandardMit {
+        MIT_STEP
+    } else {
+        STEP
+    };
+    let mut ticker = tokio::time::interval(step);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ticks: usize = 0;
+    let mut last_stop_retry = Instant::now();
     while inner.running.load(Ordering::Acquire) {
         ticker.tick().await;
         let _guard = inner.gate.lock().await;
@@ -1463,9 +1744,12 @@ async fn service_loop(inner: Arc<Inner>) {
         let gravity_end = {
             let mut s = inner.state.lock().unwrap();
             let reference_lost = if s.gravity.status.reference.is_some() {
-                if s.feedback_times
+                if s.standard_position_saturated() {
+                    Some(MIT_SATURATED_POSITION_MESSAGE.to_string())
+                } else if s
+                    .feedback_times
                     .back()
-                    .is_none_or(|t| t.elapsed() > gravity::FEEDBACK_TIMEOUT)
+                    .is_none_or(|t| t.elapsed() > s.gravity_feedback_timeout())
                 {
                     Some(
                         "EL05 gravity feedback timed out; capture the downward reference again"
@@ -1519,12 +1803,12 @@ async fn service_loop(inner: Arc<Inner>) {
                 } else if s
                     .feedback_times
                     .back()
-                    .is_none_or(|t| t.elapsed() > FEEDBACK_TIMEOUT)
+                    .is_none_or(|t| t.elapsed() > s.control_feedback_timeout())
                 {
                     Some("experiment feedback timed out".to_string())
                 } else if let Some(error) = &s.receive_error {
                     Some(error.clone())
-                } else if s.view.fault_bits != 0 || s.view.fault_code != 0 {
+                } else if s.drive_faulted() {
                     Some("drive fault".to_string())
                 } else if s
                     .experiment
@@ -1567,10 +1851,10 @@ async fn service_loop(inner: Arc<Inner>) {
                 } else if s
                     .feedback_times
                     .back()
-                    .is_none_or(|t| t.elapsed() > FEEDBACK_TIMEOUT)
+                    .is_none_or(|t| t.elapsed() > s.control_feedback_timeout())
                 {
                     Some("EL05 feedback timed out; motor stopped".to_string())
-                } else if s.view.fault_bits != 0 || s.view.fault_code != 0 {
+                } else if s.drive_faulted() {
                     Some("EL05 reported a drive fault; motor stopped".to_string())
                 } else {
                     None
@@ -1587,9 +1871,19 @@ async fn service_loop(inner: Arc<Inner>) {
                 Err(error) => format!("{reason}; {error}"),
             });
         }
-        // A failed Stop must not be kept alive by periodic dictionary reads.
-        // Only an explicit retry may leave this hold; firmware times out too.
+        // Native failed Stop suspends traffic for the configured watchdog.
+        // A compatible drive has no established watchdog: retry only Stop, so
+        // a transient transport outage cannot leave its old target indefinitely.
+        // An explicit successful Stop is still required to leave safety_hold.
         if inner.state.lock().unwrap().safety_hold {
+            if inner.protocol == El05Protocol::StandardMit
+                && last_stop_retry.elapsed() >= Duration::from_millis(250)
+            {
+                last_stop_retry = Instant::now();
+                if let Ok((id, _, _)) = inner.selected() {
+                    let _ = inner.send(mit::stop_frame(id).unwrap()).await;
+                }
+            }
             continue;
         }
         let target = inner.state.lock().unwrap().target;
@@ -1600,7 +1894,20 @@ async fn service_loop(inner: Arc<Inner>) {
                 continue;
             }
         }
-        if ticks % 5 == 0 {
+        let recording = inner.state.lock().unwrap().experiment.status.active;
+        if inner.protocol == El05Protocol::StandardMit
+            && target.is_none()
+            && (recording || ticks % 10 == 0)
+        {
+            // Stop is also the non-driving feedback request. This feeds Record,
+            // backdrive observations and a fresh downward-reference capture.
+            if let Ok((id, _, _)) = inner.selected() {
+                if let Err(error) = inner.send(mit::stop_frame(id).unwrap()).await {
+                    inner.state.lock().unwrap().view.last_error = Some(error.to_string());
+                }
+            }
+        }
+        if inner.protocol == El05Protocol::Native && ticks % 5 == 0 {
             if let Ok((id, host, _)) = inner.selected() {
                 // During experiments favor fresh Iq samples for static torque
                 // regression, while still rotating the other dictionary reads.
@@ -1619,6 +1926,11 @@ async fn service_loop(inner: Arc<Inner>) {
         }
         let probe = {
             let mut s = inner.state.lock().unwrap();
+            if inner.protocol == El05Protocol::StandardMit
+                && (s.armed || s.experiment.status.active || s.gravity.status.active)
+            {
+                s.scan_next = None;
+            }
             s.scan_next.map(|next| {
                 s.scan_next = (next < 255).then_some(next + 1);
                 (next as u8, s.view.host_id)
@@ -1627,7 +1939,11 @@ async fn service_loop(inner: Arc<Inner>) {
         if let Some((id, host)) = probe {
             // Scan every eight-bit address, including ID zero. A UID reply is
             // distinguished from local echoes by its nonzero UID payload.
-            if let Ok(frame) = frame(0, u16::from(host), id, [0; 8]) {
+            let probe_frame = match inner.protocol {
+                El05Protocol::Native => frame(0, u16::from(host), id, [0; 8]),
+                El05Protocol::StandardMit => mit::stop_frame(id),
+            };
+            if let Ok(frame) = probe_frame {
                 if let Err(error) = inner.send(frame).await {
                     inner.state.lock().unwrap().view.last_error = Some(error.to_string());
                 }
@@ -1671,7 +1987,11 @@ async fn receive_loop(inner: Arc<Inner>, mut rx: Box<dyn CanRx>) {
 }
 
 fn observe_frame(inner: &Inner, frame: CanFrame) {
-    if frame.kind() != FrameKind::Data || frame.data().len() != 8 {
+    if inner.protocol == El05Protocol::StandardMit {
+        observe_standard_frame(inner, frame);
+        return;
+    }
+    if frame.kind() != FrameKind::Data || frame.is_fd() || frame.data().len() != 8 {
         return;
     }
     let CanId::Extended(id) = frame.id() else {
@@ -1763,100 +2083,15 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
                 }
                 return;
             }
-            if s.gravity.status.reference.is_some()
-                && s.feedback_times
-                    .back()
-                    .is_some_and(|last| now.duration_since(*last) > gravity::FEEDBACK_TIMEOUT)
-            {
-                let active = s.gravity.status.active;
-                s.gravity.invalidate_reference(
-                    "EL05 gravity feedback gap; capture the downward reference again",
-                );
-                if active {
-                    s.receive_error = Some("EL05 gravity feedback gap; motor stopped".into());
-                }
-            }
             s.view.fault_bits = ((id >> 16) & 0x3F) as u8;
             s.view.status_code = ((id >> 22) & 3) as u8;
             s.view.enabled = s.view.status_code == 2;
-            s.feedback_sequence = s.feedback_sequence.saturating_add(1);
             s.view.position_rad = Some(unpack(data[0], data[1], -12.57, 12.57));
             s.view.velocity_rad_s =
                 Some(f64::from(FEEDBACK_VELOCITY_SIGN) * unpack(data[2], data[3], -50.0, 50.0));
             s.view.torque_nm = Some(unpack(data[4], data[5], -6.0, 6.0));
             s.view.temperature_c = Some(f64::from(u16::from_be_bytes([data[6], data[7]])) / 10.0);
-            let position = s.view.position_rad.unwrap();
-            let unwrapped = match (s.view.unwrapped_position_rad, s.position_window.back()) {
-                (Some(previous), Some((_, _))) => {
-                    // Difference modulo the documented 16-bit position span.
-                    let old_wrapped = (previous + 12.57).rem_euclid(25.14) - 12.57;
-                    previous + (position - old_wrapped + 12.57).rem_euclid(25.14) - 12.57
-                }
-                _ => position,
-            };
-            if s.position_window
-                .back()
-                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(100))
-            {
-                s.position_window.clear();
-            }
-            s.position_window.push_back((now, unwrapped));
-            while s.position_window.len() > 1
-                && s.position_window
-                    .front()
-                    .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(150))
-            {
-                s.position_window.pop_front();
-            }
-            s.view.position_velocity_rad_s = s.position_window.front().and_then(|(t, first)| {
-                let dt = now.duration_since(*t).as_secs_f64();
-                (dt >= 0.08).then(|| (unwrapped - first) / dt)
-            });
-            s.view.unwrapped_position_rad = Some(unwrapped);
-            s.view.feedback_sequence = s.feedback_sequence;
-            s.view.feedback_time_s = Some(now.duration_since(s.epoch).as_secs_f64());
-            let sample = TelemetrySample {
-                t_s: 0.0,
-                sequence: s.feedback_sequence,
-                can_id: id,
-                payload: data.try_into().unwrap(),
-                position_rad: position,
-                unwrapped_position_rad: unwrapped,
-                velocity_rad_s: s.view.velocity_rad_s.unwrap(),
-                position_velocity_rad_s: s.view.position_velocity_rad_s,
-                torque_nm: s.view.torque_nm.unwrap(),
-                current_a: s.view.current_a,
-                current_age_ms: s
-                    .current_seen
-                    .map(|t| now.duration_since(t).as_millis() as u64),
-                dictionary_velocity_rad_s: s.view.dictionary_velocity_rad_s,
-                dictionary_velocity_age_ms: s
-                    .dictionary_velocity_seen
-                    .map(|t| now.duration_since(t).as_millis() as u64),
-                temperature_c: s.view.temperature_c.unwrap(),
-                fault_bits: s.view.fault_bits,
-                status_code: s.view.status_code,
-                target: s.last_sent_target,
-                target_sequence: s.target_sequence,
-                target_age_ms: s
-                    .last_target_sent
-                    .map(|t| now.duration_since(t).as_millis() as u64),
-            };
-            s.experiment.push(sample, now);
-            if s.experiment.status.static_friction.is_some() && s.experiment.status.active {
-                // Apply a detected movement/angle guard to the next service
-                // command, without waiting for a UI poll or waveform tick.
-                let velocity = s.view.velocity_rad_s.unwrap();
-                s.target = s.experiment.runtime_target(position, unwrapped, velocity);
-            }
-            s.feedback_times.push_back(now);
-            while s.feedback_times.len() > 128
-                || s.feedback_times
-                    .front()
-                    .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(2))
-            {
-                s.feedback_times.pop_front();
-            }
+            record_motion_feedback(&mut s, now, id, data);
         }
         17 => {
             let index = u16::from_le_bytes([data[0], data[1]]);
@@ -1912,6 +2147,149 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
             s.view.warning_code = u32::from_le_bytes(data[4..8].try_into().unwrap());
         }
         _ => {}
+    }
+}
+
+fn observe_standard_frame(inner: &Inner, frame: CanFrame) {
+    let Some(feedback) = mit::decode_feedback(&frame) else {
+        return;
+    };
+    let now = Instant::now();
+    let mut s = inner.state.lock().unwrap();
+    // The bus may carry unrelated standard-frame protocols. Only accept a
+    // motor address recently queried by this session; bind the selected reply ID.
+    if s.mit_requests
+        .get(&feedback.source)
+        .is_none_or(|sent| now.duration_since(*sent) > FEEDBACK_TIMEOUT)
+    {
+        return;
+    }
+    if s.view.motor_id == Some(feedback.source)
+        && s.view.reply_id.is_some_and(|id| id != feedback.reply_id)
+    {
+        return;
+    }
+    let entry = s.devices.entry(feedback.source).or_insert(DeviceRecord {
+        uid: None,
+        seen: now,
+        count: 0,
+    });
+    entry.seen = now;
+    entry.count = entry.count.saturating_add(1);
+    if s.view.motor_id != Some(feedback.source) {
+        return;
+    }
+    s.view.reply_id = Some(feedback.reply_id);
+    s.last_seen = Some(now);
+    s.view.rx_count = s.view.rx_count.saturating_add(1);
+    s.view.fault_bits = u8::from(feedback.fault);
+    s.view.warning_code = u32::from(feedback.warning);
+    s.view.status_code = feedback.status;
+    // enabled is the acknowledged host lifecycle, not these unreliable raw bits.
+    s.view.position_rad = Some(feedback.position_rad);
+    s.view.velocity_rad_s = Some(feedback.velocity_rad_s);
+    s.view.torque_nm = Some(feedback.torque_nm);
+    s.view.temperature_c = Some(feedback.temperature_c);
+    record_motion_feedback(&mut s, now, u32::from(feedback.reply_id), &feedback.payload);
+}
+
+fn record_motion_feedback(s: &mut Shared, now: Instant, id: u32, data: &[u8]) {
+    // A delayed reply must not erase evidence of a gap before the service
+    // worker checks it. Never continue fast host damping on old velocity.
+    if s.view.protocol == El05Protocol::StandardMit
+        && s.armed
+        && s.feedback_times
+            .back()
+            .is_some_and(|last| now.duration_since(*last) > MIT_CONTROL_FEEDBACK_TIMEOUT)
+    {
+        s.receive_error =
+            Some("standard MIT control feedback gap exceeded 30 ms; motor stopped".into());
+    }
+    if s.gravity.status.reference.is_some()
+        && s.feedback_times
+            .back()
+            .is_some_and(|last| now.duration_since(*last) > s.gravity_feedback_timeout())
+    {
+        let active = s.gravity.status.active;
+        s.gravity.invalidate_reference(
+            "EL05 gravity feedback gap; capture the downward reference again",
+        );
+        if active {
+            s.receive_error = Some("EL05 gravity feedback gap; motor stopped".into());
+        }
+    }
+    s.feedback_sequence = s.feedback_sequence.saturating_add(1);
+    let position = s.view.position_rad.unwrap();
+    let unwrapped = match (s.view.unwrapped_position_rad, s.position_window.back()) {
+        (Some(previous), Some((_, _))) => {
+            // Difference modulo the documented 16-bit position span.
+            let old_wrapped = (previous + 12.57).rem_euclid(25.14) - 12.57;
+            previous + (position - old_wrapped + 12.57).rem_euclid(25.14) - 12.57
+        }
+        _ => position,
+    };
+    if s.position_window
+        .back()
+        .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(100))
+    {
+        s.position_window.clear();
+    }
+    s.position_window.push_back((now, unwrapped));
+    while s.position_window.len() > 1
+        && s.position_window
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(150))
+    {
+        s.position_window.pop_front();
+    }
+    s.view.position_velocity_rad_s = s.position_window.front().and_then(|(t, first)| {
+        let dt = now.duration_since(*t).as_secs_f64();
+        (dt >= 0.08).then(|| (unwrapped - first) / dt)
+    });
+    s.view.unwrapped_position_rad = Some(unwrapped);
+    s.view.feedback_sequence = s.feedback_sequence;
+    s.view.feedback_time_s = Some(now.duration_since(s.epoch).as_secs_f64());
+    let sample = TelemetrySample {
+        t_s: 0.0,
+        sequence: s.feedback_sequence,
+        can_id: id,
+        payload: data.try_into().unwrap(),
+        position_rad: position,
+        unwrapped_position_rad: unwrapped,
+        velocity_rad_s: s.view.velocity_rad_s.unwrap(),
+        position_velocity_rad_s: s.view.position_velocity_rad_s,
+        torque_nm: s.view.torque_nm.unwrap(),
+        current_a: s.view.current_a,
+        current_age_ms: s
+            .current_seen
+            .map(|t| now.duration_since(t).as_millis() as u64),
+        dictionary_velocity_rad_s: s.view.dictionary_velocity_rad_s,
+        dictionary_velocity_age_ms: s
+            .dictionary_velocity_seen
+            .map(|t| now.duration_since(t).as_millis() as u64),
+        temperature_c: s.view.temperature_c.unwrap(),
+        fault_bits: s.view.fault_bits,
+        status_code: s.view.status_code,
+        target: s.last_sent_target,
+        target_sequence: s.target_sequence,
+        target_age_ms: s
+            .last_target_sent
+            .map(|t| now.duration_since(t).as_millis() as u64),
+    };
+    s.experiment.push(sample, now);
+    if s.experiment.status.static_friction.is_some() && s.experiment.status.active {
+        // Apply a detected movement/angle guard to the next service
+        // command, without waiting for a UI poll or waveform tick.
+        let velocity = s.view.velocity_rad_s.unwrap();
+        s.target = s.experiment.runtime_target(position, unwrapped, velocity);
+    }
+    s.feedback_times.push_back(now);
+    while s.feedback_times.len() > 128
+        || s.feedback_times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(2))
+    {
+        s.feedback_times.pop_front();
     }
 }
 
@@ -2423,6 +2801,21 @@ mod tests {
         let app = El05Session::start(bus.clone(), 253).await.unwrap();
         app.attach(1).await.unwrap();
         (bus, app)
+    }
+
+    #[tokio::test]
+    async fn native_clear_fault_accepts_clean_status_before_clearing_old_fault_code() {
+        let (_bus, app) = attached().await;
+        {
+            let mut state = app.inner.state.lock().unwrap();
+            state.view.fault_code = 1;
+            state.view.warning_code = 1;
+        }
+        app.clear_fault().await.unwrap();
+        assert_eq!(app.snapshot().fault_code, 0);
+        assert_eq!(app.snapshot().warning_code, 0);
+        app.enable().await.unwrap();
+        app.shutdown().await.unwrap();
     }
 
     fn experiment_config(kind: ExperimentKind) -> ExperimentConfig {

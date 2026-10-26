@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { Alert, Button, Card, Descriptions, InputNumber, Space, Tag, Typography } from "antd";
+import { Alert, Button, Card, Descriptions, InputNumber, Popconfirm, Space, Tag, Typography } from "antd";
 import { el05Api, type El05GravityCompensationConfig, type El05State } from "../el05Api";
 import { pendulumModel } from "../el05Experiment";
+import { gravityReadiness, type GravityBlocker } from "../el05Gravity";
 
 type Settings = Omit<El05GravityCompensationConfig, "reference_id">;
 const DEFAULT_SETTINGS: Settings = {
@@ -16,13 +17,14 @@ const DEFAULT_SETTINGS: Settings = {
   ramp_s: 1,
 };
 
-export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
+export function El05GravityPanel({ state, zh, busy, stopping, run, stop, setZero }: {
   state: El05State | null;
   zh: boolean;
   busy: boolean;
   stopping: boolean;
   run: (operation: () => Promise<unknown>, success?: string) => Promise<void>;
   stop: () => Promise<void>;
+  setZero: () => Promise<void>;
 }) {
   const tr = (cn: string, en: string) => zh ? cn : en;
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -38,16 +40,31 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
   const peakTorque = model.gravityNm * shown.compensation_scale;
   const insufficientTorque = peakTorque > shown.torque_limit_nm + 1e-9;
   const validModel = model.gravityNm > 0;
-  const fresh = !!state?.connected && !!state.attached && state.online
-    && state.feedback_age_ms != null && state.feedback_age_ms <= 150;
-  const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0);
-  const atRest = state?.velocity_rad_s != null && Math.abs(state.velocity_rad_s) <= 0.1
-    && (state.position_velocity_rad_s == null || Math.abs(state.position_velocity_rad_s) <= 0.1);
-  const canCapture = fresh && !state?.enabled && atRest && !faulted && !locked;
-  const canStart = fresh && !state?.enabled && !faulted && !locked && !!reference
-    && reference.motor_id === state?.motor_id && validModel && !insufficientTorque;
-  const angle = fresh && reference && state?.unwrapped_position_rad != null
-    ? state.unwrapped_position_rad - reference.position_rad : null;
+  const { fresh, position, positionSaturated, canCapture, canStart, captureBlocker, startBlocker } = gravityReadiness(state,
+    { busy: busy || stopping, validModel, insufficientTorque });
+  const angle = fresh && reference && position != null && Number.isFinite(reference.position_rad)
+    ? position - reference.position_rad : null;
+  const blockerText = (blocker: GravityBlocker | null): string | null => {
+    if (!blocker) return null;
+    const messages: Record<GravityBlocker, [string, string]> = {
+      connect: ["请先连接 CAN。", "Connect CAN first."],
+      select: ["请先选择电机。", "Select a motor first."],
+      feedback: ["等待新鲜反馈（需在 150 ms 内）。", "Waiting for fresh feedback (within 150 ms)."],
+      position: ["尚未收到有效编码器位置。", "No valid encoder position has arrived."],
+      position_saturated: ["位置量程已满；请先停止并重置位置零点，再记录下垂参考。", "Position range is saturated. Stop and reset the position zero, then capture the downward reference."],
+      fault: ["请先处理电机故障或预警。", "Resolve the motor fault or warning first."],
+      busy: ["正在处理操作，请稍候。", "An operation is in progress."],
+      experiment: ["请先停止摆锤性能测试。", "Stop the pendulum experiment first."],
+      active: ["零重力保持正在运行。", "Zero-gravity hold is running."],
+      enabled: ["请先停止手动控制。", "Stop manual control first."],
+      moving: ["等待摆锤静止（速度需不超过 0.1 rad/s）。", "Wait for the pendulum to rest (speed at most 0.1 rad/s)."],
+      reference: ["请先记录竖直下垂参考。", "Capture the vertically downward reference first."],
+      reference_motor: ["当前参考属于其他电机，请重新记录。", "The reference belongs to another motor; capture it again."],
+      model: ["请输入非零末端质量或力臂质量。", "Enter a nonzero end mass or arm mass."],
+      torque: ["所需补偿超过转矩上限，请调整负载参数或上限。", "Required compensation exceeds the torque limit; adjust the load or limit."],
+    };
+    return messages[blocker][zh ? 0 : 1];
+  };
   const predictedTorque = angle == null ? null : peakTorque * Math.sin(angle);
   const field = (label: string, key: keyof Settings, min: number, max: number, step: number, factor = 1) => (
     <label className="el05-field">
@@ -75,6 +92,17 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
         "Enter the load and arm geometry, let the pendulum hang vertically down, wait for rest, then capture the downward reference and start. A compensation scale of 1 cancels the model's gravity. Increase damping to reduce motion after release. Model errors can cause slow drift.",
       )}</Typography.Paragraph>
       {experimentActive && <Alert type="info" showIcon message={tr("请先停止摆锤性能测试，再开启零重力保持。", "Stop the pendulum experiment before starting zero-gravity hold.")} />}
+      {positionSaturated && <Alert type="warning" showIcon
+        message={tr("位置反馈已到 ±12.57 rad 量程端点", "Position feedback has reached the ±12.57 rad endpoint")}
+        description={tr("端点读数不能用于计算真实摆角。先停止电机并重置位置零点，然后重新记录竖直下垂参考；此操作会修改电机零位并使旧参考失效。", "The saturated reading cannot establish the pendulum angle. Stop and reset the position zero, then capture vertically down again. This changes the motor zero and invalidates the previous reference.")} />}
+      {state?.protocol === "StandardMit" && <Space style={{ margin: "12px 0" }} wrap>
+        <Popconfirm title={tr("停止电机并将当前位置设为零点？", "Stop the motor and set the current position to zero?")}
+          description={tr("这会修改电机位置零位，并使旧下垂参考失效；完成后需要重新记录参考。", "This changes the motor position zero and invalidates the previous downward reference. Capture a new reference afterward.")}
+          okText={tr("停止并置零", "Stop & reset zero")} cancelText={tr("取消", "Cancel")}
+          disabled={!state.attached || locked} onConfirm={setZero}>
+          <Button disabled={!state.attached || locked} loading={busy}>{tr("停止并重置位置零点", "Stop & reset position zero")}</Button>
+        </Popconfirm>
+      </Space>}
       <div className="el05-target__fields">
         {field(tr("末端质量 (kg)", "End mass (kg)"), "mass_kg", 0, 20, 0.05)}
         {field(tr("轴至负重重心 (mm)", "Axis to load CoM (mm)"), "length_m", 1, 2000, 1, 1000)}
@@ -103,6 +131,7 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
           <Tag color={reference ? "green" : "default"}>{reference ? tr("下垂参考已测定", "Downward reference captured") : tr("需要测定下垂参考", "Capture a downward reference")}</Tag>
           {reference && <Typography.Text code>θ₀ = {reference.position_rad.toFixed(4)} rad</Typography.Text>}
         </Space>
+        {captureBlocker && <Typography.Paragraph type="secondary" style={{ margin: "8px 0" }}>{tr("暂不能记录：", "Cannot capture yet: ")}{blockerText(captureBlocker)}</Typography.Paragraph>}
         <Typography.Paragraph type="secondary" className="el05-experiment-notes">{tr(
           "停机且摆锤静止时才能记录参考；记录参考不修改电机机械零点。重连、更换电机、修改机械零位或反馈中断后需要重新记录。",
           "Capture requires a stopped motor and a stationary pendulum. Capturing the reference preserves the motor's mechanical zero. Capture again after reconnecting, changing motors, changing the mechanical zero, or losing feedback.",
@@ -114,13 +143,16 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
         <Button type="primary" danger size="large" disabled={!state?.attached} loading={stopping} onClick={() => void stop()}>{tr("停止补偿和电机", "Stop compensation & motor")}</Button>
         <Typography.Text type="secondary">{tr("停止后支撑转矩立即撤去，摆锤将受重力作用。", "Stopping removes support torque immediately; the pendulum will move under gravity.")}</Typography.Text>
       </div>
+      {startBlocker && <Typography.Paragraph type="secondary" style={{ margin: "8px 0" }}>{tr("暂不能开启：", "Cannot start yet: ")}{blockerText(startBlocker)}</Typography.Paragraph>}
     </Card>
     <Card size="small" title={tr("实时补偿状态", "Live compensation")}>
       <div className="el05-gravity-live">
         <PendulumView angle={angle} active={active} zh={zh} />
         <div>
           <div className="el05-metrics">
-            <Reading label={tr("相对下垂角", "Angle from down")} value={angle == null ? null : angle * 180 / Math.PI} unit="°" />
+            <Reading label={tr("编码器累计位置（本次连接）", "Unwrapped encoder position (this connection)")} value={fresh ? position : null} unit="rad" />
+            <Reading label={tr("相对下垂角", "Angle from down")} value={angle == null ? null : angle * 180 / Math.PI} unit="°"
+              placeholder={!reference ? tr("待记录下垂参考", "Capture downward reference") : undefined} />
             <Reading label={tr("当前速度", "Velocity")} value={fresh ? state?.velocity_rad_s : null} unit="rad/s" />
             <Reading label={tr("指令转矩", "Command torque")} value={active ? status.command_torque_nm : 0} unit="Nm" />
             <Reading label={tr("重力补偿分量", "Gravity component")} value={active ? status.gravity_torque_nm : predictedTorque} unit="Nm" />
@@ -139,9 +171,9 @@ export function El05GravityPanel({ state, zh, busy, stopping, run, stop }: {
   </div>;
 }
 
-function Reading({ label, value, unit }: { label: string; value: number | null | undefined; unit: string }) {
+function Reading({ label, value, unit, placeholder }: { label: string; value: number | null | undefined; unit: string; placeholder?: string }) {
   return <div className="el05-metric"><Typography.Text type="secondary">{label}</Typography.Text>
-    <div className="el05-metric__value el05-number">{value == null || !Number.isFinite(value) ? "—" : value.toFixed(3)}<span className="el05-metric__unit">{unit}</span></div>
+    <div className="el05-metric__value el05-number">{value == null || !Number.isFinite(value) ? placeholder ? <Typography.Text type="secondary">{placeholder}</Typography.Text> : "—" : value.toFixed(3)}{(!placeholder || value != null) && <span className="el05-metric__unit">{unit}</span>}</div>
   </div>;
 }
 
