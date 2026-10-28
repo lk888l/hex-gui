@@ -883,12 +883,23 @@ export interface SmartKnobState {
   torque_limit_nm: number;
   max_torque_permille: number;
   friction_compensation: number;
+  friction_torque_nm: number;
+  calibration: SmartKnobCalibration | null;
   click_torque_nm: number;
   p_gain: number;
   d_gain: number;
 }
 
-export type SmartKnobKind = "canopen" | "rollercan";
+export interface SmartKnobCalibration {
+  torqueFactor: number;
+  staticPositiveNm: number | null;
+  staticNegativeNm: number | null;
+  kineticPositiveNm: number | null;
+  kineticNegativeNm: number | null;
+  detail: string;
+}
+
+export type SmartKnobKind = "canopen" | "meow" | "rollercan";
 export type SmartKnobControlSide = "host" | "firmware";
 export type SmartKnobEffortUnit = "Nm" | "A";
 

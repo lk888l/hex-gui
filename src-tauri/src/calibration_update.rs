@@ -300,6 +300,8 @@ pub async fn calibration_update_write(
     let draft = session.draft.as_ref().expect("checked draft").clone();
 
     let _operation = state.device_settings_operation.acquire().await;
+    let _control = state.calibration_start_gate.lock().await;
+    crate::commands::ensure_motor_not_owned_by_smartknob(&state, request.target.node_id).await?;
     let (identity, bus) = require_single_live_motor(&state, request.target).await?;
     if identity != session.identity {
         return Err("the attached motor identity changed after preparation".into());

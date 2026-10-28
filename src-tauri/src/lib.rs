@@ -25,6 +25,7 @@ mod lift;
 mod lift_commission;
 mod logging;
 mod meow_calibration;
+mod meow_smartknob;
 mod motor_factory_backup;
 mod rollercan;
 mod rollercan_control;

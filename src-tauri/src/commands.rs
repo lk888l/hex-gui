@@ -76,6 +76,35 @@ async fn meow_manager(state: &AppState) -> CmdResult<Arc<MeowMotorManager>> {
         .ok_or_else(|| "not connected: call connect() first".to_string())
 }
 
+/// Called while holding calibration_start_gate, which also covers SmartKnob
+/// startup. Retain the gate through the motor write so ownership cannot race.
+pub(crate) async fn ensure_motor_not_owned_by_smartknob(
+    state: &AppState,
+    nid: u8,
+) -> CmdResult<()> {
+    let active = state.smartknob.lock().await;
+    let owned = match active.as_ref() {
+        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.node_id() == nid,
+        Some(ActiveSmartKnob::MeowRecovery { node_id, .. }) => *node_id == nid,
+        _ => false,
+    };
+    if owned {
+        return Err(format!(
+            "motor 0x{nid:02X} is owned by SmartKnob; stop SmartKnob first"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_no_smartknob(state: &AppState) -> CmdResult<()> {
+    if state.smartknob.lock().await.is_some() {
+        return Err(
+            "SmartKnob is active; stop it before motor calibration or bulk initialization".into(),
+        );
+    }
+    Ok(())
+}
+
 fn mark_extension_runtime_active(state: &AppState) {
     state
         .extension_runtime_active
@@ -516,7 +545,7 @@ async fn stop_active_smartknob(state: &AppState) -> CmdResult<()> {
     // is in flight, and lets us retain the marker if the disable fails so the
     // user can retry Stop.
     let mut active = state.smartknob.lock().await;
-    match active.as_ref() {
+    match active.as_mut() {
         Some(ActiveSmartKnob::Canopen(_)) => {
             let mgr = state
                 .manager()
@@ -526,6 +555,25 @@ async fn stop_active_smartknob(state: &AppState) -> CmdResult<()> {
                 unreachable!()
             };
             app.stop(&mgr).await;
+            Ok(())
+        }
+        Some(ActiveSmartKnob::Meow(app)) => {
+            let mgr = meow_manager(state).await?;
+            app.stop_meow(&mgr).await.map_err(err)?;
+            *active = None;
+            Ok(())
+        }
+        Some(ActiveSmartKnob::MeowRecovery { node_id, error }) => {
+            let mgr = meow_manager(state).await?;
+            let bus = state.feature_bus.lock().await.clone().ok_or_else(|| {
+                "SmartKnob transport disappeared before recovery stop".to_string()
+            })?;
+            if let Err(stop_error) = crate::meow_smartknob::recover_stop(&mgr, &bus, *node_id).await
+            {
+                *error = format!("motor may still be active; retry Stop: {stop_error:#}");
+                return Err(error.clone());
+            }
+            *active = None;
             Ok(())
         }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
@@ -599,6 +647,7 @@ pub async fn friction_calibration_start(
     request: FrictionCalibrationRequest,
 ) -> CmdResult<FrictionCalibrationView> {
     let _start = state.calibration_start_gate.lock().await;
+    ensure_no_smartknob(&state).await?;
     let torque = state.torque_calibration.view().await;
     if torque.running || torque.acceptance_active {
         return Err("torque calibration already owns the motor bus".into());
@@ -638,6 +687,7 @@ pub async fn torque_calibration_start(
     request: TorqueCalibrationRequest,
 ) -> CmdResult<TorqueCalibrationView> {
     let _start = state.calibration_start_gate.lock().await;
+    ensure_no_smartknob(&state).await?;
     if state.friction_calibration.view().await.running {
         return Err("friction calibration already owns the motor bus".into());
     }
@@ -661,6 +711,7 @@ pub async fn torque_calibration_acceptance_start(
     state: State<'_, AppState>,
 ) -> CmdResult<TorqueCalibrationView> {
     let _start = state.calibration_start_gate.lock().await;
+    ensure_no_smartknob(&state).await?;
     if state.friction_calibration.view().await.running {
         return Err("friction calibration already owns the motor bus".into());
     }
@@ -714,12 +765,16 @@ pub async fn identify(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn initialize(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let mgr = manager(&state).await?;
     mgr.initialize(nid).await.map_err(err)
 }
 
 #[tauri::command]
 pub async fn initialize_all(state: State<'_, AppState>) -> CmdResult<Vec<(u8, Option<String>)>> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_no_smartknob(&state).await?;
     let mgr = manager(&state).await?;
     let meow_mgr = meow_manager(&state).await?;
     let motor_nodes = mgr
@@ -827,6 +882,8 @@ pub async fn meow_identify(state: State<'_, AppState>, nid: u8) -> CmdResult<Meo
     // Device Settings shares the zeroing card and its SDO owner with this
     // protocol-specific communication panel. Serialize its initial identify too.
     let _operation = state.device_settings_operation.acquire().await;
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager.identify(nid).await.map_err(err)?;
     refresh_torque_factor(&state, &manager, nid).await;
@@ -861,6 +918,8 @@ pub async fn meow_initialize(
     nid: u8,
     event_timer_ms: u16,
 ) -> CmdResult<MeowMotorSnapshotDto> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     // Reject malformed IPC input before identification performs any SDO I/O
     // or changes the cached lifecycle state.
     let profile = meow_pdo_profile(event_timer_ms)?;
@@ -885,6 +944,8 @@ pub async fn meow_activate_target(
     nid: u8,
     target: MeowMotorTargetDto,
 ) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     let torque_factor = meow_calibration::factor_for(&state, &manager, nid).await?;
     // `set_mode_sdo` is deliberately ordered: every target object is written
@@ -1005,6 +1066,72 @@ mod meow_command_tests {
             Some(DeviceKind::Cia402Motor)
         );
         assert_eq!(motor_initialization_kind(0xDEAD_BEEF, 1), None);
+    }
+
+    #[test]
+    fn smartknob_routes_new_firmware_without_using_legacy_mit_objects() {
+        for product in [
+            MEOW_MOTOR_3525_PRODUCT_CODE,
+            MEOW_MOTOR_4310_PRODUCT_CODE,
+            MEOW_MOTOR_4342_PRODUCT_CODE,
+        ] {
+            assert_eq!(
+                smartknob_motor_kind(MEOW_MOTOR_VENDOR_ID, product),
+                Some(SmartKnobKind::Meow)
+            );
+        }
+        assert_eq!(
+            smartknob_motor_kind(0x4859_444C, 0xAAAA_0001),
+            Some(SmartKnobKind::Canopen)
+        );
+        assert_eq!(
+            smartknob_motor_kind(MEOW_MOTOR_VENDOR_ID, 0xDEAD_BEEF),
+            None
+        );
+        assert_eq!(
+            smartknob_motor_kind(0xDEAD_BEEF, MEOW_MOTOR_4310_PRODUCT_CODE),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_meow_start_with_confirmed_cleanup_releases_the_target() {
+        let mut active = None;
+        let error = record_meow_start_failure(&mut active, 1, "start failed".into(), Ok(()));
+        assert_eq!(error, "start failed");
+        assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_meow_cleanup_retains_stop_target_and_motor_ownership() {
+        let state = AppState::default();
+        let mut active = state.smartknob.lock().await;
+        let error = record_meow_start_failure(
+            &mut active,
+            1,
+            "start failed".into(),
+            Err("disable not confirmed".into()),
+        );
+        assert!(error.contains("may still be active"));
+        let Some(ActiveSmartKnob::MeowRecovery { node_id, error }) = active.as_ref() else {
+            panic!("failed cleanup must retain the recovery target");
+        };
+        let snapshot = UnifiedSmartKnobState::meow_recovery(*node_id, error.clone());
+        assert!(!snapshot.knob.running);
+        assert!(snapshot.knob.enabled);
+        assert_eq!(snapshot.target.unwrap().kind, SmartKnobKind::Meow);
+        assert_eq!(snapshot.target.unwrap().node_id, 1);
+        assert!(snapshot
+            .knob
+            .error
+            .unwrap()
+            .contains("disable not confirmed"));
+        drop(active);
+        assert!(ensure_motor_not_owned_by_smartknob(&state, 1)
+            .await
+            .is_err());
+        assert!(ensure_motor_not_owned_by_smartknob(&state, 2).await.is_ok());
+        assert!(ensure_no_smartknob(&state).await.is_err());
     }
 
     #[test]
@@ -1150,6 +1277,8 @@ pub async fn meow_set_target(
     nid: u8,
     target: MeowMotorTargetDto,
 ) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     let torque_factor = meow_calibration::factor_for(&state, &manager, nid).await?;
     manager
@@ -1164,6 +1293,8 @@ pub async fn meow_set_max_torque(
     nid: u8,
     permille: u16,
 ) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager.set_max_torque(nid, permille).await.map_err(err)
 }
@@ -1174,6 +1305,8 @@ pub async fn meow_set_profile_limits(
     nid: u8,
     limits: MeowProfileLimitsDto,
 ) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager
         .set_profile_limits(
@@ -1190,12 +1323,16 @@ pub async fn meow_set_profile_limits(
 
 #[tauri::command]
 pub async fn meow_disable(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager.disable(nid).await.map_err(err)
 }
 
 #[tauri::command]
 pub async fn meow_clear_error(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager.clear_error(nid).await.map_err(err)
 }
@@ -1222,6 +1359,8 @@ pub async fn meow_apply_can_settings(
     request: MeowCanSettingsRequestDto,
 ) -> CmdResult<bool> {
     let _operation = state.device_settings_operation.acquire().await;
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     let manager = meow_manager(&state).await?;
     manager.identify(nid).await.map_err(err)?;
     manager
@@ -1300,6 +1439,8 @@ pub async fn set_position_preset(
     pos: f32,
 ) -> CmdResult<()> {
     let _operation = state.device_settings_operation.acquire().await;
+    let _ownership = state.calibration_start_gate.lock().await;
+    ensure_motor_not_owned_by_smartknob(&state, nid).await?;
     if !crate::device_registry::classify(expected_vendor_id, expected_product_code)
         .supports_position_preset()
     {
@@ -1594,7 +1735,9 @@ pub async fn damiao_write_register(
     if address == 0x08 {
         let result = damiao_set_motor_id(state, motor_id, raw as u16, false).await?;
         return Ok(DamiaoRegisterWriteResult {
-            reading: result.verified.then(|| definition.decode(raw.to_le_bytes())),
+            reading: result
+                .verified
+                .then(|| definition.decode(raw.to_le_bytes())),
             state: result.state.clone(),
             id_change: Some(result),
             bitrate: None,
@@ -1602,8 +1745,8 @@ pub async fn damiao_write_register(
     }
     if address == 0x23 {
         let rates = [
-            125_000, 200_000, 250_000, 500_000, 1_000_000,
-            2_000_000, 2_500_000, 3_200_000, 4_000_000, 5_000_000,
+            125_000, 200_000, 250_000, 500_000, 1_000_000, 2_000_000, 2_500_000, 3_200_000,
+            4_000_000, 5_000_000,
         ];
         let result = damiao_set_bitrate(state, motor_id, rates[raw as usize]).await?;
         return Ok(DamiaoRegisterWriteResult {
@@ -1726,7 +1869,10 @@ pub async fn damiao_enable(state: State<'_, AppState>, motor_id: u16) -> CmdResu
 }
 
 #[tauri::command]
-pub async fn damiao_read_positions(state: State<'_, AppState>, motor_id: u16) -> CmdResult<DamiaoState> {
+pub async fn damiao_read_positions(
+    state: State<'_, AppState>,
+    motor_id: u16,
+) -> CmdResult<DamiaoState> {
     damiao_session(&state, motor_id)
         .await?
         .read_positions()
@@ -2144,27 +2290,20 @@ pub async fn smartknob_monitor_stop(state: State<'_, AppState>) -> CmdResult<()>
 pub async fn smartknob_list_devices(state: State<'_, AppState>) -> CmdResult<Vec<SmartKnobDevice>> {
     let mut devices = Vec::new();
     if let Some(mgr) = state.manager().await {
-        devices.extend(
-            mgr.list()
-                .into_iter()
-                .filter(|motor| motor.identity.is_some())
-                .filter(|motor| {
-                    motor.identity.as_ref().is_some_and(|identity| {
-                        crate::device_registry::classify(identity.vendor_id, identity.product_code)
-                            .supports_cia402_controls()
-                    })
-                })
-                .map(|motor| SmartKnobDevice {
-                    target: SmartKnobTarget {
-                        kind: SmartKnobKind::Canopen,
-                        node_id: motor.node_id,
-                    },
-                    name: motor.friendly_name(),
-                    online: motor.online,
-                    control_side: SmartKnobControlSide::Host,
-                    effort_unit: SmartKnobEffortUnit::Nm,
-                }),
-        );
+        devices.extend(mgr.list().into_iter().filter_map(|motor| {
+            let identity = motor.identity.as_ref()?;
+            let kind = smartknob_motor_kind(identity.vendor_id, identity.product_code)?;
+            Some(SmartKnobDevice {
+                target: SmartKnobTarget {
+                    kind,
+                    node_id: motor.node_id,
+                },
+                name: motor.friendly_name(),
+                online: motor.online,
+                control_side: SmartKnobControlSide::Host,
+                effort_unit: SmartKnobEffortUnit::Nm,
+            })
+        }));
     }
     if let Some(session) = state.rollercan.lock().await.as_ref() {
         devices.extend(session.devices().into_iter().map(|device| SmartKnobDevice {
@@ -2183,13 +2322,44 @@ pub async fn smartknob_list_devices(state: State<'_, AppState>) -> CmdResult<Vec
     Ok(devices)
 }
 
+fn smartknob_motor_kind(vendor_id: u32, product_code: u32) -> Option<SmartKnobKind> {
+    match crate::device_registry::classify(vendor_id, product_code) {
+        crate::device_registry::DeviceKind::Cia402Motor => Some(SmartKnobKind::Canopen),
+        crate::device_registry::DeviceKind::MeowMotor => Some(SmartKnobKind::Meow),
+        _ => None,
+    }
+}
+
+const MEOW_RECOVERY_REQUIRED: &str =
+    "SmartKnob startup cleanup is incomplete; retry Stop before changing motor settings";
+
+fn record_meow_start_failure(
+    active: &mut Option<ActiveSmartKnob>,
+    node_id: u8,
+    start_error: String,
+    cleanup: CmdResult<()>,
+) -> String {
+    match cleanup {
+        Ok(()) => start_error,
+        Err(cleanup_error) => {
+            let error =
+                format!("{start_error}; motor may still be active; retry Stop: {cleanup_error}");
+            *active = Some(ActiveSmartKnob::MeowRecovery {
+                node_id,
+                error: error.clone(),
+            });
+            error
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn smartknob_get_profile(
     state: State<'_, AppState>,
     target: SmartKnobTarget,
 ) -> CmdResult<SmartKnobProfile> {
     match target.kind {
-        SmartKnobKind::Canopen => Ok(SmartKnobProfile {
+        SmartKnobKind::Canopen | SmartKnobKind::Meow => Ok(SmartKnobProfile {
             target,
             configs: crate::smartknob::preset_configs(),
             control_side: SmartKnobControlSide::Host,
@@ -2276,6 +2446,16 @@ pub async fn smartknob_start(
     // just-started CANopen session can detach its 1 kHz task instead of asking
     // it to stop and disable the motor.
     let _extension_op = state.extension_op.lock().await;
+    let _ownership = state.calibration_start_gate.lock().await;
+    let torque_calibration = state.torque_calibration.view().await;
+    if state.friction_calibration.view().await.running
+        || torque_calibration.running
+        || torque_calibration.acceptance_active
+    {
+        return Err(
+            "motor calibration is active; stop calibration before starting SmartKnob".into(),
+        );
+    }
     mark_extension_runtime_active(&state);
     let feature_bus = feature_bus_locked(&state).await?;
     let mgr = manager(&state).await?;
@@ -2334,6 +2514,73 @@ pub async fn smartknob_start(
                 );
             }
             *guard = Some(ActiveSmartKnob::Canopen(app));
+        }
+        SmartKnobKind::Meow => {
+            let target_online = mgr.list().iter().any(|motor| {
+                motor.node_id == request.target.node_id
+                    && motor.online
+                    && motor.identity.as_ref().is_some_and(|identity| {
+                        smartknob_motor_kind(identity.vendor_id, identity.product_code)
+                            == Some(SmartKnobKind::Meow)
+                    })
+            });
+            if !target_online {
+                return Err(format!(
+                    "Meow SmartKnob target 0x{:02X} is not an online, identified new-protocol motor",
+                    request.target.node_id
+                ));
+            }
+            let meow_mgr = meow_manager(&state).await?;
+            let initial = crate::smartknob::InitialSettings {
+                custom_config: request.custom_config,
+                tuning: request.tuning.map(|tuning| crate::smartknob::Tuning {
+                    p_gain: tuning.p_gain,
+                    d_gain: tuning.d_gain,
+                    strength_scale: tuning.strength_scale,
+                    torque_limit_nm: tuning.effort_limit,
+                    max_torque_permille: tuning.max_output_permille,
+                    friction_compensation: tuning.friction_compensation,
+                    click_torque_nm: tuning.click_effort,
+                }),
+            };
+            let start_result = crate::smartknob::SmartKnob::start_meow(
+                meow_mgr.clone(),
+                feature_bus.clone(),
+                request.target.node_id,
+                request.config_index,
+                &state.shutdown_requested,
+                mgr.options().heartbeat_node_id,
+                initial,
+            )
+            .await;
+            let mut app = match start_result {
+                Ok(app) => app,
+                Err(start_error) => {
+                    let cleanup = crate::meow_smartknob::recover_stop(
+                        &meow_mgr,
+                        &feature_bus,
+                        request.target.node_id,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                    return Err(record_meow_start_failure(
+                        &mut guard,
+                        request.target.node_id,
+                        format!("{start_error:#}"),
+                        cleanup,
+                    ));
+                }
+            };
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                if let Err(error) = app.stop_meow(&meow_mgr).await {
+                    *guard = Some(ActiveSmartKnob::Meow(app));
+                    return Err(format!(
+                        "SmartKnob startup cancelled, but motor may still be active; retry Stop: {error}"
+                    ));
+                }
+                return Err("SmartKnob startup cancelled by application shutdown".into());
+            }
+            *guard = Some(ActiveSmartKnob::Meow(app));
         }
         SmartKnobKind::Rollercan => {
             if state
@@ -2426,7 +2673,8 @@ pub async fn smartknob_stop(state: State<'_, AppState>) -> CmdResult<()> {
 pub async fn smartknob_set_config(state: State<'_, AppState>, index: usize) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app)) => app.set_config(index),
+        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.set_config(index),
+        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2451,7 +2699,7 @@ pub async fn smartknob_set_tuning(
 ) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app)) => app.set_tuning(
+        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.set_tuning(
             tuning.p_gain,
             tuning.d_gain,
             tuning.strength_scale,
@@ -2460,6 +2708,7 @@ pub async fn smartknob_set_tuning(
             tuning.friction_compensation,
             tuning.click_effort,
         ),
+        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2483,6 +2732,25 @@ pub async fn smartknob_clear_error(state: State<'_, AppState>) -> CmdResult<()> 
         Some(ActiveSmartKnob::Canopen(app)) => {
             let mgr = manager(&state).await?;
             crate::smartknob::clear_error(&mgr, app.node_id()).await;
+        }
+        Some(ActiveSmartKnob::MeowRecovery { node_id, .. }) => {
+            // Clearing the new protocol's fault only reaches Disabled. Keep
+            // ownership until a subsequent Stop confirms cleanup completed.
+            meow_manager(&state)
+                .await?
+                .clear_error(*node_id)
+                .await
+                .map_err(err)?;
+        }
+        Some(ActiveSmartKnob::Meow(app)) => {
+            if app.state().running {
+                return Err("stop SmartKnob before clearing the motor fault".into());
+            }
+            meow_manager(&state)
+                .await?
+                .clear_error(app.node_id())
+                .await
+                .map_err(err)?;
         }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
@@ -2508,7 +2776,10 @@ pub async fn smartknob_set_custom_config(
     config.is_custom = true;
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app)) => app.set_custom_config(config),
+        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => {
+            app.set_custom_config(config)
+        }
+        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2531,6 +2802,7 @@ pub async fn smartknob_set_telemetry(
 ) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
+        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2541,7 +2813,7 @@ pub async fn smartknob_set_telemetry(
                 .await
                 .map_err(err)?;
         }
-        Some(ActiveSmartKnob::Canopen(_)) => {
+        Some(ActiveSmartKnob::Canopen(_) | ActiveSmartKnob::Meow(_)) => {
             return Err("CANopen SmartKnob does not expose firmware telemetry settings".into())
         }
         None => {}
@@ -2554,10 +2826,23 @@ pub async fn smartknob_set_telemetry(
 pub async fn smartknob_get_state(state: State<'_, AppState>) -> CmdResult<UnifiedSmartKnobState> {
     let guard = state.smartknob.lock().await;
     Ok(match guard.as_ref() {
+        Some(ActiveSmartKnob::MeowRecovery { node_id, error }) => {
+            UnifiedSmartKnobState::meow_recovery(*node_id, error.clone())
+        }
         Some(ActiveSmartKnob::Canopen(app)) => UnifiedSmartKnobState::from_knob(
             app.state(),
             Some(SmartKnobTarget {
                 kind: SmartKnobKind::Canopen,
+                node_id: app.node_id(),
+            }),
+            SmartKnobControlSide::Host,
+            SmartKnobEffortUnit::Nm,
+            None,
+        ),
+        Some(ActiveSmartKnob::Meow(app)) => UnifiedSmartKnobState::from_knob(
+            app.state(),
+            Some(SmartKnobTarget {
+                kind: SmartKnobKind::Meow,
                 node_id: app.node_id(),
             }),
             SmartKnobControlSide::Host,

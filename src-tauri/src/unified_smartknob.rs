@@ -8,6 +8,7 @@ use crate::smartknob::{KnobConfig, SmartKnob, SmartKnobState};
 #[serde(rename_all = "lowercase")]
 pub enum SmartKnobKind {
     Canopen,
+    Meow,
     Rollercan,
 }
 
@@ -125,6 +126,29 @@ impl Default for UnifiedSmartKnobState {
 }
 
 impl UnifiedSmartKnobState {
+    /// Startup did not leave a runnable host loop and disable was not
+    /// confirmed. Retain a target so the UI can still retry Stop.
+    pub fn meow_recovery(node_id: u8, error: String) -> Self {
+        Self::from_knob(
+            SmartKnobState {
+                running: false,
+                node_id,
+                // No fresh confirmation is available: conservatively expose
+                // possible output until the recovery stop succeeds.
+                enabled: true,
+                error: Some(error),
+                ..Default::default()
+            },
+            Some(SmartKnobTarget {
+                kind: SmartKnobKind::Meow,
+                node_id,
+            }),
+            SmartKnobControlSide::Host,
+            SmartKnobEffortUnit::Nm,
+            None,
+        )
+    }
+
     pub fn from_knob(
         knob: SmartKnobState,
         target: Option<SmartKnobTarget>,
@@ -149,5 +173,7 @@ impl UnifiedSmartKnobState {
 
 pub enum ActiveSmartKnob {
     Canopen(SmartKnob),
+    Meow(SmartKnob),
+    MeowRecovery { node_id: u8, error: String },
     Rollercan { node_id: u8 },
 }

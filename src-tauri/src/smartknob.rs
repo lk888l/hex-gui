@@ -30,11 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use crate::meow_smartknob::{KnobCalibration, KnobFeedback, MeowKnobMotor};
 use can_transport::{CanBus, CanFrame};
 use hex_motor::canopen::rpdo_config::{build_rpdo_config_writes, RpdoRecipe};
 use hex_motor::canopen::sdo;
 use hex_motor::canopen::tpdo_config::TpdoEntry;
 use hex_motor::cia402::{Cia402Manager, Logic};
+use hex_motor::meow_motor::MeowMotorManager;
 use hex_motor::types::MotorMode;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
@@ -424,27 +426,34 @@ pub fn preset_configs() -> Vec<KnobConfig> {
 
 /// Live, host-tunable parameters (independent of the selected mode).
 #[derive(Clone, Copy)]
-struct Tuning {
+pub struct Tuning {
     /// Proportional gain (firmware PID units). Seeded from
     /// `KnobConfig::p_gain`, then live-tunable per mode.
-    p_gain: f64,
+    pub p_gain: f64,
     /// Derivative gain (firmware PID units). Seeded from
     /// `KnobConfig::d_gain`, then live-tunable per mode.
-    d_gain: f64,
+    pub d_gain: f64,
     /// Nm per firmware PID-output unit (overall haptic strength).
-    strength_scale: f64,
+    pub strength_scale: f64,
     /// Hard host-side torque clamp (Nm).
-    torque_limit_nm: f64,
+    pub torque_limit_nm: f64,
     /// Motor-side `0x6072` safety clamp (‰ of peak).
-    max_torque_permille: u16,
+    pub max_torque_permille: u16,
     /// Coulomb friction compensation (Nm). Added in the direction of motion
     /// to cancel mechanical drag.
-    friction_compensation: f64,
+    pub friction_compensation: f64,
     /// Haptic click torque (Nm). When > 0 and the active config has
     /// `use_click = true`, a biphasic torque pulse fires on each detent
     /// transition.  Live-tunable; seeded from [`DEFAULT_CLICK_TORQUE_NM`]
     /// when the config first enables clicks.
-    click_torque_nm: f64,
+    pub click_torque_nm: f64,
+}
+
+/// Applied before enabling a new-protocol motor, including the very first tick.
+#[derive(Default)]
+pub struct InitialSettings {
+    pub custom_config: Option<KnobConfig>,
+    pub tuning: Option<Tuning>,
 }
 
 impl Default for Tuning {
@@ -580,6 +589,9 @@ pub struct SmartKnobState {
     pub click_torque_nm: f64,
     pub p_gain: f64,
     pub d_gain: f64,
+    /// Physical-unit calibration used for this session (new firmware only).
+    pub calibration: Option<KnobCalibration>,
+    pub friction_torque_nm: f64,
 }
 
 // ───────────────────────────── the driver ───────────────────────────────────
@@ -630,6 +642,9 @@ pub struct SmartKnob {
     /// Index of the requested config; the loop picks it up and applies it.
     requested_config: Arc<StdMutex<usize>>,
     tuning: Arc<StdMutex<Tuning>>,
+    /// Authoritative Meow session limits, independent of per-mode tuning.
+    /// A concurrent mode restore must never overwrite a reduced safety limit.
+    output_limits: Option<Arc<StdMutex<(f64, u16)>>>,
     /// Per-mode tuning overrides — one entry per preset.  When the user adjusts
     /// the sliders we write into this slot; on mode switch we restore from it.
     /// Initialised from each preset's defaults, so a never-touched mode keeps
@@ -642,12 +657,29 @@ pub struct SmartKnob {
     custom_config: Arc<StdMutex<KnobConfig>>,
     custom_config_dirty: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    meow: Option<Arc<MeowKnobMotor>>,
     _timer_resolution: SmartKnobTimerResolution,
+}
+
+impl Drop for SmartKnob {
+    fn drop(&mut self) {
+        // A forced window close must not detach an immortal haptic task and
+        // its heartbeat. The Meow loop owns the final zero/disable transaction.
+        self.running.store(false, Ordering::SeqCst);
+    }
 }
 
 /// How many times to attempt motor init before giving up (init can be flaky).
 const INIT_ATTEMPTS: u8 = 3;
+
+enum HapticMotor {
+    Legacy {
+        mgr: Arc<Cia402Manager>,
+        bus: Arc<dyn CanBus>,
+    },
+    Meow(Arc<MeowKnobMotor>),
+}
 
 impl SmartKnob {
     /// Initialize the chosen motor for MIT torque-stream control and start the
@@ -710,13 +742,103 @@ impl SmartKnob {
         }
         ensure_startup_allowed(&mgr, nid, shutdown_requested).await?;
 
+        Ok(Self::spawn_loop(
+            HapticMotor::Legacy { mgr, bus },
+            nid,
+            config_index,
+            InitialSettings::default(),
+        ))
+    }
+
+    /// New HEX4310 protocol. Calibration and initial limits precede enable.
+    pub async fn start_meow(
+        mgr: Arc<MeowMotorManager>,
+        bus: Arc<dyn CanBus>,
+        nid: u8,
+        config_index: usize,
+        shutdown_requested: &AtomicBool,
+        host_node_id: u8,
+        initial: InitialSettings,
+    ) -> anyhow::Result<Self> {
+        let configs = preset_configs();
+        let config_index = config_index.min(configs.len() - 1);
+        let selected = if config_index == 0 {
+            initial.custom_config.as_ref().unwrap_or(&configs[0])
+        } else {
+            &configs[config_index]
+        };
+        let tuning = initial
+            .tuning
+            .unwrap_or_else(|| Tuning::from_config(selected))
+            .sanitized();
+        let motor = Arc::new(
+            MeowKnobMotor::start(
+                mgr,
+                bus,
+                nid,
+                tuning.max_torque_permille,
+                shutdown_requested,
+                host_node_id,
+            )
+            .await?,
+        );
+        if shutdown_requested.load(Ordering::SeqCst) {
+            motor.stop().await?;
+            anyhow::bail!("SmartKnob startup cancelled by application shutdown");
+        }
+        Ok(Self::spawn_loop(
+            HapticMotor::Meow(motor),
+            nid,
+            config_index,
+            initial,
+        ))
+    }
+
+    fn spawn_loop(
+        motor: HapticMotor,
+        nid: u8,
+        config_index: usize,
+        initial: InitialSettings,
+    ) -> Self {
+        let configs = preset_configs();
+        let initial_custom = initial
+            .custom_config
+            .map(sanitize_custom_config)
+            .unwrap_or_else(|| configs[0].clone());
+        let selected = if config_index == 0 {
+            &initial_custom
+        } else {
+            &configs[config_index]
+        };
+        let tuning = initial
+            .tuning
+            .unwrap_or_else(|| Tuning::from_config(selected))
+            .sanitized();
+        let meow = match &motor {
+            HapticMotor::Meow(motor) => Some(motor.clone()),
+            _ => None,
+        };
+        let output_limits = meow.as_ref().map(|_| {
+            Arc::new(StdMutex::new((
+                tuning.torque_limit_nm,
+                tuning.max_torque_permille,
+            )))
+        });
+
         // Per-mode tuning, seeded from each preset's defaults.
-        let per_mode_tuning: Vec<Tuning> = configs.iter().map(Tuning::from_config).collect();
+        let mut per_mode_tuning: Vec<Tuning> = configs.iter().map(Tuning::from_config).collect();
+        per_mode_tuning[config_index] = tuning;
+        if meow.is_some() {
+            for slot in &mut per_mode_tuning {
+                slot.torque_limit_nm = tuning.torque_limit_nm;
+                slot.max_torque_permille = tuning.max_torque_permille;
+            }
+        }
 
         let per_mode_tuning = Arc::new(StdMutex::new(per_mode_tuning));
 
         // Custom mode config: seed from the placeholder at index 0.
-        let custom_config = Arc::new(StdMutex::new(configs[0].clone()));
+        let custom_config = Arc::new(StdMutex::new(initial_custom));
         let custom_config_dirty = Arc::new(AtomicBool::new(false));
 
         let requested_config = Arc::new(StdMutex::new(config_index));
@@ -724,14 +846,14 @@ impl SmartKnob {
         let state = Arc::new(StdMutex::new(SmartKnobState {
             node_id: nid,
             config_index,
+            calibration: meow.as_ref().map(|motor| motor.calibration()),
             ..Default::default()
         }));
         let running = Arc::new(AtomicBool::new(true));
 
         let timer_resolution = SmartKnobTimerResolution::acquire();
         let task = {
-            let mgr = mgr.clone();
-            let bus = bus.clone();
+            let output_limits = output_limits.clone();
             let requested_config = requested_config.clone();
             let tuning = tuning.clone();
             let per_mode_tuning = per_mode_tuning.clone();
@@ -741,11 +863,11 @@ impl SmartKnob {
             let custom_config_dirty = custom_config_dirty.clone();
             tokio::spawn(async move {
                 haptic_loop(
-                    mgr,
-                    bus,
+                    motor,
                     nid,
                     requested_config,
                     tuning,
+                    output_limits,
                     per_mode_tuning,
                     state,
                     running,
@@ -756,18 +878,20 @@ impl SmartKnob {
             })
         };
 
-        Ok(Self {
+        Self {
             node_id: nid,
             requested_config,
             tuning,
+            output_limits,
             per_mode_tuning,
             state,
             custom_config,
             custom_config_dirty,
             running,
-            task,
+            task: Some(task),
+            meow,
             _timer_resolution: timer_resolution,
-        })
+        }
     }
 
     /// Switch haptic mode (the front-panel "mode" button that stands in for the
@@ -813,18 +937,29 @@ impl SmartKnob {
             click_torque_nm,
         }
         .sanitized();
+        if let Some(limits) = &self.output_limits {
+            *limits.lock().expect("output_limits poisoned") =
+                (clamped.torque_limit_nm, clamped.max_torque_permille);
+        }
         *self.tuning.lock().expect("tuning poisoned") = clamped;
         // Persist into the per-mode slot for the current config.
         let idx = *self
             .requested_config
             .lock()
             .expect("requested_config poisoned");
-        if let Some(slot) = self
+        let mut per_mode = self
             .per_mode_tuning
             .lock()
-            .expect("per_mode_tuning poisoned")
-            .get_mut(idx)
-        {
+            .expect("per_mode_tuning poisoned");
+        if self.meow.is_some() {
+            // Safety limits belong to the motor session, including a mode
+            // that has never been visited. A mode switch must not raise them.
+            for slot in per_mode.iter_mut() {
+                slot.torque_limit_nm = clamped.torque_limit_nm;
+                slot.max_torque_permille = clamped.max_torque_permille;
+            }
+        }
+        if let Some(slot) = per_mode.get_mut(idx) {
             *slot = clamped;
         }
     }
@@ -838,12 +973,35 @@ impl SmartKnob {
     }
 
     /// Stop the loop, zero torque and disable the motor.
-    pub async fn stop(self, mgr: &Cia402Manager) {
+    pub async fn stop(mut self, mgr: &Cia402Manager) {
         self.running.store(false, Ordering::SeqCst);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
         if let Err(e) = mgr.disable(self.node_id).await {
             log::warn!("SmartKnob: disable 0x{:02X} on stop: {e}", self.node_id);
         }
+    }
+
+    /// Keep the session available if confirmed disable fails, so Stop can retry.
+    pub async fn stop_meow(&mut self, _mgr: &MeowMotorManager) -> anyhow::Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        if let Some(motor) = &self.meow {
+            if let Err(error) = motor.stop().await {
+                self.state.lock().expect("state poisoned").error =
+                    Some(format!("motor may still be active; retry Stop: {error:#}"));
+                return Err(error);
+            }
+        }
+        let mut state = self.state.lock().expect("state poisoned");
+        state.running = false;
+        state.enabled = false;
+        state.applied_torque_nm = 0.0;
+        state.friction_torque_nm = 0.0;
+        Ok(())
     }
 }
 
@@ -1197,11 +1355,11 @@ fn build_rpdo_frame(torque_nm: f64, max_torque_permille: u16) -> [u8; FRAME_LEN]
 }
 
 async fn haptic_loop(
-    mgr: Arc<Cia402Manager>,
-    bus: Arc<dyn can_transport::CanBus>,
+    motor: HapticMotor,
     nid: u8,
     requested_config: Arc<StdMutex<usize>>,
     tuning: Arc<StdMutex<Tuning>>,
+    output_limits: Option<Arc<StdMutex<(f64, u16)>>>,
     per_mode_tuning: Arc<StdMutex<Vec<Tuning>>>,
     state: Arc<StdMutex<SmartKnobState>>,
     running: Arc<AtomicBool>,
@@ -1242,9 +1400,19 @@ async fn haptic_loop(
 
     while running.load(Ordering::SeqCst) {
         tick.tick().await;
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         let tick_at = Instant::now();
         let loop_dt = tick_at.duration_since(last_tick_at);
         last_tick_at = tick_at;
+        if matches!(&motor, HapticMotor::Meow(_)) && loop_dt > Duration::from_millis(20) {
+            state.lock().expect("state poisoned").error = Some(format!(
+                "SmartKnob stopped: control loop delayed {:.1} ms",
+                loop_dt.as_secs_f64() * 1000.0,
+            ));
+            break;
+        }
         if loop_dt > HAPTIC_TIMING_WARN_THRESHOLD {
             let should_warn = last_timing_warn
                 .map(|t| tick_at.duration_since(t) >= Duration::from_secs(1))
@@ -1260,24 +1428,54 @@ async fn haptic_loop(
         let mut tun = *tuning.lock().expect("tuning poisoned");
 
         // ── 1. read motor feedback & unwrap to a continuous shaft angle ──
-        let ls = mgr.status(nid);
-        let m = &ls.measurements;
-        let raw_rev = m.position_rev.unwrap_or(0.0) as f64;
-        let (new_accum, new_prev, shaft_angle) =
-            unwrap_shaft_angle(h.angle.prev_raw_rev, h.angle.accum_rev, raw_rev);
+        let feedback = match &motor {
+            HapticMotor::Legacy { mgr, .. } => {
+                let ls = mgr.status(nid);
+                let m = &ls.measurements;
+                let (enabled, error) = match ls.logic.as_ref() {
+                    Some(Logic::Enabled(_)) => (true, None),
+                    Some(Logic::Error { kind, raw_code }) => {
+                        (false, Some(format!("{kind:?} (0x{raw_code:04X})")))
+                    }
+                    _ => (false, None),
+                };
+                KnobFeedback {
+                    raw_rev: m.position_rev.unwrap_or(0.0) as f64,
+                    velocity_rev_per_s: m.velocity_rev_per_s.unwrap_or(0.0) as f64,
+                    torque_nm: m.torque_nm,
+                    driver_temp_c: m.driver_temp_c,
+                    motor_temp_c: m.motor_temp_c,
+                    online: ls.connection.online,
+                    enabled,
+                    error,
+                }
+            }
+            HapticMotor::Meow(motor) => match motor.feedback() {
+                Ok(feedback) => feedback,
+                Err(error) => {
+                    state.lock().expect("state poisoned").error =
+                        Some(format!("SmartKnob stopped: {error:#}"));
+                    break;
+                }
+            },
+        };
+        let raw_rev = feedback.raw_rev;
+        // Meow's manager already accumulates Q8.24 modular deltas (256 rev
+        // range). Applying the old one-revolution unwrap would corrupt it.
+        let (new_accum, new_prev, shaft_angle) = match &motor {
+            HapticMotor::Legacy { .. } => {
+                unwrap_shaft_angle(h.angle.prev_raw_rev, h.angle.accum_rev, raw_rev)
+            }
+            HapticMotor::Meow(_) => (
+                raw_rev,
+                Some(raw_rev),
+                DIRECTION * raw_rev * std::f64::consts::TAU,
+            ),
+        };
         h.angle.accum_rev = new_accum;
         h.angle.prev_raw_rev = new_prev;
         h.angle.shaft_angle = shaft_angle;
-        let velocity_rad_s =
-            DIRECTION * m.velocity_rev_per_s.unwrap_or(0.0) as f64 * std::f64::consts::TAU;
-
-        let (enabled, error) = match ls.logic.as_ref() {
-            Some(Logic::Enabled(_)) => (true, None),
-            Some(Logic::Error { kind, raw_code }) => {
-                (false, Some(format!("{kind:?} (0x{raw_code:04X})")))
-            }
-            _ => (false, None),
-        };
+        let velocity_rad_s = DIRECTION * feedback.velocity_rev_per_s * std::f64::consts::TAU;
 
         // ── 2. apply a pending mode switch ──
         let wanted =
@@ -1400,9 +1598,6 @@ async fn haptic_loop(
             num_positions,
         );
 
-        // ── 7. friction compensation (Coulomb) ──
-        let friction_torque = compute_friction_coulomb(velocity_rad_s, tun.friction_compensation);
-
         // ── 8. haptic click pulse ──
         let click_active =
             tun.click_torque_nm > 0.0 && !out_of_bounds && config.detent_positions.is_empty();
@@ -1421,13 +1616,45 @@ async fn haptic_loop(
         let click_torque =
             compute_click_torque(&mut h.click, tun.click_torque_nm, click_active, tick_at);
 
+        // Static assistance follows the restoring spring only; click bursts
+        // and damping cannot arm a stationary breakaway boost.
+        let friction_torque = match &motor {
+            HapticMotor::Legacy { .. } => {
+                compute_friction_coulomb(velocity_rad_s, tun.friction_compensation)
+            }
+            HapticMotor::Meow(motor) => {
+                DIRECTION
+                    * motor.friction_torque(
+                        DIRECTION * velocity_rad_s,
+                        DIRECTION
+                            * (compute_haptic_pid(
+                                &config,
+                                &tun,
+                                h.detent.current_position,
+                                angle_to_detent_center,
+                                dead_zone_adjustment,
+                                0.0,
+                                out_of_bounds,
+                            ) + min_restoring),
+                        tun.friction_compensation,
+                    )
+            }
+        };
+
         // ── 9. clamp total torque ──
+        // Read the authoritative limits after all mode/tuning operations.
+        // A simultaneous edit can affect the next frame, but cannot be lost
+        // permanently to an old per-mode snapshot.
+        if let Some(limits) = &output_limits {
+            (tun.torque_limit_nm, tun.max_torque_permille) =
+                *limits.lock().expect("output_limits poisoned");
+        }
         // Runaway guard on the TOTAL command, not just the PID term: above
         // MAX_VEL_RAD_S every component must go silent. Friction compensation
         // points along the direction of motion and click bursts keep firing
         // as detents fly past — left unguarded they would actively sustain
         // the very runaway this guard exists to stop.
-        let torque_nm = if velocity_rad_s.abs() > MAX_VEL_RAD_S {
+        let mut torque_nm = if velocity_rad_s.abs() > MAX_VEL_RAD_S {
             0.0
         } else {
             (haptic_component + click_torque + min_restoring + friction_torque)
@@ -1436,36 +1663,53 @@ async fn haptic_loop(
 
         // ── 10. stream RPDO frame ──
         let data = build_rpdo_frame(torque_nm, tun.max_torque_permille);
-        match CanFrame::new_fd(rpdo_cob_id(nid), &data, true) {
-            Ok(frame) => {
-                let send_started = Instant::now();
-                if let Err(e) = bus.send(frame).await {
-                    // Rate-limit: warn at most once per second to avoid log spam.
-                    let now = Instant::now();
-                    let should_warn = last_rpdo_warn
-                        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
-                        .unwrap_or(true);
-                    if should_warn {
-                        log::warn!("SmartKnob: RPDO send failed: {e}");
-                        last_rpdo_warn = Some(now);
-                    }
-                }
-                let send_dt = send_started.elapsed();
-                if send_dt > HAPTIC_TIMING_WARN_THRESHOLD {
-                    let now = Instant::now();
-                    let should_warn = last_timing_warn
-                        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
-                        .unwrap_or(true);
-                    if should_warn {
-                        log::warn!(
-                            "SmartKnob: RPDO send took {:.2} ms",
-                            send_dt.as_secs_f64() * 1000.0
-                        );
-                        last_timing_warn = Some(now);
+        match &motor {
+            HapticMotor::Meow(motor) => {
+                match motor
+                    .send_torque(DIRECTION * torque_nm, tun.max_torque_permille)
+                    .await
+                {
+                    Ok(applied) => torque_nm = DIRECTION * applied,
+                    Err(error) => {
+                        state.lock().expect("state poisoned").error =
+                            Some(format!("SmartKnob send failed: {error:#}"));
+                        break;
                     }
                 }
             }
-            Err(e) => log::error!("SmartKnob: build RPDO frame: {e}"),
+            HapticMotor::Legacy { bus, .. } => {
+                match CanFrame::new_fd(rpdo_cob_id(nid), &data, true) {
+                    Ok(frame) => {
+                        let send_started = Instant::now();
+                        if let Err(e) = bus.send(frame).await {
+                            // Rate-limit: warn at most once per second to avoid log spam.
+                            let now = Instant::now();
+                            let should_warn = last_rpdo_warn
+                                .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                                .unwrap_or(true);
+                            if should_warn {
+                                log::warn!("SmartKnob: RPDO send failed: {e}");
+                                last_rpdo_warn = Some(now);
+                            }
+                        }
+                        let send_dt = send_started.elapsed();
+                        if send_dt > HAPTIC_TIMING_WARN_THRESHOLD {
+                            let now = Instant::now();
+                            let should_warn = last_timing_warn
+                                .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                                .unwrap_or(true);
+                            if should_warn {
+                                log::warn!(
+                                    "SmartKnob: RPDO send took {:.2} ms",
+                                    send_dt.as_secs_f64() * 1000.0
+                                );
+                                last_timing_warn = Some(now);
+                            }
+                        }
+                    }
+                    Err(e) => log::error!("SmartKnob: build RPDO frame: {e}"),
+                }
+            }
         }
 
         // ── 11. publish state snapshot for the frontend ──
@@ -1482,14 +1726,14 @@ async fn haptic_loop(
             s.shaft_angle_rad = h.angle.shaft_angle;
             s.shaft_velocity_rev_per_s = velocity_rad_s / std::f64::consts::TAU;
             s.applied_torque_nm = torque_nm;
-            s.measured_torque_nm = m.torque_nm;
+            s.measured_torque_nm = feedback.torque_nm;
             s.at_endstop = out_of_bounds;
             s.node_id = nid;
-            s.online = ls.connection.online;
-            s.enabled = enabled;
-            s.driver_temp_c = m.driver_temp_c;
-            s.motor_temp_c = m.motor_temp_c;
-            s.error = error;
+            s.online = feedback.online;
+            s.enabled = feedback.enabled;
+            s.driver_temp_c = feedback.driver_temp_c;
+            s.motor_temp_c = feedback.motor_temp_c;
+            s.error = feedback.error;
             s.strength_scale = tun.strength_scale;
             s.torque_limit_nm = tun.torque_limit_nm;
             s.max_torque_permille = tun.max_torque_permille;
@@ -1497,9 +1741,32 @@ async fn haptic_loop(
             s.click_torque_nm = tun.click_torque_nm;
             s.p_gain = tun.p_gain;
             s.d_gain = tun.d_gain;
+            s.friction_torque_nm = if velocity_rad_s.abs() > MAX_VEL_RAD_S {
+                0.0
+            } else {
+                friction_torque
+            };
         }
     }
 
+    running.store(false, Ordering::SeqCst);
+    if let HapticMotor::Meow(motor) = &motor {
+        let cleanup = motor.stop().await;
+        let mut s = state.lock().expect("state poisoned");
+        match cleanup {
+            Ok(()) => {
+                s.enabled = false;
+                s.applied_torque_nm = 0.0;
+                s.friction_torque_nm = 0.0;
+            }
+            Err(error) => {
+                s.error = Some(format!(
+                    "{}; motor may still be active; retry Stop: {error:#}",
+                    s.error.as_deref().unwrap_or("SmartKnob stopped")
+                ))
+            }
+        }
+    }
     state.lock().expect("state poisoned").running = false;
     log::info!("SmartKnob: haptic loop stopped");
 }

@@ -21,6 +21,7 @@ import {
 import { api, errMsg } from "../api";
 import { useI18n } from "../i18n";
 import { nid2hex } from "../format";
+import { smartknobModeTuning } from "../smartknobUi";
 import type {
   KnobConfig,
   SmartKnobDevice,
@@ -111,7 +112,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
     };
   }, [connected, message, t]);
 
-  // Discover both CANopen and RollerCAN knobs through the shared bus manager.
+  // Discover legacy CANopen, Meow Motor and RollerCAN knobs on the shared bus.
   useEffect(() => {
     if (!connected) {
       setDevices([]);
@@ -221,7 +222,9 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
         const nextState = await api.smartknobGetState();
         if (!alive) return;
         setState(nextState);
-        if (!nextState.running) setRunning(false);
+        // A fault may stop the haptic task while the backend retains ownership
+        // until disable succeeds. Keep Stop available for cleanup/retry.
+        if (!nextState.running && !nextState.target) setRunning(false);
 
         if (performance.now() - lastEditRef.current > EDIT_GRACE_MS) {
           setEditor((current) => {
@@ -293,7 +296,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
       const failure = errMsg(error);
       const uncertainState = await api.smartknobGetState().catch(() => null);
       setState(uncertainState);
-      setRunning(Boolean(uncertainState?.running) || failure.includes("may still be active"));
+      setRunning(Boolean(uncertainState?.running || uncertainState?.target) || failure.includes("may still be active"));
       message.error(`${t("skStartFailed")}: ${failure}`);
     } finally {
       setStarting(false);
@@ -376,7 +379,10 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
     const previous = cloneEditor(readyEditor);
     lastEditRef.current = 0;
     const saved = readyEditor.perModeTuning.get(index);
-    const nextTuning = saved ?? tuningForConfig(readyProfile.configs[index], readyProfile);
+    const modeTuning = saved ?? tuningForConfig(readyProfile.configs[index], readyProfile);
+    // New-protocol output limits belong to the whole session. A cached mode
+    // must never raise a limit that the operator just reduced in another mode.
+    const nextTuning = smartknobModeTuning(readyProfile.target.kind, readyEditor.tuning, modeTuning);
     const next = {
       ...readyEditor,
       modeIndex: index,
@@ -394,7 +400,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
         await enqueueLiveCommand(async () => {
           await api.smartknobSetConfig(index);
           if (custom) await api.smartknobSetCustomConfig(custom);
-          if (saved) await api.smartknobSetTuning(saved);
+          if (saved) await api.smartknobSetTuning(nextTuning);
         });
       } catch (error) {
         message.error(`${t("skModeChangeFailed")}: ${errMsg(error)}`);
@@ -499,6 +505,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
     ? readyEditor.customConfig
     : state?.config ?? readyProfile?.configs[activeIndex] ?? null;
   const unit = effortUnitLabel(readyProfile?.effortUnit ?? state?.effortUnit ?? "Nm");
+  const isMeow = readyProfile?.target.kind === "meow" || state?.target?.kind === "meow";
   const canStart = Boolean(
     selectedDevice?.online
       && readyProfile
@@ -542,11 +549,13 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             ) : (
               <>
                 <Button danger onClick={stop}>{t("skStop")}</Button>
-                <Button onClick={clearError}>{t("skClearError")}</Button>
+                {(!isMeow || state?.running === false) && (
+                  <Button onClick={clearError}>{t("skClearError")}</Button>
+                )}
               </>
             )}
-            <Tag color={running ? "green" : "default"}>
-              {running ? t("skRunning") : t("skStopped")}
+            <Tag color={running && state?.running !== false ? "green" : "default"}>
+              {running && state?.running !== false ? t("skRunning") : t("skStopped")}
             </Tag>
             {readyProfile && (
               <Tag color={readyProfile.controlSide === "host" ? "blue" : "purple"}>
@@ -756,6 +765,29 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             </Card>
 
             <Card title={t("skTuningFeel")} size="small" style={{ marginTop: 16 }}>
+              {isMeow && (
+                <Alert
+                  type="info"
+                  showIcon
+                  message={t("skCalibratedFriction")}
+                  description={t("skCalibratedFrictionHint")}
+                  style={{ marginBottom: 12 }}
+                />
+              )}
+              {isMeow && state?.calibration && (
+                <Space direction="vertical" size={4} style={{ marginBottom: 12 }}>
+                  <Typography.Text>
+                    {t("skTorqueFactor")}: {fmt(state.calibration.torqueFactor, 4)}
+                  </Typography.Text>
+                  <Typography.Text>
+                    {t("skStaticFriction")}: + {fmt(state.calibration.staticPositiveNm, 4)} / − {fmt(state.calibration.staticNegativeNm, 4)} N·m
+                  </Typography.Text>
+                  <Typography.Text>
+                    {t("skKineticFriction")}: + {fmt(state.calibration.kineticPositiveNm, 4)} / − {fmt(state.calibration.kineticNegativeNm, 4)} N·m
+                  </Typography.Text>
+                  <Typography.Text type="secondary">{state.calibration.detail}</Typography.Text>
+                </Space>
+              )}
               <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
                 (p_gain &times; input &minus; d_gain &times; velocity) &times; strength_scale
               </Typography.Text>
@@ -788,7 +820,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                     onChange={(value) => applyTuning({ strengthScale: value ?? 0 })}
                   />
                 </Labeled>
-                <Labeled label={`${t("skFrictionComp")} (${unit})`}>
+                <Labeled label={`${t(isMeow ? "skFrictionCap" : "skFrictionComp")} (${unit})`}>
                   <InputNumber
                     disabled={modeSwitching}
                     min={0}
@@ -812,6 +844,9 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             </Card>
 
             <Card title={t("skTuningSafety")} size="small" style={{ marginTop: 16 }}>
+              {isMeow && (
+                <Typography.Paragraph type="secondary">{t("skSessionLimits")}</Typography.Paragraph>
+              )}
               <Space wrap align="end">
                 <Labeled label={`${t("skTorqueLimit")} (${unit})`}>
                   <InputNumber
@@ -838,6 +873,11 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
 
             {running && (
               <Card title={`${t("skTorque")} (${unit})`} size="small" style={{ marginTop: 16 }}>
+                {isMeow && (
+                  <Typography.Text type="secondary">
+                    {t("skAppliedFriction")}: {fmt(state?.friction_torque_nm, 4)} N·m
+                  </Typography.Text>
+                )}
                 <Row gutter={8}>
                   <Col span={8}>
                     <Statistic title={`${t("skAngle")} (°)`} value={fmt(degOf(state?.shaft_angle_rad), 1)} />
@@ -1027,7 +1067,7 @@ function targetKey(target: SmartKnobTarget): string {
 }
 
 function formatDevice(device: SmartKnobDevice): string {
-  const protocol = device.target.kind === "canopen" ? "CANopen" : "RollerCAN";
+  const protocol = { canopen: "CANopen", meow: "Meow Motor", rollercan: "RollerCAN" }[device.target.kind];
   const offline = device.online ? "" : " · offline";
   return `[${protocol}] ${nid2hex(device.target.nodeId)} · ${device.name}${offline}`;
 }
