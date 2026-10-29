@@ -10,6 +10,7 @@ pub enum SmartKnobKind {
     Canopen,
     Meow,
     Rollercan,
+    Damiao,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,6 +130,10 @@ impl UnifiedSmartKnobState {
     /// Startup did not leave a runnable host loop and disable was not
     /// confirmed. Retain a target so the UI can still retry Stop.
     pub fn meow_recovery(node_id: u8, error: String) -> Self {
+        Self::recovery(SmartKnobKind::Meow, node_id, error)
+    }
+
+    pub fn recovery(kind: SmartKnobKind, node_id: u8, error: String) -> Self {
         Self::from_knob(
             SmartKnobState {
                 running: false,
@@ -139,10 +144,7 @@ impl UnifiedSmartKnobState {
                 error: Some(error),
                 ..Default::default()
             },
-            Some(SmartKnobTarget {
-                kind: SmartKnobKind::Meow,
-                node_id,
-            }),
+            Some(SmartKnobTarget { kind, node_id }),
             SmartKnobControlSide::Host,
             SmartKnobEffortUnit::Nm,
             None,
@@ -174,6 +176,52 @@ impl UnifiedSmartKnobState {
 pub enum ActiveSmartKnob {
     Canopen(SmartKnob),
     Meow(SmartKnob),
-    MeowRecovery { node_id: u8, error: String },
-    Rollercan { node_id: u8 },
+    Damiao(SmartKnob),
+    DamiaoRecovery {
+        node_id: u8,
+        error: String,
+        session: std::sync::Arc<crate::damiao::DamiaoSession>,
+    },
+    MeowRecovery {
+        node_id: u8,
+        error: String,
+    },
+    Rollercan {
+        node_id: u8,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn damiao_target_round_trips_with_its_own_protocol() {
+        let target = SmartKnobTarget {
+            kind: SmartKnobKind::Damiao,
+            node_id: 4,
+        };
+        let json = serde_json::to_value(target).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "damiao", "nodeId": 4}));
+        assert_eq!(
+            serde_json::from_value::<SmartKnobTarget>(json).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn uncertain_damiao_start_keeps_stop_target_and_possible_output_visible() {
+        let state =
+            UnifiedSmartKnobState::recovery(SmartKnobKind::Damiao, 4, "disable timeout".into());
+        assert_eq!(
+            state.target,
+            Some(SmartKnobTarget {
+                kind: SmartKnobKind::Damiao,
+                node_id: 4
+            })
+        );
+        assert!(!state.knob.running);
+        assert!(state.knob.enabled);
+        assert_eq!(state.knob.error.as_deref(), Some("disable timeout"));
+    }
 }

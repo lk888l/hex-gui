@@ -21,7 +21,7 @@ import {
 import { api, errMsg } from "../api";
 import { useI18n } from "../i18n";
 import { nid2hex } from "../format";
-import { smartknobModeTuning } from "../smartknobUi";
+import { smartknobInitialOutputLimits, smartknobModeTuning } from "../smartknobUi";
 import type {
   KnobConfig,
   SmartKnobDevice,
@@ -112,7 +112,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
     };
   }, [connected, message, t]);
 
-  // Discover legacy CANopen, Meow Motor and RollerCAN knobs on the shared bus.
+  // Discover compatible knobs, including DM-H3510, on the shared bus.
   useEffect(() => {
     if (!connected) {
       setDevices([]);
@@ -289,7 +289,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
       setRunning(true);
       message.success(t("skRunning"));
     } catch (error) {
-      // A RollerCAN start can fail after firmware accepted enable while the
+      // A start can fail after the motor accepted enable while the
       // bus then disappears and rollback also fails. The backend deliberately
       // retains that session so Stop can be retried; reflect it instead of
       // hiding the safety control behind a generic start error.
@@ -310,7 +310,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
       setModeSwitching(false);
       setState(null);
     } catch (error) {
-      // The backend retains a RollerCAN active marker when zero/disable
+      // The backend retains an active marker when zero/disable
       // fails, so keep Stop visible and let the user retry safely.
       message.error(`${t("skStopFailed")}: ${errMsg(error)}`);
     }
@@ -506,6 +506,8 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
     : state?.config ?? readyProfile?.configs[activeIndex] ?? null;
   const unit = effortUnitLabel(readyProfile?.effortUnit ?? state?.effortUnit ?? "Nm");
   const isMeow = readyProfile?.target.kind === "meow" || state?.target?.kind === "meow";
+  const isDamiao = readyProfile?.target.kind === "damiao" || state?.target?.kind === "damiao";
+  const sessionLimits = isMeow || isDamiao;
   const canStart = Boolean(
     selectedDevice?.online
       && readyProfile
@@ -549,7 +551,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             ) : (
               <>
                 <Button danger onClick={stop}>{t("skStop")}</Button>
-                {(!isMeow || state?.running === false) && (
+                {(!sessionLimits || state?.running === false) && (
                   <Button onClick={clearError}>{t("skClearError")}</Button>
                 )}
               </>
@@ -824,7 +826,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                   <InputNumber
                     disabled={modeSwitching}
                     min={0}
-                    max={0.5}
+                    max={isDamiao ? 0.03 : Math.min(0.5, readyProfile.effortLimitMax)}
                     step={0.005}
                     value={readyEditor.tuning.frictionCompensation}
                     onChange={(value) => applyTuning({ frictionCompensation: value ?? 0 })}
@@ -834,7 +836,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                   <InputNumber
                     disabled={modeSwitching}
                     min={0}
-                    max={readyProfile.effortUnit === "A" ? 0.8 : 2}
+                    max={Math.min(readyProfile.effortLimitMax, readyProfile.effortUnit === "A" ? 0.8 : 2)}
                     step={readyProfile.effortUnit === "A" ? 0.005 : 0.01}
                     value={readyEditor.tuning.clickEffort}
                     onChange={(value) => applyTuning({ clickEffort: value ?? 0 })}
@@ -844,7 +846,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             </Card>
 
             <Card title={t("skTuningSafety")} size="small" style={{ marginTop: 16 }}>
-              {isMeow && (
+              {sessionLimits && (
                 <Typography.Paragraph type="secondary">{t("skSessionLimits")}</Typography.Paragraph>
               )}
               <Space wrap align="end">
@@ -853,7 +855,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                     disabled={modeSwitching}
                     min={0}
                     max={readyProfile.effortLimitMax}
-                    step={readyProfile.effortUnit === "A" ? 0.05 : 0.1}
+                    step={isDamiao ? 0.01 : readyProfile.effortUnit === "A" ? 0.05 : 0.1}
                     value={readyEditor.tuning.effortLimit}
                     onChange={(value) => applyTuning({ effortLimit: value ?? 0 })}
                   />
@@ -1067,7 +1069,7 @@ function targetKey(target: SmartKnobTarget): string {
 }
 
 function formatDevice(device: SmartKnobDevice): string {
-  const protocol = { canopen: "CANopen", meow: "Meow Motor", rollercan: "RollerCAN" }[device.target.kind];
+  const protocol = { canopen: "CANopen", meow: "Meow Motor", rollercan: "RollerCAN", damiao: "DAMIAO · DM-H3510" }[device.target.kind];
   const offline = device.online ? "" : " · offline";
   return `[${protocol}] ${nid2hex(device.target.nodeId)} · ${device.name}${offline}`;
 }
@@ -1119,10 +1121,7 @@ function tuningForConfig(config: KnobConfig | null, profile: SmartKnobProfile): 
     pGain: config?.p_gain ?? 0,
     dGain: config?.d_gain ?? 0,
     strengthScale: config?.strength_scale ?? (profile.effortUnit === "A" ? 0.04 : 0.15),
-    effortLimit: Math.min(profile.effortLimitMax, profile.effortUnit === "A" ? 0.45 : 2),
-    // Keep the established motor-side safety default even if an older backend
-    // advertises only the protocol's absolute 1000-permille capability.
-    maxOutputPermille: Math.min(profile.maxOutputPermille, 700),
+    ...smartknobInitialOutputLimits(profile),
     frictionCompensation: config?.friction_compensation ?? 0,
     clickEffort: config?.click_torque_nm ?? 0,
   };

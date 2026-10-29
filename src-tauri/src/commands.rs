@@ -84,8 +84,15 @@ pub(crate) async fn ensure_motor_not_owned_by_smartknob(
 ) -> CmdResult<()> {
     let active = state.smartknob.lock().await;
     let owned = match active.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.node_id() == nid,
-        Some(ActiveSmartKnob::MeowRecovery { node_id, .. }) => *node_id == nid,
+        Some(
+            ActiveSmartKnob::Canopen(app)
+            | ActiveSmartKnob::Meow(app)
+            | ActiveSmartKnob::Damiao(app),
+        ) => app.node_id() == nid,
+        Some(
+            ActiveSmartKnob::MeowRecovery { node_id, .. }
+            | ActiveSmartKnob::DamiaoRecovery { node_id, .. },
+        ) => *node_id == nid,
         _ => false,
     };
     if owned {
@@ -195,6 +202,7 @@ pub(crate) async fn stop_torque_calibration(state: &AppState) {
 }
 
 async fn damiao_session(state: &AppState, motor_id: u16) -> CmdResult<Arc<DamiaoSession>> {
+    ensure_damiao_control_available(state).await?;
     state
         .damiao
         .lock()
@@ -202,6 +210,21 @@ async fn damiao_session(state: &AppState, motor_id: u16) -> CmdResult<Arc<Damiao
         .get(&motor_id)
         .cloned()
         .ok_or_else(|| format!("DAMIAO motor 0x{motor_id:X} is not attached"))
+}
+
+/// A SmartKnob session owns the direct DAMIAO output stream and its bus settings.
+async fn ensure_damiao_control_available(state: &AppState) -> CmdResult<()> {
+    let active = state.smartknob.lock().await;
+    if matches!(
+        active.as_ref(),
+        Some(ActiveSmartKnob::Damiao(_) | ActiveSmartKnob::DamiaoRecovery { .. })
+    ) {
+        return Err(
+            "DAMIAO SmartKnob owns the motor; stop SmartKnob before using DAMIAO motor control"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 async fn damiao_discovery(state: &AppState) -> CmdResult<Arc<DamiaoDiscovery>> {
@@ -572,6 +595,30 @@ async fn stop_active_smartknob(state: &AppState) -> CmdResult<()> {
             {
                 *error = format!("motor may still be active; retry Stop: {stop_error:#}");
                 return Err(error.clone());
+            }
+            *active = None;
+            Ok(())
+        }
+        Some(ActiveSmartKnob::Damiao(app)) => {
+            app.stop_damiao().await.map_err(err)?;
+            if let Some(discovery) = state.damiao_discovery.lock().await.as_ref() {
+                discovery.set_attached(u16::from(app.node_id()), false);
+            }
+            *active = None;
+            Ok(())
+        }
+        Some(ActiveSmartKnob::DamiaoRecovery {
+            node_id,
+            error,
+            session,
+        }) => {
+            if let Err(stop_error) = session.disable().await {
+                *error = format!("motor may still be active; retry Stop: {stop_error:#}");
+                return Err(error.clone());
+            }
+            session.force_stop();
+            if let Some(discovery) = state.damiao_discovery.lock().await.as_ref() {
+                discovery.set_attached(u16::from(*node_id), false);
             }
             *active = None;
             Ok(())
@@ -1069,6 +1116,63 @@ mod meow_command_tests {
     }
 
     #[test]
+    fn classic_can_smartknob_discovery_does_not_emit_fd_probes() {
+        use can_transport::CanLinkConfig;
+        assert!(!smartknob_fd_discovery_allowed(
+            Some(CanLinkConfig {
+                fd_enabled: Some(false),
+                ..Default::default()
+            }),
+            false,
+            false
+        ));
+        assert!(smartknob_fd_discovery_allowed(
+            Some(CanLinkConfig {
+                fd_enabled: Some(true),
+                ..Default::default()
+            }),
+            false,
+            false
+        ));
+        assert!(smartknob_fd_discovery_allowed(None, false, false));
+        assert!(smartknob_fd_discovery_allowed(
+            Some(CanLinkConfig::default()),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn damiao_discovery_or_ownership_prevents_fd_even_on_an_fd_host() {
+        use can_transport::CanLinkConfig;
+        for fd_enabled in [Some(false), Some(true), None] {
+            let link = Some(CanLinkConfig {
+                fd_enabled,
+                ..Default::default()
+            });
+            assert!(!smartknob_fd_discovery_allowed(link, false, true));
+            assert!(!smartknob_fd_discovery_allowed(link, true, false));
+            assert!(!smartknob_fd_discovery_allowed(link, true, true));
+            assert_eq!(
+                smartknob_fd_discovery_allowed(link, false, false),
+                fd_enabled != Some(false)
+            );
+        }
+        assert!(!smartknob_fd_discovery_allowed(None, false, true));
+        assert!(!smartknob_fd_discovery_allowed(None, true, false));
+    }
+
+    #[test]
+    fn h3510_rejects_ids_that_overlap_feedback_status() {
+        for id in 0..=15 {
+            assert!(validate_damiao_smartknob_id(id).is_ok());
+        }
+        for id in [0x10, 0x14, 0x7F, 0xFF] {
+            assert!(validate_damiao_smartknob_id(id).is_err());
+        }
+    }
+
+    #[test]
     fn smartknob_routes_new_firmware_without_using_legacy_mit_objects() {
         for product in [
             MEOW_MOTOR_3525_PRODUCT_CODE,
@@ -1525,6 +1629,7 @@ pub async fn damiao_list_devices(
 
 #[tauri::command]
 pub async fn damiao_safe_rescan(state: State<'_, AppState>) -> CmdResult<()> {
+    ensure_damiao_control_available(&state).await?;
     damiao_discovery(&state).await?.request_safe_sweep();
     Ok(())
 }
@@ -1535,6 +1640,7 @@ pub async fn damiao_attach(
     config: DamiaoConfig,
 ) -> CmdResult<DamiaoState> {
     let _extension_op = state.extension_op.lock().await;
+    ensure_damiao_control_available(&state).await?;
     mark_extension_runtime_active(&state);
     let bus = feature_bus_locked(&state).await?;
     let mut guard = state.damiao.lock().await;
@@ -1891,6 +1997,7 @@ pub async fn damiao_disable(state: State<'_, AppState>, motor_id: u16) -> CmdRes
 
 #[tauri::command]
 pub async fn damiao_disable_all(state: State<'_, AppState>) -> CmdResult<()> {
+    ensure_damiao_control_available(&state).await?;
     let sessions: Vec<(u16, Arc<DamiaoSession>)> = state
         .damiao
         .lock()
@@ -2261,18 +2368,60 @@ pub fn smartknob_configs() -> Vec<crate::smartknob::KnobConfig> {
     crate::smartknob::preset_configs()
 }
 
-/// Explicitly enable RollerCAN SmartKnob CAN-FD discovery while its workspace
-/// is mounted. A normal bus connection remains receive-only for this protocol.
+/// Enable discovery for the SmartKnob workspace, including direct DAMIAO
+/// motors and RollerCAN SmartKnob firmware.
 #[tauri::command]
 pub async fn smartknob_monitor_start(state: State<'_, AppState>) -> CmdResult<()> {
     let _extension_op = state.extension_op.lock().await;
     mark_extension_runtime_active(&state);
     ensure_rollercan_monitor_locked(&state).await?;
+    // Quiesce a previous mount before the Classic CAN discovery window.
+    if let Some(session) = state.rollercan.lock().await.as_ref() {
+        session.stop_discovery().await;
+    }
+    let discovery = damiao_discovery_locked(&state).await?;
+    let link = feature_bus_locked(&state)
+        .await?
+        .link_config()
+        .await
+        .map_err(err)?;
+    // Remounting the workspace must preserve the direct motor's ownership.
+    // Snapshot under extension_op and release SmartKnob before locking RollerCAN.
+    let damiao_owns_output = matches!(
+        state.smartknob.lock().await.as_ref(),
+        Some(ActiveSmartKnob::Damiao(_) | ActiveSmartKnob::DamiaoRecovery { .. })
+    );
+    if !smartknob_fd_discovery_allowed(link, damiao_owns_output, false) {
+        return Ok(());
+    }
+    // A host configured for FD may still have a Classic CAN H3510 attached.
+    // Allow all 16 DAMIAO IDs (75 ms each) to answer before emitting FD probes.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1300);
+    loop {
+        let damiao_online = discovery.snapshot().iter().any(|device| device.online);
+        if !smartknob_fd_discovery_allowed(link, damiao_owns_output, damiao_online) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let guard = state.rollercan.lock().await;
     let session = guard
         .as_ref()
         .ok_or_else(|| "not connected: RollerCAN monitor is unavailable".to_string())?;
     session.start_discovery().await.map_err(err)
+}
+
+fn smartknob_fd_discovery_allowed(
+    link: Option<can_transport::CanLinkConfig>,
+    damiao_owns_output: bool,
+    damiao_online: bool,
+) -> bool {
+    !damiao_owns_output
+        && !damiao_online
+        && link.and_then(|config| config.fd_enabled) != Some(false)
 }
 
 /// Stop RollerCAN SmartKnob discovery and wait until no background FD probe is
@@ -2317,6 +2466,21 @@ pub async fn smartknob_list_devices(state: State<'_, AppState>) -> CmdResult<Vec
             effort_unit: SmartKnobEffortUnit::Ampere,
         }));
     }
+    if let Some(discovery) = state.damiao_discovery.lock().await.as_ref() {
+        devices.extend(discovery.snapshot().into_iter().filter_map(|device| {
+            let node_id = u8::try_from(device.motor_id).ok()?;
+            Some(SmartKnobDevice {
+                target: SmartKnobTarget {
+                    kind: SmartKnobKind::Damiao,
+                    node_id,
+                },
+                name: format!("DAMIAO · DM-H3510 profile · 0x{:02X}", node_id),
+                online: device.online,
+                control_side: SmartKnobControlSide::Host,
+                effort_unit: SmartKnobEffortUnit::Nm,
+            })
+        }));
+    }
     devices.sort_by_key(|device| (device.target.kind as u8, device.target.node_id));
 
     Ok(devices)
@@ -2328,6 +2492,15 @@ fn smartknob_motor_kind(vendor_id: u32, product_code: u32) -> Option<SmartKnobKi
         crate::device_registry::DeviceKind::MeowMotor => Some(SmartKnobKind::Meow),
         _ => None,
     }
+}
+
+/// DM-H3510 documents an OR of the low eight ID bits and the status nibble.
+/// IDs above 15 can make Enabled/Disabled indistinguishable; never guess.
+fn validate_damiao_smartknob_id(node_id: u8) -> CmdResult<()> {
+    if node_id > 0x0F {
+        return Err("DM-H3510 SmartKnob requires CAN ID 0x00..=0x0F: higher ID bits overlap the feedback status, so enable/disable cannot be verified safely".into());
+    }
+    Ok(())
 }
 
 const MEOW_RECOVERY_REQUIRED: &str =
@@ -2368,6 +2541,18 @@ pub async fn smartknob_get_profile(
             supports_telemetry: false,
             effort_limit_max: 10.0,
             max_output_permille: crate::smartknob::DEFAULT_MAX_TORQUE_PERMILLE,
+            telemetry_enabled: None,
+            telemetry_rate_hz: None,
+        }),
+        SmartKnobKind::Damiao => Ok(SmartKnobProfile {
+            target,
+            configs: crate::damiao_smartknob::preset_configs(),
+            control_side: SmartKnobControlSide::Host,
+            effort_unit: SmartKnobEffortUnit::Nm,
+            supports_temperature: true,
+            supports_telemetry: false,
+            effort_limit_max: crate::damiao_smartknob::PEAK_TORQUE_NM,
+            max_output_permille: crate::damiao_smartknob::DEFAULT_MAX_TORQUE_PERMILLE,
             telemetry_enabled: None,
             telemetry_rate_hz: None,
         }),
@@ -2582,6 +2767,102 @@ pub async fn smartknob_start(
             }
             *guard = Some(ActiveSmartKnob::Meow(app));
         }
+        SmartKnobKind::Damiao => {
+            validate_damiao_smartknob_id(request.target.node_id)?;
+            let motor_id = u16::from(request.target.node_id);
+            if state
+                .damiao
+                .lock()
+                .await
+                .values()
+                .any(|session| session.snapshot().motor_id & 0x0F == motor_id & 0x0F)
+            {
+                return Err("DAMIAO target conflicts with a motor-control session; detach it before starting SmartKnob".into());
+            }
+            let discovery =
+                state.damiao_discovery.lock().await.clone().ok_or_else(|| {
+                    "DAMIAO discovery is unavailable; reopen SmartKnob".to_string()
+                })?;
+            let device = discovery
+                .snapshot()
+                .into_iter()
+                .find(|device| device.motor_id == motor_id && device.online)
+                .ok_or_else(|| {
+                    "DAMIAO SmartKnob target is not online; wait for discovery".to_string()
+                })?;
+            // Drain an in-flight discovery disable before claiming this address.
+            let _scan_guard = discovery.suspend_scanning().await;
+            if let Some(roller) = state.rollercan.lock().await.as_ref() {
+                roller.stop_discovery().await;
+            }
+            let session = DamiaoSession::start(
+                feature_bus.clone(),
+                DamiaoConfig {
+                    motor_id,
+                    master_id: device.feedback_can_id.unwrap_or(0),
+                    mode: DamiaoMode::Mit,
+                    // Session::start reads and replaces all three with live mapping.
+                    p_max: 12.5,
+                    v_max: 45.0,
+                    t_max: crate::damiao_smartknob::PEAK_TORQUE_NM as f32,
+                },
+            )
+            .await
+            .map_err(err)?;
+            discovery.set_attached(motor_id, true);
+            let initial = crate::smartknob::InitialSettings {
+                custom_config: request.custom_config,
+                tuning: request.tuning.map(|tuning| crate::smartknob::Tuning {
+                    p_gain: tuning.p_gain,
+                    d_gain: tuning.d_gain,
+                    strength_scale: tuning.strength_scale,
+                    torque_limit_nm: tuning.effort_limit,
+                    max_torque_permille: tuning.max_output_permille,
+                    friction_compensation: tuning.friction_compensation,
+                    click_torque_nm: tuning.click_effort,
+                }),
+            };
+            let start_result = crate::smartknob::SmartKnob::start_damiao(
+                session.clone(),
+                feature_bus,
+                request.target.node_id,
+                request.config_index,
+                &state.shutdown_requested,
+                initial,
+            )
+            .await;
+            let mut app = match start_result {
+                Ok(app) => app,
+                Err(start_error) => {
+                    let cleanup = session.disable().await;
+                    session.force_stop();
+                    return Err(match cleanup {
+                        Ok(()) => {
+                            discovery.set_attached(motor_id, false);
+                            format!("{start_error:#}")
+                        }
+                        Err(cleanup_error) => {
+                            let error = format!("{start_error:#}; motor may still be active; retry Stop: {cleanup_error:#}");
+                            *guard = Some(ActiveSmartKnob::DamiaoRecovery {
+                                node_id: request.target.node_id,
+                                session,
+                                error: error.clone(),
+                            });
+                            error
+                        }
+                    });
+                }
+            };
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                if let Err(error) = app.stop_damiao().await {
+                    *guard = Some(ActiveSmartKnob::Damiao(app));
+                    return Err(format!("SmartKnob startup cancelled, but motor may still be active; retry Stop: {error:#}"));
+                }
+                discovery.set_attached(motor_id, false);
+                return Err("SmartKnob startup cancelled by application shutdown".into());
+            }
+            *guard = Some(ActiveSmartKnob::Damiao(app));
+        }
         SmartKnobKind::Rollercan => {
             if state
                 .rollercan_control
@@ -2673,8 +2954,14 @@ pub async fn smartknob_stop(state: State<'_, AppState>) -> CmdResult<()> {
 pub async fn smartknob_set_config(state: State<'_, AppState>, index: usize) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.set_config(index),
-        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
+        Some(
+            ActiveSmartKnob::Canopen(app)
+            | ActiveSmartKnob::Meow(app)
+            | ActiveSmartKnob::Damiao(app),
+        ) => app.set_config(index),
+        Some(ActiveSmartKnob::MeowRecovery { .. } | ActiveSmartKnob::DamiaoRecovery { .. }) => {
+            return Err(MEOW_RECOVERY_REQUIRED.into())
+        }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2699,7 +2986,11 @@ pub async fn smartknob_set_tuning(
 ) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => app.set_tuning(
+        Some(
+            ActiveSmartKnob::Canopen(app)
+            | ActiveSmartKnob::Meow(app)
+            | ActiveSmartKnob::Damiao(app),
+        ) => app.set_tuning(
             tuning.p_gain,
             tuning.d_gain,
             tuning.strength_scale,
@@ -2708,7 +2999,9 @@ pub async fn smartknob_set_tuning(
             tuning.friction_compensation,
             tuning.click_effort,
         ),
-        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
+        Some(ActiveSmartKnob::MeowRecovery { .. } | ActiveSmartKnob::DamiaoRecovery { .. }) => {
+            return Err(MEOW_RECOVERY_REQUIRED.into())
+        }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2752,6 +3045,15 @@ pub async fn smartknob_clear_error(state: State<'_, AppState>) -> CmdResult<()> 
                 .await
                 .map_err(err)?;
         }
+        Some(ActiveSmartKnob::Damiao(app)) => {
+            if app.state().running {
+                return Err("stop SmartKnob before clearing the motor fault".into());
+            }
+            app.clear_damiao_error().await.map_err(err)?;
+        }
+        Some(ActiveSmartKnob::DamiaoRecovery { session, .. }) => {
+            session.clear_fault().await.map_err(err)?;
+        }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2776,10 +3078,14 @@ pub async fn smartknob_set_custom_config(
     config.is_custom = true;
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::Canopen(app) | ActiveSmartKnob::Meow(app)) => {
-            app.set_custom_config(config)
+        Some(
+            ActiveSmartKnob::Canopen(app)
+            | ActiveSmartKnob::Meow(app)
+            | ActiveSmartKnob::Damiao(app),
+        ) => app.set_custom_config(config),
+        Some(ActiveSmartKnob::MeowRecovery { .. } | ActiveSmartKnob::DamiaoRecovery { .. }) => {
+            return Err(MEOW_RECOVERY_REQUIRED.into())
         }
-        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2802,7 +3108,9 @@ pub async fn smartknob_set_telemetry(
 ) -> CmdResult<()> {
     let guard = state.smartknob.lock().await;
     match guard.as_ref() {
-        Some(ActiveSmartKnob::MeowRecovery { .. }) => return Err(MEOW_RECOVERY_REQUIRED.into()),
+        Some(ActiveSmartKnob::MeowRecovery { .. } | ActiveSmartKnob::DamiaoRecovery { .. }) => {
+            return Err(MEOW_RECOVERY_REQUIRED.into())
+        }
         Some(ActiveSmartKnob::Rollercan { node_id }) => {
             let session_guard = state.rollercan.lock().await;
             let session = session_guard
@@ -2813,9 +3121,9 @@ pub async fn smartknob_set_telemetry(
                 .await
                 .map_err(err)?;
         }
-        Some(ActiveSmartKnob::Canopen(_) | ActiveSmartKnob::Meow(_)) => {
-            return Err("CANopen SmartKnob does not expose firmware telemetry settings".into())
-        }
+        Some(
+            ActiveSmartKnob::Canopen(_) | ActiveSmartKnob::Meow(_) | ActiveSmartKnob::Damiao(_),
+        ) => return Err("CANopen SmartKnob does not expose firmware telemetry settings".into()),
         None => {}
     }
     Ok(())
@@ -2829,6 +3137,19 @@ pub async fn smartknob_get_state(state: State<'_, AppState>) -> CmdResult<Unifie
         Some(ActiveSmartKnob::MeowRecovery { node_id, error }) => {
             UnifiedSmartKnobState::meow_recovery(*node_id, error.clone())
         }
+        Some(ActiveSmartKnob::DamiaoRecovery { node_id, error, .. }) => {
+            UnifiedSmartKnobState::recovery(SmartKnobKind::Damiao, *node_id, error.clone())
+        }
+        Some(ActiveSmartKnob::Damiao(app)) => UnifiedSmartKnobState::from_knob(
+            app.state(),
+            Some(SmartKnobTarget {
+                kind: SmartKnobKind::Damiao,
+                node_id: app.node_id(),
+            }),
+            SmartKnobControlSide::Host,
+            SmartKnobEffortUnit::Nm,
+            None,
+        ),
         Some(ActiveSmartKnob::Canopen(app)) => UnifiedSmartKnobState::from_knob(
             app.state(),
             Some(SmartKnobTarget {

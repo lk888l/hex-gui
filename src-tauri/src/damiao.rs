@@ -803,7 +803,11 @@ impl DamiaoSession {
         }
         self.stream_target.lock().unwrap().take();
         let disabled = self.confirm_disabled_locked().await?;
-        if disabled.velocity_rad_s.abs() > ZERO_VELOCITY_TOLERANCE_RAD_S {
+        // An odd number of 12-bit mapping intervals has no exact zero code.
+        // H3510 VMAX=280 reports +/-0.0684 rad/s even for a stationary shaft.
+        let stationary_tolerance = ZERO_VELOCITY_TOLERANCE_RAD_S
+            .max(self.current_config().v_max / 4095.0 + 1e-6);
+        if disabled.velocity_rad_s.abs() > stationary_tolerance {
             bail!("DAMIAO shaft is still moving ({:.3} rad/s); wait for it to stop before enabling or switching mode", disabled.velocity_rad_s);
         }
         let position = if mode != DamiaoMode::Velocity {

@@ -12,6 +12,7 @@ mod can_lease;
 mod cobs_can_iap_profiles;
 mod commands;
 mod damiao;
+mod damiao_smartknob;
 mod device_registry;
 mod dfu_gate;
 mod dfu_release;

@@ -11,6 +11,10 @@
 
 #[path = "../src/calibration_transport.rs"]
 mod calibration_transport;
+#[path = "../src/damiao.rs"]
+mod damiao;
+#[path = "../src/damiao_smartknob.rs"]
+mod damiao_smartknob;
 #[path = "../src/meow_smartknob.rs"]
 mod meow_smartknob;
 #[path = "../src/smartknob.rs"]

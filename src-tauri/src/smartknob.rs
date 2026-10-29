@@ -30,6 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use crate::damiao::DamiaoSession;
+use crate::damiao_smartknob::DamiaoKnobMotor;
 use crate::meow_smartknob::{KnobCalibration, KnobFeedback, MeowKnobMotor};
 use can_transport::{CanBus, CanFrame};
 use hex_motor::canopen::rpdo_config::{build_rpdo_config_writes, RpdoRecipe};
@@ -642,7 +644,7 @@ pub struct SmartKnob {
     /// Index of the requested config; the loop picks it up and applies it.
     requested_config: Arc<StdMutex<usize>>,
     tuning: Arc<StdMutex<Tuning>>,
-    /// Authoritative Meow session limits, independent of per-mode tuning.
+    /// Authoritative session limits, independent of per-mode tuning.
     /// A concurrent mode restore must never overwrite a reduced safety limit.
     output_limits: Option<Arc<StdMutex<(f64, u16)>>>,
     /// Per-mode tuning overrides — one entry per preset.  When the user adjusts
@@ -659,6 +661,7 @@ pub struct SmartKnob {
     running: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
     meow: Option<Arc<MeowKnobMotor>>,
+    damiao: Option<Arc<DamiaoKnobMotor>>,
     _timer_resolution: SmartKnobTimerResolution,
 }
 
@@ -679,6 +682,16 @@ enum HapticMotor {
         bus: Arc<dyn CanBus>,
     },
     Meow(Arc<MeowKnobMotor>),
+    Damiao(Arc<DamiaoKnobMotor>),
+}
+
+impl HapticMotor {
+    fn configs(&self) -> Vec<KnobConfig> {
+        match self {
+            Self::Damiao(_) => crate::damiao_smartknob::preset_configs(),
+            _ => preset_configs(),
+        }
+    }
 }
 
 impl SmartKnob {
@@ -794,13 +807,36 @@ impl SmartKnob {
         ))
     }
 
+    /// DM-H3510 uses packed MIT torque with driver-reported mapping scales.
+    pub async fn start_damiao(
+        session: Arc<DamiaoSession>,
+        bus: Arc<dyn CanBus>,
+        nid: u8,
+        config_index: usize,
+        shutdown_requested: &AtomicBool,
+        initial: InitialSettings,
+    ) -> anyhow::Result<Self> {
+        let config_index = config_index.min(crate::damiao_smartknob::preset_configs().len() - 1);
+        let motor = Arc::new(DamiaoKnobMotor::start(session, bus, shutdown_requested).await?);
+        if shutdown_requested.load(Ordering::SeqCst) {
+            motor.stop().await?;
+            anyhow::bail!("SmartKnob startup cancelled by application shutdown");
+        }
+        Ok(Self::spawn_loop(
+            HapticMotor::Damiao(motor),
+            nid,
+            config_index,
+            initial,
+        ))
+    }
+
     fn spawn_loop(
         motor: HapticMotor,
         nid: u8,
         config_index: usize,
         initial: InitialSettings,
     ) -> Self {
-        let configs = preset_configs();
+        let configs = motor.configs();
         let initial_custom = initial
             .custom_config
             .map(sanitize_custom_config)
@@ -810,15 +846,32 @@ impl SmartKnob {
         } else {
             &configs[config_index]
         };
-        let tuning = initial
+        let mut tuning = initial
             .tuning
-            .unwrap_or_else(|| Tuning::from_config(selected))
+            .unwrap_or_else(|| {
+                let mut tuning = Tuning::from_config(selected);
+                if matches!(&motor, HapticMotor::Damiao(_)) {
+                    tuning.torque_limit_nm = crate::damiao_smartknob::DEFAULT_TORQUE_LIMIT_NM;
+                    tuning.max_torque_permille =
+                        crate::damiao_smartknob::DEFAULT_MAX_TORQUE_PERMILLE;
+                }
+                tuning
+            })
             .sanitized();
         let meow = match &motor {
             HapticMotor::Meow(motor) => Some(motor.clone()),
             _ => None,
         };
-        let output_limits = meow.as_ref().map(|_| {
+        let damiao = match &motor {
+            HapticMotor::Damiao(motor) => Some(motor.clone()),
+            _ => None,
+        };
+        if damiao.is_some() {
+            tuning.torque_limit_nm = tuning
+                .torque_limit_nm
+                .min(crate::damiao_smartknob::PEAK_TORQUE_NM);
+        }
+        let output_limits = (meow.is_some() || damiao.is_some()).then(|| {
             Arc::new(StdMutex::new((
                 tuning.torque_limit_nm,
                 tuning.max_torque_permille,
@@ -828,7 +881,7 @@ impl SmartKnob {
         // Per-mode tuning, seeded from each preset's defaults.
         let mut per_mode_tuning: Vec<Tuning> = configs.iter().map(Tuning::from_config).collect();
         per_mode_tuning[config_index] = tuning;
-        if meow.is_some() {
+        if output_limits.is_some() {
             for slot in &mut per_mode_tuning {
                 slot.torque_limit_nm = tuning.torque_limit_nm;
                 slot.max_torque_permille = tuning.max_torque_permille;
@@ -846,7 +899,10 @@ impl SmartKnob {
         let state = Arc::new(StdMutex::new(SmartKnobState {
             node_id: nid,
             config_index,
-            calibration: meow.as_ref().map(|motor| motor.calibration()),
+            calibration: meow
+                .as_ref()
+                .map(|motor| motor.calibration())
+                .or_else(|| damiao.as_ref().map(|motor| motor.calibration())),
             ..Default::default()
         }));
         let running = Arc::new(AtomicBool::new(true));
@@ -890,6 +946,7 @@ impl SmartKnob {
             running,
             task: Some(task),
             meow,
+            damiao,
             _timer_resolution: timer_resolution,
         }
     }
@@ -927,7 +984,7 @@ impl SmartKnob {
         friction_compensation: f64,
         click_torque_nm: f64,
     ) {
-        let clamped = Tuning {
+        let mut clamped = Tuning {
             p_gain,
             d_gain,
             strength_scale,
@@ -937,6 +994,11 @@ impl SmartKnob {
             click_torque_nm,
         }
         .sanitized();
+        if self.damiao.is_some() {
+            clamped.torque_limit_nm = clamped
+                .torque_limit_nm
+                .min(crate::damiao_smartknob::PEAK_TORQUE_NM);
+        }
         if let Some(limits) = &self.output_limits {
             *limits.lock().expect("output_limits poisoned") =
                 (clamped.torque_limit_nm, clamped.max_torque_permille);
@@ -951,7 +1013,7 @@ impl SmartKnob {
             .per_mode_tuning
             .lock()
             .expect("per_mode_tuning poisoned");
-        if self.meow.is_some() {
+        if self.output_limits.is_some() {
             // Safety limits belong to the motor session, including a mode
             // that has never been visited. A mode switch must not raise them.
             for slot in per_mode.iter_mut() {
@@ -1001,6 +1063,37 @@ impl SmartKnob {
         state.enabled = false;
         state.applied_torque_nm = 0.0;
         state.friction_torque_nm = 0.0;
+        Ok(())
+    }
+
+    pub async fn stop_damiao(&mut self) -> anyhow::Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        if let Some(motor) = &self.damiao {
+            if let Err(error) = motor.stop().await {
+                self.state.lock().expect("state poisoned").error =
+                    Some(format!("motor may still be active; retry Stop: {error:#}"));
+                return Err(error);
+            }
+        }
+        let mut state = self.state.lock().expect("state poisoned");
+        state.running = false;
+        state.enabled = false;
+        state.applied_torque_nm = 0.0;
+        state.friction_torque_nm = 0.0;
+        Ok(())
+    }
+
+    pub async fn clear_damiao_error(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.running.load(Ordering::SeqCst),
+            "stop SmartKnob before clearing faults"
+        );
+        if let Some(motor) = &self.damiao {
+            motor.clear_error().await?;
+        }
         Ok(())
     }
 }
@@ -1366,7 +1459,7 @@ async fn haptic_loop(
     custom_config: Arc<StdMutex<KnobConfig>>,
     custom_config_dirty: Arc<AtomicBool>,
 ) {
-    let configs = preset_configs();
+    let configs = motor.configs();
     let period = Duration::from_micros(1_000_000 / CONTROL_HZ);
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1406,7 +1499,9 @@ async fn haptic_loop(
         let tick_at = Instant::now();
         let loop_dt = tick_at.duration_since(last_tick_at);
         last_tick_at = tick_at;
-        if matches!(&motor, HapticMotor::Meow(_)) && loop_dt > Duration::from_millis(20) {
+        if matches!(&motor, HapticMotor::Meow(_) | HapticMotor::Damiao(_))
+            && loop_dt > Duration::from_millis(20)
+        {
             state.lock().expect("state poisoned").error = Some(format!(
                 "SmartKnob stopped: control loop delayed {:.1} ms",
                 loop_dt.as_secs_f64() * 1000.0,
@@ -1458,6 +1553,14 @@ async fn haptic_loop(
                     break;
                 }
             },
+            HapticMotor::Damiao(motor) => match motor.feedback() {
+                Ok(feedback) => feedback,
+                Err(error) => {
+                    state.lock().expect("state poisoned").error =
+                        Some(format!("SmartKnob stopped: {error:#}"));
+                    break;
+                }
+            },
         };
         let raw_rev = feedback.raw_rev;
         // Meow's manager already accumulates Q8.24 modular deltas (256 rev
@@ -1466,7 +1569,7 @@ async fn haptic_loop(
             HapticMotor::Legacy { .. } => {
                 unwrap_shaft_angle(h.angle.prev_raw_rev, h.angle.accum_rev, raw_rev)
             }
-            HapticMotor::Meow(_) => (
+            HapticMotor::Meow(_) | HapticMotor::Damiao(_) => (
                 raw_rev,
                 Some(raw_rev),
                 DIRECTION * raw_rev * std::f64::consts::TAU,
@@ -1622,6 +1725,14 @@ async fn haptic_loop(
             HapticMotor::Legacy { .. } => {
                 compute_friction_coulomb(velocity_rad_s, tun.friction_compensation)
             }
+            HapticMotor::Damiao(motor) => {
+                DIRECTION
+                    * motor.friction_torque(
+                        DIRECTION * velocity_rad_s,
+                        DIRECTION * (haptic_component + min_restoring),
+                        tun.friction_compensation,
+                    )
+            }
             HapticMotor::Meow(motor) => {
                 DIRECTION
                     * motor.friction_torque(
@@ -1664,6 +1775,19 @@ async fn haptic_loop(
         // ── 10. stream RPDO frame ──
         let data = build_rpdo_frame(torque_nm, tun.max_torque_permille);
         match &motor {
+            HapticMotor::Damiao(motor) => {
+                match motor
+                    .send_torque(DIRECTION * torque_nm, tun.max_torque_permille)
+                    .await
+                {
+                    Ok(applied) => torque_nm = DIRECTION * applied,
+                    Err(error) => {
+                        state.lock().expect("state poisoned").error =
+                            Some(format!("SmartKnob send failed: {error:#}"));
+                        break;
+                    }
+                }
+            }
             HapticMotor::Meow(motor) => {
                 match motor
                     .send_torque(DIRECTION * torque_nm, tun.max_torque_permille)
@@ -1750,8 +1874,12 @@ async fn haptic_loop(
     }
 
     running.store(false, Ordering::SeqCst);
-    if let HapticMotor::Meow(motor) = &motor {
-        let cleanup = motor.stop().await;
+    let cleanup = match &motor {
+        HapticMotor::Meow(motor) => Some(motor.stop().await),
+        HapticMotor::Damiao(motor) => Some(motor.stop().await),
+        HapticMotor::Legacy { .. } => None,
+    };
+    if let Some(cleanup) = cleanup {
         let mut s = state.lock().expect("state poisoned");
         match cleanup {
             Ok(()) => {

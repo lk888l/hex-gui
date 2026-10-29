@@ -899,7 +899,7 @@ export interface SmartKnobCalibration {
   detail: string;
 }
 
-export type SmartKnobKind = "canopen" | "meow" | "rollercan";
+export type SmartKnobKind = "canopen" | "meow" | "rollercan" | "damiao";
 export type SmartKnobControlSide = "host" | "firmware";
 export type SmartKnobEffortUnit = "Nm" | "A";
 
