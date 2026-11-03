@@ -10,6 +10,12 @@ use std::{
 
 use super::{check_range, El05ParameterValue, El05Target, El05Version};
 
+#[path = "el05_torque_accuracy.rs"]
+pub mod torque_accuracy;
+use torque_accuracy::{
+    TorqueAccuracyConfig, TorqueAccuracyPhase, TorqueAccuracyRuntime, TorqueAccuracyStatus,
+};
+
 const MAX_SAMPLES: usize = 120_000;
 const MIT_POSITION_LIMIT: f64 = 12.57;
 const MIT_TORQUE_LIMIT: f64 = 6.0;
@@ -37,6 +43,7 @@ pub enum ExperimentKind {
     TorqueRamp,
     StaticFriction,
     StaticTorque,
+    TorqueAccuracy,
     PositionSteps,
     SineSweep,
     Impedance,
@@ -133,6 +140,8 @@ pub struct ExperimentConfig {
     pub motion_confirm_s: f64,
     #[serde(default = "default_settle_time")]
     pub settle_time_s: f64,
+    #[serde(default)]
+    pub torque_accuracy: Option<TorqueAccuracyConfig>,
 }
 
 fn default_torque_ramp_rate() -> f64 {
@@ -191,6 +200,7 @@ impl Default for ExperimentConfig {
             motion_threshold_rad: default_motion_threshold(),
             motion_confirm_s: default_motion_confirm(),
             settle_time_s: default_settle_time(),
+            torque_accuracy: None,
         }
     }
 }
@@ -323,6 +333,12 @@ impl ExperimentConfig {
                 check_range(value, min, max, label)?;
             }
         }
+        if self.kind == ExperimentKind::TorqueAccuracy {
+            self.torque_accuracy
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("torque accuracy configuration is required"))?
+                .validate(self)?;
+        }
         Ok(())
     }
 
@@ -431,7 +447,7 @@ impl ExperimentConfig {
             }
             // A feedback-driven state machine owns this experiment. The
             // compatibility/config-only entry point must never start a ramp.
-            ExperimentKind::StaticFriction => {
+            ExperimentKind::StaticFriction | ExperimentKind::TorqueAccuracy => {
                 *position_rad = 0.0;
                 *kp = 0.0;
                 *kd = 0.0;
@@ -815,6 +831,7 @@ pub struct ExperimentStatus {
     #[serde(default)]
     pub recording_interval_s: f64,
     pub static_friction: Option<StaticFrictionStatus>,
+    pub torque_accuracy: Option<TorqueAccuracyStatus>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -844,10 +861,17 @@ pub struct Experiment {
     pub version: Option<El05Version>,
     start: Option<Instant>,
     static_friction_runtime: StaticFrictionRuntime,
+    torque_accuracy_runtime: Option<TorqueAccuracyRuntime>,
 }
 
 impl Experiment {
     pub fn begin(&mut self, config: ExperimentConfig, motor_id: u8, uid: Option<String>) {
+        let accuracy = (config.kind == ExperimentKind::TorqueAccuracy)
+            .then(|| TorqueAccuracyRuntime::new(&config));
+        let (torque_accuracy_runtime, torque_accuracy) = match accuracy {
+            Some((runtime, status)) => (Some(runtime), Some(status)),
+            None => (None, None),
+        };
         *self = Self {
             status: ExperimentStatus {
                 run_id: next_run_id(),
@@ -860,12 +884,14 @@ impl Experiment {
                 } / (MAX_SAMPLES - 1) as f64,
                 static_friction: (config.kind == ExperimentKind::StaticFriction)
                     .then(|| StaticFrictionStatus::new(&config)),
+                torque_accuracy,
                 config: Some(config),
                 ..Default::default()
             },
             start: Some(Instant::now()),
             motor_id: Some(motor_id),
             uid,
+            torque_accuracy_runtime,
             ..Default::default()
         };
     }
@@ -884,6 +910,12 @@ impl Experiment {
                 if state.phase != StaticFrictionPhase::Complete || reason != completed_reason {
                     state.phase = StaticFrictionPhase::Complete;
                     state.outcome = Some(StaticFrictionOutcome::Interrupted);
+                }
+            }
+            if let Some(state) = self.status.torque_accuracy.as_mut() {
+                if state.phase != TorqueAccuracyPhase::Complete {
+                    state.return_reason = Some(reason.clone());
+                    state.phase = TorqueAccuracyPhase::Complete;
                 }
             }
             self.status.elapsed_s = self.elapsed_s();
@@ -952,6 +984,26 @@ impl Experiment {
         velocity_rad_s: f64,
     ) -> Option<El05Target> {
         let config = self.status.config.as_ref()?;
+        if let (Some(runtime), Some(state)) = (
+            &mut self.torque_accuracy_runtime,
+            &mut self.status.torque_accuracy,
+        ) {
+            let (position, velocity) =
+                runtime.target(elapsed_s, unwrapped_position, velocity_rad_s, config, state);
+            let pendulum = config.pendulum.as_ref()?;
+            // Use measured angle throughout positioning, holding and return.
+            // No empirically fitted scale is applied during this measurement.
+            let gravity_torque = torque_accuracy::gravity_peak(pendulum)
+                * (unwrapped_position - pendulum.downward_zero_rad).sin();
+            return Some(El05Target::Mit {
+                position_rad: (wrapped_position + position - unwrapped_position)
+                    .clamp(-MIT_POSITION_LIMIT, MIT_POSITION_LIMIT),
+                velocity_rad_s: velocity,
+                torque_nm: gravity_torque.clamp(-MIT_TORQUE_LIMIT, MIT_TORQUE_LIMIT),
+                kp: config.kp,
+                kd: config.kd,
+            });
+        }
         let Some(state) = self.status.static_friction.as_mut() else {
             return config.target_with_feedback(elapsed_s, wrapped_position, unwrapped_position);
         };
@@ -1024,6 +1076,23 @@ impl Experiment {
         let elapsed = self.elapsed_s();
         self.status.elapsed_s = elapsed;
         let config = self.status.config.as_ref()?;
+        if let (Some(runtime), Some(state)) = (
+            &mut self.torque_accuracy_runtime,
+            &self.status.torque_accuracy,
+        ) {
+            runtime.temperature(temperature, config, state);
+            return (state.phase == TorqueAccuracyPhase::Complete).then(|| {
+                format!(
+                    "torque accuracy: {}; {}",
+                    state.return_reason.as_deref().unwrap_or("scan ended"),
+                    if state.returned_to_zero {
+                        "returned to calibrated zero"
+                    } else {
+                        "zero return unconfirmed"
+                    }
+                )
+            });
+        }
         if config.max_temperature_c > 0.0 && temperature >= config.max_temperature_c {
             return Some("temperature bound reached".into());
         }
@@ -1188,6 +1257,93 @@ mod tests {
             panic!("expected MIT command")
         };
         (position_rad, velocity_rad_s, torque_nm, kp, kd)
+    }
+
+    #[test]
+    fn accuracy_gravity_feedforward_uses_actual_angle_during_motion_hold_and_hot_return() {
+        for direction in [-1, 1] {
+            let zero = 0.7;
+            let p = PendulumConfig {
+                mass_kg: 3.0,
+                length_m: 0.18,
+                arm_mass_kg: 0.4,
+                downward_zero_rad: zero,
+                zero_measured: true,
+                ..Default::default()
+            };
+            let peak = torque_accuracy::gravity_peak(&p);
+            let c = ExperimentConfig {
+                kind: ExperimentKind::TorqueAccuracy,
+                kp: 80.0,
+                kd: 2.0,
+                max_temperature_c: 120.0,
+                gravity_compensation: true,
+                origin_position_rad: zero,
+                pendulum: Some(p),
+                torque_accuracy: Some(TorqueAccuracyConfig {
+                    reference_id: "reference".into(),
+                    start_nm: 3.7,
+                    end_nm: 5.2,
+                    step_nm: 0.05,
+                    hold_s: 1.0,
+                    move_speed_rad_s: 0.3,
+                    direction,
+                }),
+                ..Default::default()
+            };
+            c.validate().unwrap();
+            let mut run = Experiment::default();
+            run.begin(c, 1, None);
+            assert_eq!(mit(run.runtime_target_at(0.0, zero, zero, 0.0)).2, 0.0);
+            let angle = f64::from(direction) * 0.2;
+            let expected = peak * angle.sin();
+            for t in [1.0, 10.0] {
+                let target = mit(run.runtime_target_at(t, zero + angle, zero + angle, 0.0));
+                assert!((target.2 - expected).abs() < 1e-10);
+                assert_eq!((target.3, target.4), (80.0, 2.0));
+            }
+            assert_eq!(
+                run.status.torque_accuracy.as_ref().unwrap().phase,
+                TorqueAccuracyPhase::Holding
+            );
+            assert!(run.end_reason(119.9).is_none());
+            assert!(
+                run.end_reason(120.0).is_none(),
+                "temperature requests return, not immediate disable"
+            );
+            assert!(
+                (mit(run.runtime_target_at(10.1, zero + angle, zero + angle, 0.0)).2 - expected)
+                    .abs()
+                    < 1e-10
+            );
+            assert_eq!(
+                run.status.torque_accuracy.as_ref().unwrap().phase,
+                TorqueAccuracyPhase::Returning
+            );
+            let near_zero = f64::from(direction) * 0.02;
+            assert!(
+                (mit(run.runtime_target_at(11.0, zero + near_zero, zero + near_zero, 0.0)).2
+                    - peak * near_zero.sin())
+                .abs()
+                    < 1e-10
+            );
+            assert_eq!(mit(run.runtime_target_at(20.0, zero, zero, 0.0)).2, 0.0);
+            // Even a larger fixture remains within the MIT feedforward range.
+            let p = run
+                .status
+                .config
+                .as_mut()
+                .unwrap()
+                .pendulum
+                .as_mut()
+                .unwrap();
+            p.mass_kg = 20.0;
+            p.length_m = 2.0;
+            assert_eq!(
+                mit(run.runtime_target_at(20.1, zero + angle, zero + angle, 0.0)).2,
+                f64::from(direction) * 6.0
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@ struct MitOnlyBus {
     position: StdMutex<f64>,
     zero_due: StdMutex<Option<Instant>>,
     zero_applies: AtomicBool,
+    follow_position: AtomicBool,
+    temperature_decic: AtomicU16,
 }
 
 impl MitOnlyBus {
@@ -39,12 +41,15 @@ impl MitOnlyBus {
             position: StdMutex::new(-2.9333),
             zero_due: StdMutex::new(None),
             zero_applies: AtomicBool::new(true),
+            follow_position: AtomicBool::new(false),
+            temperature_decic: AtomicU16::new(307),
         })
     }
 
     fn telemetry(&self) -> CanFrame {
         // Independent wire fixture: p16, v12=2048, tau12=2048, 30.7 C.
         let p = (((*self.position.lock().unwrap() + 12.57) / 25.14) * 65535.0).round() as u16;
+        let temperature = self.temperature_decic.load(Ordering::Acquire);
         CanFrame::new_data(
             CanId::Standard(self.reply_id.load(Ordering::Acquire)),
             &[
@@ -54,8 +59,8 @@ impl MitOnlyBus {
                 0x80,
                 0x08,
                 0,
-                self.flags.load(Ordering::Acquire) | 1,
-                0x33,
+                self.flags.load(Ordering::Acquire) | ((temperature >> 8) as u8 & 0x0f),
+                temperature as u8,
             ],
         )
         .unwrap()
@@ -167,6 +172,12 @@ impl CanBus for MitOnlyBus {
             }
             data if data.starts_with(&[255; 6]) => return Err(invalid()),
             _ => {
+                let kp_raw =
+                    (u16::from(request.data()[3] & 0x0f) << 8) | u16::from(request.data()[4]);
+                if self.follow_position.load(Ordering::Acquire) && kp_raw > 0 {
+                    let p = u16::from_be_bytes([request.data()[0], request.data()[1]]);
+                    *self.position.lock().unwrap() = f64::from(p) * 25.14 / 65535.0 - 12.57;
+                }
                 if self.motion_replies.load(Ordering::Acquire) {
                     self.feedback();
                 }
@@ -237,6 +248,170 @@ async fn gravity_config(app: &El05Session) -> GravityCompensationConfig {
         max_velocity_rad_s: 3.0,
         max_temperature_c: 60.0,
         ramp_s: 0.1,
+    }
+}
+
+async fn accuracy_config(app: &El05Session) -> ExperimentConfig {
+    let reference = app.capture_gravity_reference().await.unwrap();
+    ExperimentConfig {
+        kind: ExperimentKind::TorqueAccuracy,
+        kp: 80.0,
+        kd: 2.0,
+        max_temperature_c: 120.0,
+        gravity_compensation: true,
+        pendulum: Some(experiment::PendulumConfig {
+            mass_kg: 3.0,
+            length_m: 0.18,
+            // The session must replace UI coordinates with the bound reference.
+            downward_zero_rad: 123.0,
+            zero_measured: true,
+            ..Default::default()
+        }),
+        torque_accuracy: Some(experiment::torque_accuracy::TorqueAccuracyConfig {
+            reference_id: reference.id,
+            start_nm: 3.7,
+            end_nm: 5.2,
+            step_nm: 0.05,
+            hold_s: 1.0,
+            move_speed_rad_s: 0.3,
+            direction: 1,
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn standard_accuracy_overtemperature_keeps_position_control_until_zero_then_stops() {
+    let (bus, app) = attached(1).await;
+    let config = accuracy_config(&app).await;
+    let zero = app
+        .snapshot()
+        .gravity_compensation
+        .reference
+        .unwrap()
+        .position_rad;
+    bus.follow_position.store(true, Ordering::Release);
+    app.start_experiment(config).await.unwrap();
+    let stop_count = bus.stop_count();
+    assert_eq!(
+        app.experiment_data()
+            .status
+            .config
+            .unwrap()
+            .pendulum
+            .unwrap()
+            .downward_zero_rad,
+        zero
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(app.snapshot().position_rad.unwrap() > zero + 0.01);
+    bus.temperature_decic.store(1200, Ordering::Release);
+    wait_until(&app, |s| {
+        s.experiment
+            .torque_accuracy
+            .as_ref()
+            .is_some_and(|a| a.phase == experiment::torque_accuracy::TorqueAccuracyPhase::Returning)
+    })
+    .await;
+    let returning = app.snapshot();
+    assert!(returning.enabled && returning.streaming && returning.experiment.active);
+    assert_eq!(
+        bus.stop_count(),
+        stop_count,
+        "temperature alone must not send immediate Stop"
+    );
+    wait_until(&app, |s| !s.experiment.active && !s.enabled).await;
+    let data = app.experiment_data();
+    assert!(
+        data.status
+            .torque_accuracy
+            .as_ref()
+            .unwrap()
+            .returned_to_zero
+    );
+    assert!(data
+        .status
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("temperature bound reached"));
+    assert!((app.snapshot().position_rad.unwrap() - zero).abs() < 0.02);
+    assert!(bus.stop_count() > stop_count);
+    assert!(!bus.physical_enabled.load(Ordering::Acquire));
+    assert!(data.commands.iter().all(|c| matches!(
+        c.target,
+        El05Target::Mit {
+            kp: 80.0,
+            kd: 2.0,
+            torque_nm,
+            ..
+        } if torque_nm.is_finite() && torque_nm.abs() <= 6.0
+    )));
+    assert!(data
+        .commands
+        .iter()
+        .any(|c| matches!(c.target, El05Target::Mit { torque_nm, .. } if torque_nm > 0.01)));
+    let return_start = data
+        .status
+        .torque_accuracy
+        .as_ref()
+        .unwrap()
+        .return_started_s
+        .unwrap();
+    assert!(data
+        .commands
+        .iter()
+        .filter(|c| c.t_s >= return_start)
+        .any(|c| matches!(c.target, El05Target::Mit { torque_nm, .. } if torque_nm > 0.01)));
+    assert!(
+        matches!(data.commands.last().unwrap().target, El05Target::Mit { torque_nm, .. } if torque_nm.abs() < 0.02)
+    );
+    assert!(data.samples.iter().any(|s| s.temperature_c >= 120.0));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standard_accuracy_stale_zero_is_rejected_and_stop_fault_and_feedback_guards_interrupt_return(
+) {
+    for condition in ["stop", "fault", "feedback"] {
+        let (bus, app) = attached(1).await;
+        let mut config = accuracy_config(&app).await;
+        let reference_id = config
+            .torque_accuracy
+            .as_ref()
+            .unwrap()
+            .reference_id
+            .clone();
+        config.torque_accuracy.as_mut().unwrap().reference_id = "stale".into();
+        assert!(app.start_experiment(config.clone()).await.is_err());
+        assert!(!bus.physical_enabled.load(Ordering::Acquire));
+        config.torque_accuracy.as_mut().unwrap().reference_id = reference_id;
+        bus.follow_position.store(true, Ordering::Release);
+        app.start_experiment(config).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        bus.temperature_decic.store(1200, Ordering::Release);
+        wait_until(&app, |s| {
+            s.experiment.torque_accuracy.as_ref().is_some_and(|a| {
+                a.phase == experiment::torque_accuracy::TorqueAccuracyPhase::Returning
+            })
+        })
+        .await;
+        match condition {
+            "stop" => app.stop().await.unwrap(),
+            "fault" => bus.flags.store(0x20, Ordering::Release),
+            _ => bus.motion_replies.store(false, Ordering::Release),
+        }
+        wait_until(&app, |s| !s.experiment.active && !s.enabled).await;
+        assert!(!bus.physical_enabled.load(Ordering::Acquire), "{condition}");
+        assert!(
+            !app.experiment_data()
+                .status
+                .torque_accuracy
+                .unwrap()
+                .returned_to_zero,
+            "{condition}"
+        );
+        app.shutdown().await.unwrap();
     }
 }
 

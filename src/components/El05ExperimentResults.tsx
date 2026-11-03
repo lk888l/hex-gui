@@ -6,6 +6,7 @@ import { LEGACY_HISTORY_KEY, readWorkspaceHistory, writeWorkspaceHistory } from 
 import { analyzeExperiment, deriveExperimentSamples, EL05_TORQUE_UNIT, experimentTorqueLimitNm, staticFrictionPasses } from "../el05Experiment";
 import { LEGACY_VELOCITY_ANALYSIS_NOTE, normalizeExperimentFeedbackVelocity } from "../el05Velocity";
 import { feedbackVelocityBits } from "../el05Protocol";
+import { torqueAccuracyModelLabel, validateTorqueAccuracyRecording } from "../el05TorqueAccuracy";
 
 export type ExperimentAnalysis = ReturnType<typeof analyzeExperiment>;
 export interface ExperimentRecord {
@@ -40,6 +41,11 @@ function isAnalysis(value: unknown): value is ExperimentAnalysis {
     && (!report.frequency_response || (Array.isArray(report.frequency_response.points) && report.frequency_response.points.every(point => [point.frequency_hz, point.gain_db, point.phase_deg].every(Number.isFinite))))
     && Array.isArray(report.quality.notes) && report.quality.notes.every(note => typeof note === "string")
     && Array.isArray(report.limitations) && report.limitations.every(note => typeof note === "string")
+    && (!report.torque_accuracy || (Array.isArray(report.torque_accuracy.points)
+      && ["constant", "linear", "step", "piecewise_linear", "inconclusive"].includes(report.torque_accuracy.model)
+      && report.torque_accuracy.points.every(p => p && typeof p.accepted === "boolean"
+        && [p.index, p.started_s, p.target_torque_nm].every(Number.isFinite)
+        && [p.theory_nm, p.feedback_nm, p.send_scale, p.error_nm, p.error_percent, p.angle_rad, p.temperature_c, p.feedback_std_nm].every(v => v === null || Number.isFinite(v)))))
     && Array.isArray(report.sections) && report.sections.every(section => typeof section.id === "string" && typeof section.title === "string"
       && Array.isArray(section.notes) && section.notes.every(note => typeof note === "string")
       && Array.isArray(section.metrics) && section.metrics.every(metric => typeof metric.key === "string" && typeof metric.label === "string"
@@ -93,7 +99,7 @@ function parseExperimentValue(parsed: any): { data: El05ExperimentData; analysis
   if (data.feedback_velocity_bits != null && data.feedback_velocity_bits !== expectedBits) {
     throw new Error("Feedback bit width does not match protocol / 反馈位宽与协议不一致");
   }
-  const kinds = ["Record", "VelocitySteps", "TorqueRamp", "StaticTorque", "PositionSteps", "SineSweep", "Impedance", "Backdrive", "ThermalHold", "SlowTriangle", "StaticFriction"];
+  const kinds = ["Record", "VelocitySteps", "TorqueRamp", "StaticTorque", "TorqueAccuracy", "PositionSteps", "SineSweep", "Impedance", "Backdrive", "ThermalHold", "SlowTriangle", "StaticFriction"];
   if (!kinds.includes(data.status.config?.kind)) throw new Error("Missing or unsupported experiment configuration / 缺少或不支持的测试配置");
   const config = data.status.config;
   const numeric = ["duration_s", "velocity_rad_s", "torque_nm", "kd", "max_temperature_c"];
@@ -107,6 +113,7 @@ function parseExperimentValue(parsed: any): { data: El05ExperimentData; analysis
   if (config.pendulum && (["mass_kg", "length_m", "arm_mass_kg", "downward_zero_rad"].some(key => !Number.isFinite(config.pendulum[key])) || (config.pendulum.extra_inertia_kg_m2 != null && !Number.isFinite(config.pendulum.extra_inertia_kg_m2)))) {
     throw new Error("Invalid pendulum geometry / 摆锤几何或参考角数据无效");
   }
+  validateTorqueAccuracyRecording(data);
   const validateSample = (sample: any) => {
     if (!sample || ![sample.t_s, sample.sequence, sample.unwrapped_position_rad, sample.velocity_rad_s, sample.torque_nm, sample.temperature_c].every(Number.isFinite)) {
       throw new Error("Invalid telemetry sample / 遥测样本包含缺失或无效的数值");
@@ -230,6 +237,9 @@ export function experimentReport(data: El05ExperimentData, analysis: ExperimentA
   if (analysis.kind === "StaticTorque") detailTable(tr("逐平台静态结果", "Static plateau results"),
     ["t (s)", tr("目标角 (rad)", "Target (rad)"), tr("实际角 (rad)", "Angle (rad)"), `${tr("理论重力矩", "Theoretical gravity torque")} (${EL05_TORQUE_UNIT})`, "Iq (A)", `${tr("驱动反馈力矩", "Drive feedback torque")} (${EL05_TORQUE_UNIT})`, tr("接近方向", "Approach")],
     (analysis.static_torque?.platforms ?? []).map(point => [fmt(point.start_s, 2), fmt(point.target_angle_rad), fmt(point.angle_rad), fmt(point.gravity_torque_nm), fmt(point.current_a), fmt(point.feedback_torque_nm), point.approach ?? "—"]));
+  if (analysis.torque_accuracy) detailTable(tr("逐点力矩准确度", "Torque accuracy by hold"),
+    [tr("测点", "Point"), tr("方向", "Sweep"), tr("目标 Nm", "Target Nm"), tr("实际角 rad", "Angle rad"), tr("理论 Nm", "Theory Nm"), tr("反馈总力矩 Nm", "Total feedback Nm"), tr("反馈标准差 Nm", "Feedback SD Nm"), tr("误差 %", "Error %"), tr("反馈/理论比值", "Feedback/theory ratio"), "°C", tr("采样有效性", "Sample validity")],
+    analysis.torque_accuracy.points.map(p => [String(p.index + 1), p.increasing ? "↑" : "↓", fmt(p.target_torque_nm), fmt(p.angle_rad), fmt(p.theory_nm), fmt(p.feedback_nm), fmt(p.feedback_std_nm), fmt(p.error_percent, 2), fmt(p.send_scale), fmt(p.temperature_c, 1), p.accepted ? tr("有效", "Accepted") : p.reason ?? "—"]));
   const position = analysis.kind !== "VelocitySteps";
   const steps = position ? analysis.tracking?.position_steps : analysis.tracking?.velocity_steps;
   detailTable(tr("逐阶跃响应结果", "Individual step responses"),
@@ -250,9 +260,34 @@ export function experimentReport(data: El05ExperimentData, analysis: ExperimentA
 export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: El05ExperimentData | null; analysis: ExperimentAnalysis | null; zh: boolean; reduced?: boolean }) {
   const tr = (cn: string, en: string) => zh ? cn : en;
   const [chart, setChart] = useState("motion");
-  useEffect(() => { setChart(data?.status.config?.kind === "StaticFriction" ? "friction" : "motion"); }, [data?.status.config?.kind]);
+  useEffect(() => { setChart(data?.status.config?.kind === "StaticFriction" ? "friction" : data?.status.config?.kind === "TorqueAccuracy" ? "torque" : "motion"); }, [data?.status.config?.kind]);
   const chartOption = useMemo(() => {
     if (!data?.samples.length) return {};
+    if (chart === "accuracy" || chart === "scale") {
+      const accuracy = analysis?.torque_accuracy;
+      const points = accuracy?.points.filter(p => p.accepted && p.theory_nm != null && p.feedback_nm != null) ?? [];
+      const scale = chart === "scale";
+      const xs = points.map(p => Math.abs(p.theory_nm!));
+      const bounds = xs.length ? [Math.min(...xs), Math.max(...xs)] : [];
+      const fit = (x: number) => !accuracy || accuracy.intercept == null ? null
+        : accuracy.model === "step" ? (x < (accuracy.boundary_nm![0] + accuracy.boundary_nm![1]) / 2 ? accuracy.low_scale : accuracy.high_scale)
+        : accuracy.model === "piecewise_linear" ? accuracy.intercept + accuracy.slope_per_nm! * Math.max(0, x - accuracy.hinge_nm!)
+        : accuracy.intercept + (accuracy.slope_per_nm ?? 0) * x;
+      return { animation: false, color: ["#60a5fa", "#f59e0b", "#94a3b8", "#34d399"], tooltip: { trigger: "axis" },
+        legend: { textStyle: { color: "#94a3b8" }, top: 0 }, grid: { left: 70, right: 70, top: 55, bottom: 70 },
+        xAxis: { type: "value", name: tr("理论 |Nm|", "Theory |Nm|"), nameLocation: "middle", nameGap: 30, scale: true, axisLabel: { color: "#94a3b8" } },
+        yAxis: { type: "value", name: scale ? tr("反馈/理论比值", "Feedback/theory ratio") : tr("反馈总力矩 |Nm|", "Total feedback |Nm|"), scale: true, axisLabel: { color: "#94a3b8" } },
+        dataZoom: [{ type: "inside", filterMode: "none" }, { type: "slider", height: 20, bottom: 10 }],
+        series: [
+          ...[true, false].map(increasing => ({ type: "line", name: increasing ? tr("递增", "Ascending") : tr("回扫", "Descending"), symbolSize: 6,
+            data: points.filter(p => p.increasing === increasing).sort((a, b) => Math.abs(a.theory_nm!) - Math.abs(b.theory_nm!))
+              .map(p => [Math.abs(p.theory_nm!), scale ? p.send_scale : Math.abs(p.feedback_nm!)]) })),
+          { type: "line", name: tr("理想值", "Ideal"), showSymbol: false, lineStyle: { type: "dashed" }, data: bounds.map(x => [x, scale ? 1 : x]),
+            markArea: { silent: true, itemStyle: { color: "rgba(167,139,250,0.15)" }, data: accuracy?.boundary_nm ? [[{ xAxis: accuracy.boundary_nm[0] }, { xAxis: accuracy.boundary_nm[1] }]] : [] } },
+          { type: "line", name: tr("比值拟合", "Ratio fit"), showSymbol: false, data: scale && accuracy?.model !== "inconclusive" && bounds.length
+            ? Array.from({ length: 201 }, (_, i) => { const x = bounds[0] + (bounds[1] - bounds[0]) * i / 200; return [x, fit(x)]; }) : [] },
+        ] };
+    }
     if (chart === "friction") {
       const samples = thin(data.samples, 3000);
       const passes = staticFrictionPasses(data);
@@ -330,9 +365,9 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
       add(tr("驱动反馈力矩", "Drive feedback torque"), samples.map(sample => sample.torque_nm));
       add(tr("前馈转矩指令", "Feedforward torque"), samples.map(sample => sample.target?.kind === "Mit" ? sample.target.torque_nm : null));
       add(tr("重力保持转矩", "Gravity holding torque"), derived.map(sample => sample.gravity_torque_nm));
-      add(tr("摩擦转矩估计", "Estimated friction"), derived.map(sample => sample.friction_torque_nm));
+      add(data.status.config?.kind === "TorqueAccuracy" ? tr("反馈 − 重力 − 惯性", "Feedback − gravity − inertia") : tr("摩擦转矩估计", "Estimated friction"), derived.map(sample => sample.friction_torque_nm));
       add("Iq", derived.map(sample => sample.fresh_current_a), 1);
-      if (data.status.config?.kind === "StaticTorque") {
+      if (["StaticTorque", "TorqueAccuracy"].includes(data.status.config?.kind ?? "")) {
         const torqueLimit = experimentTorqueLimitNm(data);
         Object.assign(series[0], { markLine: { silent: true, symbol: "none", lineStyle: { color: "#f87171", type: "dashed" },
           label: { color: "#f87171", formatter: `{c} ${EL05_TORQUE_UNIT} ${tr("驱动上限", "drive limit")}` },
@@ -361,6 +396,11 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
   }, [data, analysis, chart, zh]);
   if (!data?.samples.length || !analysis) return <Empty description={tr("开始测试或导入 JSON 后显示曲线与自动分析", "Start a run or import JSON to view traces and analysis")} />;
   return <div className="el05-experiment-results">
+    {analysis.torque_accuracy && <Alert showIcon type="info" message={torqueAccuracyModelLabel(analysis.torque_accuracy.model, zh)}
+      description={<>{tr("记录的是电机回包的总反馈力矩；MIT 合成指令包含重力前馈、位置项和阻尼项。反馈/理论比值并非已验证的发送补偿系数，静摩擦、零点、负载几何和温度均可能影响结果。紫色区域为候选边界区间。", "Recorded torque is total drive feedback; MIT demand includes gravity feedforward, position and damping terms. The feedback/theory ratio is not a validated command correction: static friction, zero, load geometry and temperature can affect it. Purple shading marks a candidate boundary interval.")}
+        {analysis.torque_accuracy.model === "inconclusive" && analysis.torque_accuracy.hysteresis_scale != null && analysis.torque_accuracy.hysteresis_scale > 0.025 && <div>{tr(
+          `往返比值差均值 ${(analysis.torque_accuracy.hysteresis_scale * 100).toFixed(2)} 个百分点，超过 2.5 个百分点；本组不能确定发送补偿系数或边界。`,
+          `Mean approach ratio difference is ${(analysis.torque_accuracy.hysteresis_scale * 100).toFixed(2)} percentage points, above 2.5; this run cannot determine a command correction or boundary.`)}</div>}</>} />}
     {reduced && <Alert type="info" showIcon message={analysis.quality.notes.includes(LEGACY_VELOCITY_ANALYSIS_NOTE)
       ? tr("历史曲线已抽样；反馈速度方向已修正，指标按当前保留样本重新计算。", "History traces are reduced. Feedback velocity direction is corrected and metrics are recalculated from retained samples.")
       : tr("本地历史的曲线已抽样；指标保留自原始完整数据分析。需要完整原始帧时，请在下一组开始前导出 JSON。", "Local history traces are reduced; metrics retain the original full-data analysis. Export JSON before the next run to keep every original frame.")} />}
@@ -371,6 +411,7 @@ export function El05ExperimentResults({ data, analysis, zh, reduced }: { data: E
     </div>
     <Segmented value={chart} onChange={value => setChart(String(value))} options={[
       ...(data.status.config?.kind === "StaticFriction" ? [{ value: "friction", label: tr("小角度静摩擦标定", "Small-angle static friction") }] : []),
+      ...(data.status.config?.kind === "TorqueAccuracy" ? [{ value: "accuracy", label: tr("反馈 / 理论力矩", "Feedback / theory") }, { value: "scale", label: tr("反馈比值 / 力矩", "Feedback ratio / torque") }] : []),
       { value: "motion", label: tr("位置 / 速度", "Position / velocity") }, { value: "torque", label: tr("转矩 / 电流", "Torque / current") },
       { value: "error", label: tr("跟踪误差", "Tracking errors") }, { value: "thermal", label: tr("温升", "Temperature") }, ...(data.status.config?.kind === "SineSweep" ? [{ value: "frequency", label: tr("频率响应", "Frequency response") }] : []), ...(data.status.config?.kind === "StaticTorque" ? [{ value: "static", label: tr("转矩 / Iq 标定", "Torque / Iq fit") }] : [])]} />
     {chart === "frequency" && !analysis.frequency_response?.points.length && <Typography.Paragraph type="secondary" className="el05-experiment-notes">{analysis.frequency_response?.reason ?? tr("可辨识的完整周期不足，暂无法提取频率响应。", "Insufficient identifiable complete cycles for a frequency response.")}</Typography.Paragraph>}
@@ -402,6 +443,22 @@ function El05ExperimentDetails({ analysis, zh }: { analysis: ExperimentAnalysis;
   const tr = (cn: string, en: string) => zh ? cn : en;
   const fmt = (value: number | null | undefined, digits = 4) => value != null && Number.isFinite(value) ? value.toFixed(digits) : "—";
   const items = [];
+  if (analysis.torque_accuracy) items.push({ key: "torque_accuracy", label: tr("逐点力矩准确度（含无效点）", "Torque accuracy by hold (including rejected points)"), children:
+    <Table size="small" pagination={false} scroll={{ x: 1300 }} rowKey="index" dataSource={analysis.torque_accuracy.points} columns={[
+      { title: tr("测点", "Point"), dataIndex: "index", render: v => v + 1 },
+      { title: tr("扫描", "Sweep"), dataIndex: "increasing", render: v => v ? "↑" : "↓" },
+      { title: tr("目标 Nm", "Target Nm"), dataIndex: "target_torque_nm", render: v => fmt(v) },
+      { title: tr("实际角 rad", "Angle rad"), dataIndex: "angle_rad", render: v => fmt(v) },
+      { title: tr("理论 Nm", "Theory Nm"), dataIndex: "theory_nm", render: v => fmt(v) },
+      { title: tr("反馈总力矩 Nm", "Total feedback Nm"), dataIndex: "feedback_nm", render: v => fmt(v) },
+      { title: tr("反馈标准差 Nm", "Feedback SD Nm"), dataIndex: "feedback_std_nm", render: v => fmt(v) },
+      { title: tr("误差 Nm", "Error Nm"), dataIndex: "error_nm", render: v => fmt(v) },
+      { title: tr("误差 %", "Error %"), dataIndex: "error_percent", render: v => fmt(v, 2) },
+      { title: tr("反馈/理论比值", "Feedback/theory ratio"), dataIndex: "send_scale", render: v => fmt(v) },
+      { title: "°C", dataIndex: "temperature_c", render: v => fmt(v, 1) },
+      { title: tr("样本", "Samples"), dataIndex: "sample_count" },
+      { title: tr("采样有效性", "Sample validity"), key: "validity", render: (_, p) => p.accepted ? <Tag color="green">{tr("有效", "Accepted")}</Tag> : <Typography.Text type="warning">{p.reason}</Typography.Text> },
+    ]} /> });
   if (analysis.kind === "StaticTorque" && analysis.static_torque?.platforms?.length) items.push({ key: "static", label: tr("逐平台静态结果", "Static plateau results"), children:
     <Table size="small" pagination={false} scroll={{ x: 780 }} rowKey="start_s" dataSource={analysis.static_torque.platforms} columns={[
       { title: "t (s)", dataIndex: "start_s", render: value => fmt(value, 2) },

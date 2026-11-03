@@ -3,9 +3,12 @@ import { Alert, App, Button, Card, Checkbox, Collapse, Descriptions, Input, Inpu
 import { el05Api, type MotorWorkspaceApi, type El05Protocol, type El05ExperimentConfig, type El05ExperimentData, type El05ExperimentKind, type El05State } from "../el05Api";
 import { analyzeExperiment, EL05_TORQUE_LIMIT_NM, EL05_TORQUE_UNIT, experimentCsv, experimentJson, pendulumModel, staticHoldingTorquePeakNm } from "../el05Experiment";
 import { errMsg } from "../api";
+import { DEFAULT_TORQUE_ACCURACY, TORQUE_ACCURACY_MAX_TEMPERATURE_C } from "../el05TorqueAccuracy";
+import { gravityReadiness } from "../el05Gravity";
 import { El05ExperimentResults, experimentReport, loadRecords, makeRecord, metricLabel, metricValue, parseExperimentJson, runKey, staticFrictionStatusText, storeRecords, thin, type ExperimentRecord } from "./El05ExperimentResults";
 
 const KINDS: { value: El05ExperimentKind; cn: string; en: string; description: [string, string]; preset: Partial<El05ExperimentConfig> }[] = [
+  { value: "TorqueAccuracy", cn: "力矩准确度测试", en: "Torque accuracy", description: ["将理论力矩换算为 MIT 位置，逐点保持并递增、回扫。对比实际摆角对应的重力矩和电机反馈总力矩，分析比值及变化边界；该比值需独立验证后才能用于发送补偿。保持前的移动时间单独计算；超温或扫描完成后先回已标定零点，确认静止后停机。", "Converts theoretical loads to MIT positions and holds each point on ascending and descending sweeps. Compares measured-angle gravity torque with total drive feedback to analyze ratios and boundaries; ratios need independent validation before use as command corrections. Travel time is separate from dwell time. On temperature limit or completion, returns to the calibrated zero and stops after settling."], preset: {} },
   { value: "Record", cn: "自由衰减 / 被动记录", en: "Free decay / passive recording", description: ["自动停机后记录。手动拨动并释放摆锤，估算周期、阻尼比与衰减，并结合重力和惯量辨识摩擦。", "Automatically stops the drive and records. Deflect and release the pendulum to estimate period, damping and decay; gravity and inertia support friction estimation."], preset: { duration_s: 20 } },
   { value: "StaticFriction", cn: "静摩擦标定 · 双向小角度起动", en: "Static friction · bidirectional breakaway", description: ["将摆锤自然垂直下垂后开始。默认依次测正、反两个方向：确认静止，从零缓慢增加转矩；检测到微小起动便撤去斜坡，回位并重新确认静止后测反向，最后回位停止。两个方向的起动事件独立保存。", "Start with the pendulum naturally hanging down. By default tests positive then negative: confirms rest, ramps torque from zero, detects small motion, returns and confirms rest again before reversing. Returns and stops after the second direction; each direction keeps independent onset events."], preset: { duration_s: 45, friction_direction: "Both", torque_nm: 0.6, torque_ramp_rate_nm_s: 0.02, max_excursion_rad: 3 * Math.PI / 180, motion_threshold_rad: 0.15 * Math.PI / 180, motion_confirm_s: 0.04, settle_time_s: 0.5, kp: 8, kd: 0.8, gravity_compensation: false } },
   { value: "VelocitySteps", cn: "正反速度阶跃", en: "Bidirectional velocity steps", description: ["按静止→正转→静止→反转→静止运行，比较速度误差、波动及正反差异。MIT 速度响应由 Kd 决定，无速度积分项。", "Runs rest → positive → rest → negative → rest. Compares speed errors, ripple and directional differences. MIT speed response uses Kd without an integral term."], preset: { duration_s: 20, velocity_rad_s: 0.3, kd: 0.5 } },
@@ -21,19 +24,30 @@ const KINDS: { value: El05ExperimentKind; cn: string; en: string; description: [
 const DEFAULT_CONFIG: El05ExperimentConfig = { kind: "Record", duration_s: 20, velocity_rad_s: 0.3, torque_nm: 0.3, kp: 8, kd: 0.5, center_angle_rad: 0, position_amplitude_rad: 0.25, frequency_start_hz: 0.1, frequency_end_hz: 2, gravity_compensation: false, disturbance_torque_nm: 0.15, max_temperature_c: 0, torque_ramp_rate_nm_s: 0.02, max_excursion_rad: 3 * Math.PI / 180, motion_threshold_rad: 0.15 * Math.PI / 180, motion_confirm_s: 0.04, settle_time_s: 0.5 };
 const POSITION_KINDS: El05ExperimentKind[] = ["StaticTorque", "PositionSteps", "SineSweep", "Impedance", "ThermalHold", "SlowTriangle"];
 
-export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refresh, onWorkingChange, api = el05Api, protocol = "Native" }: { state: El05State | null; zh: boolean; busy: boolean; coordinateRevision: number; refresh: () => Promise<void>; onWorkingChange: (working: boolean) => void; api?: MotorWorkspaceApi; protocol?: El05Protocol }) {
+export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refresh, onWorkingChange, api = el05Api, protocol = "Native", accuracyMode = false, onAccuracyModeChange }: { state: El05State | null; zh: boolean; busy: boolean; coordinateRevision: number; refresh: () => Promise<void>; onWorkingChange: (working: boolean) => void; api?: MotorWorkspaceApi; protocol?: El05Protocol; accuracyMode?: boolean; onAccuracyModeChange?: (accuracy: boolean) => void }) {
   const tr = (cn: string, en: string) => zh ? cn : en;
   const { message } = App.useApp();
   const [working, setWorkingState] = useState(false);
   const setWorking = (next: boolean) => { setWorkingState(next); onWorkingChange(next); };
   const [stopping, setStopping] = useState(false);
-  const [config, setConfig] = useState<El05ExperimentConfig>(DEFAULT_CONFIG);
-  const [mass, setMass] = useState(1);
+  const [benchConfig, setBenchConfig] = useState<El05ExperimentConfig>(DEFAULT_CONFIG);
+  const [accuracyConfig, setAccuracyConfig] = useState<El05ExperimentConfig>({ ...DEFAULT_CONFIG,
+    kind: "TorqueAccuracy", duration_s: 300, kp: 80, kd: 2, max_temperature_c: TORQUE_ACCURACY_MAX_TEMPERATURE_C, gravity_compensation: true,
+    torque_accuracy: { ...DEFAULT_TORQUE_ACCURACY } });
+  const config = accuracyMode ? accuracyConfig : benchConfig;
+  const setConfig = accuracyMode ? setAccuracyConfig : setBenchConfig;
+  const [benchMass, setBenchMass] = useState(1);
+  const [accuracyMass, setAccuracyMass] = useState(3);
+  const mass = accuracyMode ? accuracyMass : benchMass;
+  const setMass = accuracyMode ? setAccuracyMass : setBenchMass;
   const [lengthMm, setLengthMm] = useState(180);
   const [armMass, setArmMass] = useState(0);
   const [extraInertia, setExtraInertia] = useState(0);
-  const [downwardZero, setDownwardZero] = useState(0);
-  const [zeroMeasured, setZeroMeasured] = useState(false);
+  const [benchDownwardZero, setDownwardZero] = useState(0);
+  const [benchZeroMeasured, setZeroMeasured] = useState(false);
+  const reference = state?.gravity_compensation?.reference;
+  const downwardZero = accuracyMode ? reference?.position_rad ?? 0 : benchDownwardZero;
+  const zeroMeasured = accuracyMode ? !!reference && reference.motor_id === state?.motor_id : benchZeroMeasured;
   const [live, setLive] = useState<El05ExperimentData | null>(null);
   const liveRef = useRef<El05ExperimentData | null>(null);
   const [records, setRecords] = useState<ExperimentRecord[]>(() => loadRecords(protocol));
@@ -134,6 +148,17 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
     + (frictionStatus.phase === "Complete" ? 1 : Math.min(0.99, Math.max(0, (status?.elapsed_s ?? 0) - (frictionStatus.started_s ?? 0)) / (statusConfig.duration_s + 3)))) / directionCount
     : 100 * (status?.elapsed_s ?? 0) / plannedDuration;
   const model = pendulumModel(mass, lengthMm / 1000, armMass);
+  const accuracy = config.torque_accuracy ?? DEFAULT_TORQUE_ACCURACY;
+  const accuracyReadiness = gravityReadiness(state, { busy: busy || working || stopping,
+    validModel: model.gravityNm > 0, insufficientTorque: false });
+  const accuracyProblem = accuracyMode && (!(accuracy.end_nm > accuracy.start_nm) || accuracy.end_nm > model.gravityNm
+    || accuracy.step_nm < 0.01 || accuracy.hold_s < 0.3 || Math.ceil((accuracy.end_nm - accuracy.start_nm) / accuracy.step_nm - 1e-9) * 2 + 1 > 401);
+  const accuracyStatus = status?.torque_accuracy;
+  const accuracyStatusText = accuracyStatus ? [
+    ({ Moving: tr("移动至测点", "Moving to load"), Holding: tr("位置保持采样", "Holding & sampling"), Returning: tr("返回标定零点", "Returning to calibrated zero"), Complete: tr("测试结束", "Finished") })[accuracyStatus.phase],
+    `${accuracyStatus.holds.filter(h => h.completed).length} / ${accuracyStatus.point_count}`,
+    accuracyStatus.return_reason, accuracyStatus.returned_to_zero ? tr("已确认回零", "Zero return confirmed") : null,
+  ].filter(Boolean).join(" · ") : null;
   const staticHoldingPeak = staticHoldingTorquePeakNm({ ...config, pendulum: {
     mass_kg: mass, length_m: lengthMm / 1000, arm_mass_kg: armMass, downward_zero_rad: downwardZero, zero_measured: zeroMeasured,
   } });
@@ -179,7 +204,7 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
         archive(liveRef.current);
       }
       pollGeneration.current++;
-      await api.startExperiment({ ...config, pendulum: { mass_kg: mass, length_m: lengthMm / 1000, arm_mass_kg: armMass,
+      await api.startExperiment({ ...config, ...(accuracyMode ? { gravity_compensation: true, torque_accuracy: { ...accuracy, reference_id: reference?.id ?? "" } } : {}), pendulum: { mass_kg: mass, length_m: lengthMm / 1000, arm_mass_kg: armMass,
         extra_inertia_kg_m2: extraInertia, downward_zero_rad: downwardZero, zero_measured: zeroMeasured } });
       setSelected("live");
       await refresh();
@@ -213,10 +238,13 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   const reuseConfig = () => {
     if (!displayedData?.status.config) return;
     const previous = displayedData.status.config;
-    setConfig({ ...DEFAULT_CONFIG, ...previous, origin_position_rad: undefined });
+    const reuseAccuracy = previous.kind === "TorqueAccuracy";
+    (reuseAccuracy ? setAccuracyConfig : setBenchConfig)({ ...DEFAULT_CONFIG, ...previous, ...(reuseAccuracy ? { gravity_compensation: true } : {}), origin_position_rad: undefined });
+    onAccuracyModeChange?.(reuseAccuracy);
     if (previous.pendulum) {
-      setMass(previous.pendulum.mass_kg); setLengthMm(previous.pendulum.length_m * 1000); setArmMass(previous.pendulum.arm_mass_kg);
-      setExtraInertia(previous.pendulum.extra_inertia_kg_m2 ?? 0); setDownwardZero(previous.pendulum.downward_zero_rad); setZeroMeasured(previous.pendulum.zero_measured);
+      (reuseAccuracy ? setAccuracyMass : setBenchMass)(previous.pendulum.mass_kg); setLengthMm(previous.pendulum.length_m * 1000); setArmMass(previous.pendulum.arm_mass_kg);
+      setExtraInertia(previous.pendulum.extra_inertia_kg_m2 ?? 0);
+      if (!reuseAccuracy) { setDownwardZero(previous.pendulum.downward_zero_rad); setZeroMeasured(previous.pendulum.zero_measured); }
     }
     message.success(tr("已载入该组工况与几何参数", "Loaded this run's configuration and geometry"));
   };
@@ -235,10 +263,10 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
   const performanceOptions = metricOptions.filter(option => !option.value.startsWith("quality:"));
   const selectedMetrics = compareKeys.length ? compareKeys : (performanceOptions.length ? performanceOptions : metricOptions).slice(0, 3).map(option => option.value);
   return <div className="el05-experiments">
-    <Card size="small" title={tr("摆锤电机性能测试台", "Pendulum motor test bench")} extra={<Tag color={active ? "processing" : "default"}>{active ? tr("测试中", "Running") : tr("就绪", "Ready")}</Tag>}>
-      <div className="el05-experiment-presets">
-        {KINDS.map(item => <button type="button" disabled={locked} key={item.value} className={`el05-experiment-preset${config.kind === item.value ? " el05-experiment-preset--selected" : ""}`} onClick={() => setConfig(previous => ({ ...previous, center_angle_rad: 0, ...item.preset, kind: item.value }))}>{zh ? item.cn : item.en}</button>)}
-      </div>
+    <Card size="small" title={accuracyMode ? tr("力矩准确度测试", "Torque accuracy test") : tr("摆锤电机性能测试台", "Pendulum motor test bench")} extra={<Tag color={active ? "processing" : "default"}>{active ? tr("测试中", "Running") : tr("就绪", "Ready")}</Tag>}>
+      {!accuracyMode && <div className="el05-experiment-presets">
+        {KINDS.filter(item => item.value !== "TorqueAccuracy").map(item => <button type="button" disabled={locked} key={item.value} className={`el05-experiment-preset${config.kind === item.value ? " el05-experiment-preset--selected" : ""}`} onClick={() => setConfig(previous => ({ ...previous, center_angle_rad: 0, ...item.preset, kind: item.value }))}>{zh ? item.cn : item.en}</button>)}
+      </div>}
       <Typography.Paragraph className="el05-experiment-description">{kind.description[zh ? 0 : 1]}</Typography.Paragraph>
       {staticHoldingPeak !== null && <Alert showIcon type={staticHoldingPeak > EL05_TORQUE_LIMIT_NM ? "warning" : "info"}
         message={tr(`目标角最大理论保持力矩 ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · ${protocol === "StandardMit" ? "协议量程上限" : "EL05 峰值"} ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`, `Peak target holding torque ${staticHoldingPeak.toFixed(3)} ${EL05_TORQUE_UNIT} · ${protocol === "StandardMit" ? "Protocol torque range" : "EL05 peak"} ${EL05_TORQUE_LIMIT_NM} ${EL05_TORQUE_UNIT}`)}
@@ -247,7 +275,21 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
           : tr("理论值按负载几何计算，单位与驱动反馈相同；还需为摩擦和运动加减速留出力矩余量。", "The theoretical value uses load geometry in the same unit as drive feedback. Allow torque margin for friction and acceleration.")} />}
       <div className="el05-target__fields">
         <label className="el05-field el05-experiment-name"><Typography.Text type="secondary">{tr("本组名称（可选）", "Run name (optional)")}</Typography.Text><Input disabled={locked} value={runName} onChange={event => setRunName(event.target.value)} maxLength={100} placeholder={zh ? kind.cn : kind.en} /></label>
-        {field(staticFriction ? tr("每方向超时 (s)", "Timeout per direction (s)") : tr("测试时长 (s)", "Duration (s)"), "duration_s", 2, 3600, 1)}
+        {!accuracyMode && field(staticFriction ? tr("每方向超时 (s)", "Timeout per direction (s)") : tr("测试时长 (s)", "Duration (s)"), "duration_s", 2, 3600, 1)}
+        {accuracyMode && <>
+          {([
+            ["start_nm", tr("起始理论力矩 (Nm)", "Start load (Nm)"), 0.1, 5.9, 0.05],
+            ["end_nm", tr("结束理论力矩 (Nm)", "End load (Nm)"), 0.1, 5.9, 0.05],
+            ["step_nm", tr("力矩步长 (Nm)", "Load step (Nm)"), 0.01, 0.5, 0.01],
+            ["hold_s", tr("每点停留 (s)", "Dwell per point (s)"), 0.3, 30, 0.1],
+            ["move_speed_rad_s", tr("移动 / 回零速度 (rad/s)", "Move / return speed (rad/s)"), 0.05, 0.5, 0.05],
+          ] as const).map(([key, label, min, max, step]) => <label className="el05-field" key={key}><Typography.Text type="secondary">{label}</Typography.Text>
+            <InputNumber disabled={locked} value={accuracy[key]} min={min} max={max} step={step} onChange={value => { if (value != null) setAccuracyConfig(previous => ({ ...previous, torque_accuracy: { ...previous.torque_accuracy!, [key]: value } })); }} /></label>)}
+          <label className="el05-field"><Typography.Text type="secondary">{tr("摆动侧（均含递增与回扫）", "Side (ascending and descending)")}</Typography.Text>
+            <Select disabled={locked} value={accuracy.direction} options={[{ value: 1, label: tr("正角度侧", "Positive side") }, { value: -1, label: tr("负角度侧", "Negative side") }]}
+              onChange={direction => setAccuracyConfig(previous => ({ ...previous, torque_accuracy: { ...previous.torque_accuracy!, direction } }))} /></label>
+          {field("Kp (Nm/rad)", "kp", 1, 500, 1)}
+        </>}
         {config.kind === "VelocitySteps" && field(tr("速度幅值 (rad/s)", "Speed amplitude (rad/s)"), "velocity_rad_s", 0.001, 50, 0.05)}
         {config.kind === "TorqueRamp" && field(tr("斜坡终点转矩 (Nm，带符号)", "Ramp endpoint (Nm, signed)"), "torque_nm", -6, 6, 0.05)}
         {staticFriction && <>
@@ -265,11 +307,15 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
         {positional && field(tr("中心角 (rad)", "Center angle (rad)"), "center_angle_rad", -12, 12, 0.05)}
         {positional && !["Impedance", "ThermalHold"].includes(config.kind) && field(tr("位置半幅值 (rad)", "Position amplitude (rad)"), "position_amplitude_rad", 0.001, 6, 0.05)}
         {positional && field("Kp (Nm/rad)", "kp", 0, 500, 0.5)}
-        {!["Record", "TorqueRamp", "StaticFriction"].includes(config.kind) && field("Kd (Nm·s/rad)", "kd", 0, 5, 0.05)}
+        {!["Record", "TorqueRamp", "StaticFriction"].includes(config.kind) && field("Kd (Nm·s/rad)", "kd", accuracyMode ? 0.1 : 0, 5, 0.05)}
         {config.kind === "SineSweep" && <>{field(tr("起始频率 (Hz)", "Start frequency (Hz)"), "frequency_start_hz", 0.01, 5, 0.05)}{field(tr("终止频率 (Hz)", "End frequency (Hz)"), "frequency_end_hz", 0.01, 5, 0.1)}</>}
         {config.kind === "Impedance" && field(tr("扰动转矩幅值 (Nm)", "Disturbance amplitude (Nm)"), "disturbance_torque_nm", 0, 6, 0.05)}
-        {field(tr("温度上限 (°C，0 关闭)", "Temperature limit (°C, 0 off)"), "max_temperature_c", 0, 135, 5)}
+        {field(accuracyMode ? tr("超温回零阈值 (°C)", "Temperature return threshold (°C)") : tr("温度上限 (°C，0 关闭)", "Temperature limit (°C, 0 off)"), "max_temperature_c", accuracyMode ? 20 : 0, accuracyMode ? TORQUE_ACCURACY_MAX_TEMPERATURE_C : 135, 5)}
       </div>
+      {accuracyMode && <Alert showIcon type={accuracyProblem ? "warning" : "info"}
+        message={tr(`本组最大重力矩 ${model.gravityNm.toFixed(3)} Nm · 起始角 ${accuracy.start_nm <= model.gravityNm ? (Math.asin(accuracy.start_nm / model.gravityNm) * 180 / Math.PI).toFixed(2) : "—"}°`, `Peak gravity ${model.gravityNm.toFixed(3)} Nm · starting angle ${accuracy.start_nm <= model.gravityNm ? (Math.asin(accuracy.start_nm / model.gravityNm) * 180 / Math.PI).toFixed(2) : "—"}°`)}
+        description={accuracyProblem ? tr("请保证结束力矩高于起始且不超过负载最大重力矩，往返测点不超过 401 个。", "End load must exceed start and stay within the pendulum's peak gravity; at most 401 holds per run.")
+          : tr("MIT 位置保持 + 重力前馈已开启：Tff=(m+ma/2)gL·sin(θ)，θ 使用实测摆角；移动、保持和回零全程补偿。理论值按实测角度计算，反馈按总维持力矩比较。每点前 40% 用于稳定，后 60% 取稳定样本；不足时可延长停留后重测。", "MIT position hold + gravity feedforward enabled: Tff=(m+ma/2)gL·sin(θ), using measured angle during travel, holding and return. Theory uses measured angle and is compared with total holding feedback. The first 40% settles; the final 60% supplies stationary samples. Increase dwell if data is insufficient.")} />}
       {staticFriction && <>
         <Typography.Paragraph type="secondary">{tr("默认起动检测仅 0.15°，角度上限默认 3°；通信与机械惯性可能产生少量越界。每方向有独立超时，回位最多另加 3 秒。双向测试共用转矩幅值和速率；回位未稳定或触发角度保护时停止后续方向。结果为起动静摩擦力矩估计（Nm），扣除重力仍需已测下垂参考。", "The default motion threshold is 0.15° and excursion limit is 3°; delay and inertia can cause some overshoot. Each direction has its own timeout plus up to 3 seconds for return. Both directions use the same torque magnitude and ramp rate. Unstable return or an angle guard ends further testing. Results estimate breakaway torque (Nm); gravity correction requires a measured downward reference.")}</Typography.Paragraph>
         <Collapse ghost items={[{ key: "static-friction-timing", label: tr("标定时序与回位参数", "Calibration timing & return parameters"), children: <>
@@ -283,20 +329,28 @@ export function El05ExperimentPanel({ state, zh, busy, coordinateRevision, refre
         </> }]} />
       </>}
       {positional && <Typography.Paragraph type="secondary">{zeroMeasured ? tr("中心角相对于已测下垂参考；例如 0 为下垂、1.571 为水平。", "Center angle is relative to the measured downward reference: 0 is down and 1.571 is horizontal.") : tr("未测下垂参考：中心角相对于本组开始时的位置。", "Without a downward reference, the center angle is relative to the position at run start.")}</Typography.Paragraph>}
-      {!["Record", "Backdrive", "StaticFriction"].includes(config.kind) && <Space wrap className="el05-experiment-compensation"><Checkbox disabled={locked} checked={config.gravity_compensation} onChange={event => update("gravity_compensation", event.target.checked)}>{tr("前馈补偿摆锤重力", "Feedforward gravity compensation")}</Checkbox><Typography.Text type="secondary">{tr("使用已测下垂参考与本组几何；参考未测时不施加补偿。", "Uses this run's geometry and measured downward reference; inactive when the reference is unmeasured.")}</Typography.Text></Space>}
-      <Collapse ghost className="el05-experiment-geometry" items={[{ key: "geometry", label: tr(`摆锤几何与参考 · 重力矩 ${model.gravityNm.toFixed(3)} Nm · 惯量 ${(model.inertiaKgM2 + extraInertia).toFixed(5)} kg·m²`, `Pendulum geometry & reference · gravity ${model.gravityNm.toFixed(3)} Nm · inertia ${(model.inertiaKgM2 + extraInertia).toFixed(5)} kg·m²`), children: <>
+      {!["Record", "Backdrive", "StaticFriction", "TorqueAccuracy"].includes(config.kind) && <Space wrap className="el05-experiment-compensation"><Checkbox disabled={locked} checked={config.gravity_compensation} onChange={event => update("gravity_compensation", event.target.checked)}>{tr("前馈补偿摆锤重力", "Feedforward gravity compensation")}</Checkbox><Typography.Text type="secondary">{tr("使用已测下垂参考与本组几何；参考未测时不施加补偿。", "Uses this run's geometry and measured downward reference; inactive when the reference is unmeasured.")}</Typography.Text></Space>}
+      <Collapse key={accuracyMode ? "accuracy-geometry" : "bench-geometry"} defaultActiveKey={accuracyMode ? ["geometry"] : []} ghost className="el05-experiment-geometry" items={[{ key: "geometry", label: tr(`摆锤几何与参考 · 重力矩 ${model.gravityNm.toFixed(3)} Nm · 惯量 ${(model.inertiaKgM2 + extraInertia).toFixed(5)} kg·m²`, `Pendulum geometry & reference · gravity ${model.gravityNm.toFixed(3)} Nm · inertia ${(model.inertiaKgM2 + extraInertia).toFixed(5)} kg·m²`), children: <>
         <div className="el05-target__fields">
           <label className="el05-field"><Typography.Text type="secondary">{tr("末端质量 (kg)", "End mass (kg)")}</Typography.Text><InputNumber disabled={locked} min={0} max={20} step={0.05} value={mass} onChange={value => setMass(value ?? 0)} /></label>
           <label className="el05-field"><Typography.Text type="secondary">{tr("轴至负重重心 (mm)", "Axis to load CoM (mm)")}</Typography.Text><InputNumber disabled={locked} min={1} max={2000} value={lengthMm} onChange={value => setLengthMm(value ?? 180)} /></label>
           <label className="el05-field"><Typography.Text type="secondary">{tr("均匀力臂质量 (kg)", "Uniform arm mass (kg)")}</Typography.Text><InputNumber disabled={locked} min={0} max={20} step={0.01} value={armMass} onChange={value => setArmMass(value ?? 0)} /></label>
           <label className="el05-field"><Typography.Text type="secondary">{tr("额外惯量 (kg·m²)", "Additional inertia (kg·m²)")}</Typography.Text><InputNumber disabled={locked} min={0} max={10} step={0.0001} value={extraInertia} onChange={value => setExtraInertia(value ?? 0)} /></label>
-          <label className="el05-field"><Typography.Text type="secondary">{tr("下垂参考 θ₀ (rad)", "Downward reference θ₀ (rad)")}</Typography.Text><InputNumber disabled={locked} min={-1e6} max={1e6} step={0.001} value={downwardZero} onChange={value => { if (value != null) { setDownwardZero(value); setZeroMeasured(true); } }} /></label>
+          <label className="el05-field"><Typography.Text type="secondary">{tr("下垂参考 θ₀ (rad)", "Downward reference θ₀ (rad)")}</Typography.Text><InputNumber disabled={locked || accuracyMode} min={-1e6} max={1e6} step={0.001} value={accuracyMode && !reference ? null : downwardZero} onChange={value => { if (value != null) { setDownwardZero(value); setZeroMeasured(true); } }} /></label>
         </div>
-        <Space wrap><Button disabled={locked || state?.unwrapped_position_rad == null} onClick={() => { setDownwardZero(state!.unwrapped_position_rad!); setZeroMeasured(true); }}>{tr("将当前角记为下垂参考", "Use current angle as downward reference")}</Button><Checkbox disabled={locked} checked={zeroMeasured} onChange={event => setZeroMeasured(event.target.checked)}>{tr("下垂参考已测定", "Downward reference measured")}</Checkbox><Typography.Text type="secondary">θ={zeroMeasured && state?.unwrapped_position_rad != null ? (state.unwrapped_position_rad - downwardZero).toFixed(4) : "—"} rad</Typography.Text></Space>
+        <Space wrap><Button disabled={accuracyMode ? !accuracyReadiness.canCapture : locked || state?.unwrapped_position_rad == null} onClick={async () => {
+          if (accuracyMode) {
+            setWorking(true);
+            try { await api.captureGravityReference(); await refresh(); }
+            catch (error) { message.error(errMsg(error)); }
+            finally { setWorking(false); }
+          } else { setDownwardZero(state!.unwrapped_position_rad!); setZeroMeasured(true); }
+        }}>{tr("将当前角记为下垂参考", "Use current angle as downward reference")}</Button><Checkbox disabled={locked || accuracyMode} checked={zeroMeasured} onChange={event => setZeroMeasured(event.target.checked)}>{tr("下垂参考已测定", "Downward reference measured")}</Checkbox><Typography.Text type="secondary">θ={zeroMeasured && state?.unwrapped_position_rad != null ? (state.unwrapped_position_rad - downwardZero).toFixed(4) : "—"} rad</Typography.Text></Space>
+        {accuracyMode && <Typography.Paragraph type="secondary">{tr("与零重力保持共用当前连接的标定零点。先停止电机，将摆锤自然下垂并静止后记录；重连、改零点或反馈中断后重新标定。手动停止按钮始终立即失能。", "Shares the current connection's zero with gravity compensation. Stop the motor, let the pendulum hang still, then capture. Recapture after reconnecting, zero changes or feedback gaps. Manual Stop always disables immediately.")}</Typography.Paragraph>}
         <Typography.Paragraph type="secondary" className="el05-experiment-notes">{tr("把摆锤放在竖直向下的位置后取当前角。该参考只用于中心角、重力模型和分析，不修改电机机械零位。开始时冻结本组参数；重连、更换电机或修改机械零位后重新测定。模型 J=mL²+maL²/3+额外惯量，重力矩=(m+ma/2)gL·sin(θ)。", "Place the pendulum vertically down before capturing its angle. This reference defines center angles, gravity and analysis without changing the drive zero. Values are frozen at run start; remeasure after reconnecting, changing motors or changing the drive zero. J=mL²+maL²/3+additional inertia; gravity torque=(m+ma/2)gL·sin(θ).")}</Typography.Paragraph>
       </> }]} />
-      <div className="el05-experiment-actions"><Button type="primary" size="large" disabled={!state?.online || locked} loading={working} onClick={() => void start()}>{staticFriction ? tr("自然下垂后开始标定", "Start calibration from natural rest") : tr("一键开始测试", "Start experiment")}</Button><Button danger type="primary" size="large" disabled={!state?.attached} loading={stopping} onClick={() => void stop()}>{tr("停止测试和电机", "Stop experiment & motor")}</Button><Typography.Text type="secondary">{tr("自动准备模式并使能；结束后停机。", "Automatically prepares and enables the drive; stops at completion.")}</Typography.Text></div>
-      <div className="el05-experiment-status"><Typography.Text>{status?.static_friction ? staticFrictionStatusText(status, zh) : status?.active ? tr("记录中", "Recording") : status?.reason ?? tr("尚未开始", "No run yet")} · {(status?.elapsed_s ?? 0).toFixed(2)} / {plannedDuration} s · {status?.samples ?? 0} {tr("帧", "frames")}</Typography.Text>{status?.config && <Progress percent={Math.min(100, progress)} status={status.active ? "active" : "normal"} showInfo={false} size="small" />}</div>
+      <div className="el05-experiment-actions"><Button type="primary" size="large" disabled={!state?.online || locked || (accuracyMode && (!accuracyReadiness.canStart || accuracyProblem))} loading={working} onClick={() => void start()}>{staticFriction ? tr("自然下垂后开始标定", "Start calibration from natural rest") : tr("一键开始测试", "Start experiment")}</Button><Button danger type="primary" size="large" disabled={!state?.attached} loading={stopping} onClick={() => void stop()}>{tr("停止测试和电机", "Stop experiment & motor")}</Button><Typography.Text type="secondary">{accuracyMode ? tr("完成 / 超温先回标定零点，再停机；急停、故障或通信中断立即停机。", "Completion / temperature limit returns to calibrated zero before stopping; emergency stop, faults or communication loss stop immediately.") : tr("自动准备模式并使能；结束后停机。", "Automatically prepares and enables the drive; stops at completion.")}</Typography.Text></div>
+      <div className="el05-experiment-status"><Typography.Text>{accuracyStatusText ?? (status?.static_friction ? staticFrictionStatusText(status, zh) : status?.active ? tr("记录中", "Recording") : status?.reason ?? tr("尚未开始", "No run yet"))} · {(status?.elapsed_s ?? 0).toFixed(2)} {accuracyMode || accuracyStatus ? "s" : `/ ${plannedDuration} s`} · {status?.samples ?? 0} {tr("帧", "frames")}</Typography.Text>{status?.config && <Progress percent={Math.min(100, accuracyStatus ? 100 * accuracyStatus.holds.filter(h => h.completed).length / accuracyStatus.point_count : progress)} status={status.active ? "active" : "normal"} showInfo={false} size="small" />}</div>
       {status?.recording_interval_s != null && status.recording_interval_s > 0.002 && <Typography.Text type="secondary">{tr("长时记录最小间隔：", "Long-run minimum recording interval: ")}{(status.recording_interval_s * 1000).toFixed(1)} ms</Typography.Text>}
       {pollError && <Typography.Paragraph type="warning">{tr("数据读取：", "Data read: ")}{pollError}</Typography.Paragraph>}
     </Card>

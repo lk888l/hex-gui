@@ -589,6 +589,51 @@ bus with the right settings:
   three seconds and drive faults stop support. Stop disables the motor and
   removes its supporting torque.
 
+  **Torque accuracy** is a separate tab beside zero-gravity hold in the
+  Standard MIT app. Defaults are a 3 kg end mass, 180 mm arm, 3.7–5.2 Nm
+  theoretical loads in 0.05 Nm increments, then a descending sweep. Each
+  position is held for 1 s (adjustable); speed-bounded smooth positioning is
+  separate from dwell time. Kp/Kd default to 80/2 with gravity feedforward
+  `Tff = (m + arm_mass/2) * 9.80665 * L * sin(q - q_down)` calculated from
+  measured angle throughout travel, holding and return, clamped to ±6 Nm.
+  Gravity feedforward is required for new runs, including reused configurations.
+  The scan shares the backend-captured downward reference with zero-gravity
+  hold, and rejects an obsolete reference or an unreachable load/position.
+  Fill in the uniform arm mass and actual axis-to-load center-of-mass distance
+  when known; the nominal 3 kg / 180 mm fixture peaks at 5.2956 Nm without arm mass.
+
+  Completion or the configurable temperature threshold (default and maximum
+  120 °C) ends the scan and returns under MIT position control to that measured
+  zero. The motor stops only after position is within 0.02 rad and speed within
+  0.05 rad/s for 0.2 s. A return that does not settle within five seconds after
+  its commanded trajectory stops with an explicit timeout, without claiming
+  success. Manual Stop, drive faults, invalid feedback, an expired heartbeat,
+  feedback loss and the 2 rad/s speed guard still stop immediately.
+
+  The existing waveforms, history, CSV/JSON and report exports are reused, with
+  per-hold theory/feedback/error/temperature and feedback/theory ratios, plus
+  feedback-versus-theory and scale-versus-load plots. Only stable samples in
+  the final 60% of completed holds contribute. Theory uses **actual angle**,
+  not the commanded angle, so steady position error does not become torque
+  error. Compare total feedback torque with gravity load; do not subtract the
+  feedforward component. Older zero-feedforward recordings remain importable.
+  Interrupted, drifting, saturated or stale-command holds are excluded.
+  Ascending/descending pairs compare constant, linear, step and continuous
+  post-boundary linear scale models; insufficient or conflicting evidence
+  leaves the classification and boundary unset. Boundaries are adjacent
+  measured-load intervals, with feedback values on each side also reported.
+  The displayed ratio is `total feedback torque / theoretical gravity torque`,
+  retained as `send_scale` in exports for compatibility. Feedback is decoded
+  directly from CAN; software does not add feedforward to the reported value.
+  The MIT torque demand includes `Tff + Kp * position error + Kd * velocity error`.
+  Subtracting the position term or feedforward from feedback does not establish
+  actual shaft torque. A feedback/theory ratio is not a validated command
+  correction: geometry, zero, friction, temperature and command/feedback scaling
+  must be checked independently. It is never applied automatically. Large
+  approach differences leave the model inconclusive and report the measured
+  ratio difference, with a recommendation to repeat both approaches at similar
+  temperatures.
+
   **Static friction calibration** tests both directions in one run by default
   (positive → return → rest → negative → return → stop), with optional
   positive-only and negative-only modes. Place the

@@ -108,7 +108,34 @@ export interface El05GravityCompensationStatus {
   reason: string | null;
 }
 
-export type El05ExperimentKind = "Record" | "VelocitySteps" | "TorqueRamp" | "StaticTorque" | "PositionSteps" | "SineSweep" | "Impedance" | "Backdrive" | "ThermalHold" | "SlowTriangle" | "StaticFriction";
+export type El05ExperimentKind = "Record" | "VelocitySteps" | "TorqueRamp" | "StaticTorque" | "TorqueAccuracy" | "PositionSteps" | "SineSweep" | "Impedance" | "Backdrive" | "ThermalHold" | "SlowTriangle" | "StaticFriction";
+export interface El05TorqueAccuracyConfig {
+  reference_id: string;
+  start_nm: number;
+  end_nm: number;
+  step_nm: number;
+  hold_s: number;
+  move_speed_rad_s: number;
+  direction: 1 | -1;
+}
+export interface El05TorqueAccuracyHold {
+  index: number;
+  target_torque_nm: number;
+  target_angle_rad: number;
+  increasing: boolean;
+  started_s: number;
+  ended_s: number | null;
+  completed: boolean;
+}
+export interface El05TorqueAccuracyStatus {
+  phase: "Moving" | "Holding" | "Returning" | "Complete";
+  index: number;
+  point_count: number;
+  holds: El05TorqueAccuracyHold[];
+  return_started_s: number | null;
+  return_reason: string | null;
+  returned_to_zero: boolean;
+}
 export interface El05PendulumConfig {
   mass_kg: number;
   length_m: number;
@@ -139,6 +166,7 @@ export interface El05ExperimentConfig {
   motion_confirm_s?: number;
   settle_time_s?: number;
   friction_direction?: "Both" | "Positive" | "Negative";
+  torque_accuracy?: El05TorqueAccuracyConfig | null;
 }
 export interface El05StaticFrictionPass {
   /** Absent in legacy single-direction recordings; infer from signed torque. */
@@ -162,6 +190,7 @@ export interface El05ExperimentStatus {
   run_id?: number;
   recording_interval_s?: number;
   static_friction?: El05StaticFrictionStatus | null;
+  torque_accuracy?: El05TorqueAccuracyStatus | null;
   active: boolean;
   config: El05ExperimentConfig | null;
   samples: number;

@@ -93,7 +93,7 @@ export function MotorCanWorkspace({ protocol, api }: { protocol: El05Protocol; a
   const [pollError, setPollError] = useState<string | null>(null);
   const [refreshHz, setRefreshHz] = useState(20);
   const [view, setView] = useState<"numeric" | "chart">("numeric");
-  const [workspaceTab, setWorkspaceTab] = useState<"bench" | "gravity" | "manual" | "settings">(protocol === "StandardMit" ? "manual" : "bench");
+  const [workspaceTab, setWorkspaceTab] = useState<"bench" | "accuracy" | "gravity" | "manual" | "settings">(protocol === "StandardMit" ? "manual" : "bench");
   const [windowSec, setWindowSec] = useState(10);
   const [repeat, setRepeat] = useState(true);
   const [position, setPosition] = useState(0);
@@ -432,11 +432,13 @@ export function MotorCanWorkspace({ protocol, api }: { protocol: El05Protocol; a
             <Segmented className="el05-workspace-tabs" block value={workspaceTab} onChange={value => setWorkspaceTab(value as typeof workspaceTab)} options={[
               { label: tr("摆锤性能测试", "Pendulum tests"), value: "bench" },
               { label: tr("零重力保持", "Zero-gravity hold"), value: "gravity" },
+              ...(standardMit ? [{ label: tr("力矩准确度", "Torque accuracy"), value: "accuracy" }] : []),
               { label: tr("手动控制与监视", "Manual control & monitor"), value: "manual" },
               { label: tr("设备设置与参数", "Settings & parameters"), value: "settings" },
             ]} />
-            <div hidden={workspaceTab !== "bench"}>
-              <El05ExperimentPanel api={api} protocol={protocol} state={state} zh={zh} busy={busy || stopping} coordinateRevision={coordinateRevision} refresh={async () => acceptState(await api.getState())} onWorkingChange={setBenchWorking} />
+            <div hidden={workspaceTab !== "bench" && workspaceTab !== "accuracy"}>
+              <El05ExperimentPanel api={api} protocol={protocol} state={state} zh={zh} busy={busy || stopping} coordinateRevision={coordinateRevision} refresh={async () => acceptState(await api.getState())} onWorkingChange={setBenchWorking}
+                accuracyMode={workspaceTab === "accuracy"} onAccuracyModeChange={accuracy => setWorkspaceTab(accuracy ? "accuracy" : "bench")} />
             </div>
             <div hidden={workspaceTab !== "gravity"}>
               <El05GravityPanel api={api} state={state} zh={zh} busy={busy || benchWorking} stopping={stopping} run={run} stop={stop} setZero={setZero} />

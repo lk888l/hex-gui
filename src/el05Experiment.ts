@@ -1,5 +1,6 @@
 import type { El05ExperimentConfig, El05ExperimentData, El05StaticFrictionPass, El05TelemetrySample } from "./el05Api";
 import { controlFeedbackEligible, feedbackVelocityBits, feedbackVelocityResolution } from "./el05Protocol.ts";
+import { analyzeTorqueAccuracy, torqueAccuracyModelLabel, type TorqueAccuracyAnalysis } from "./el05TorqueAccuracy.ts";
 
 /** Native uint16 and standard MIT uint12 torque both map to -6..6 Nm. */
 export const EL05_TORQUE_UNIT = "Nm";
@@ -165,6 +166,7 @@ export interface El05ExperimentAnalysis {
     reason: string | null;
   };
   static_friction?: El05StaticFrictionAnalysis;
+  torque_accuracy?: TorqueAccuracyAnalysis;
   friction: {
     coulomb_nm: number | null;
     viscous_nm_s_rad: number | null;
@@ -853,7 +855,7 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
   if (maxGap !== null && interval !== null && maxGap > Math.max(interval * 5, 0.1)) qualityNotes.push("存在明显采样间断；缺口附近的导数和动态响应需谨慎解读。");
   if (data.samples.length !== indices.length) qualityNotes.push("重复、同时间戳或无效反馈已从分析中剔除，导出仍保留原始行。");
   if (data.status.active) qualityNotes.push("实验仍在运行，当前为阶段性分析。");
-  else if (config && kind !== "StaticFriction" && (points[points.length - 1]?.s.t_s ?? 0) < config.duration_s * 0.95) qualityNotes.push("实际记录未覆盖计划全程，仅分析已经完成的激励和响应。");
+  else if (config && !["StaticFriction", "TorqueAccuracy"].includes(kind) && (points[points.length - 1]?.s.t_s ?? 0) < config.duration_s * 0.95) qualityNotes.push("实际记录未覆盖计划全程，仅分析已经完成的激励和响应。");
   const freshCount = points.filter(p => p.d.fresh_current_a !== null).length;
   const standardMit = data.protocol === "StandardMit";
   const inactiveCount = standardMit ? null : points.filter(p => p.s.status_code !== 2).length;
@@ -879,6 +881,7 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
     ? [`目标角最大理论保持力矩 ${staticHoldingPeak.toFixed(3)} Nm 超过本组驱动限值 ${torqueLimit.toFixed(3)} Nm（EL05 峰值 / 协议量程上限 6 Nm）；部分目标角无法仅靠该力矩保持。理论与反馈均为 Nm，理论需求按实际负载保留。`]
     : [];
   const staticFriction = staticFrictionAnalysis(data, config);
+  const torqueAccuracy = analyzeTorqueAccuracy(data, derived);
   const friction = fitFriction(performancePoints, Boolean(config?.pendulum?.zero_measured));
   const freeDecay = kind === "Record" || kind === "Backdrive" ? decayAnalysis(performancePoints, config)
     : { period_s: null, frequency_hz: null, log_decrement: null, damping_ratio: null, equivalent_viscous_nm_s_rad: null,
@@ -900,6 +903,26 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
     metric("fresh_current_samples", "独立新鲜 Iq 样本", "Independent fresh Iq samples", freshCount, ""),
     metric("dropped_frames", "接收丢帧", "Dropped receive frames", data.status.dropped_frames, ""),
   ], notes: qualityNotes }];
+  if (torqueAccuracy) sections.push({ id: "torque_accuracy", title: "力矩准确度与反馈比值", title_en: "Torque accuracy and feedback ratio", metrics: [
+    metric("accepted_holds", "有效保持点", "Accepted holds", torqueAccuracy.points.filter(p => p.accepted).length, ""),
+    metric("paired_points", "有效往返配对点", "Paired loads", torqueAccuracy.paired_points, ""),
+    metric("boundary_low", "边界下界（理论力矩）", "Boundary lower bound (theory)", torqueAccuracy.boundary_nm?.[0] ?? null, "Nm"),
+    metric("boundary_high", "边界上界（理论力矩）", "Boundary upper bound (theory)", torqueAccuracy.boundary_nm?.[1] ?? null, "Nm"),
+    metric("boundary_feedback_low", "边界下侧反馈力矩", "Feedback below boundary", torqueAccuracy.boundary_feedback_nm?.[0] ?? null, "Nm"),
+    metric("boundary_feedback_high", "边界上侧反馈力矩", "Feedback above boundary", torqueAccuracy.boundary_feedback_nm?.[1] ?? null, "Nm"),
+    metric("low_scale", "边界前 / 恒定反馈比值", "Low / constant feedback ratio", torqueAccuracy.low_scale, "×"),
+    metric("high_scale", "边界后恒定反馈比值", "High feedback ratio", torqueAccuracy.high_scale, "×"),
+    metric("scale_slope", "比值线性斜率", "Ratio slope", torqueAccuracy.slope_per_nm, "1/Nm"),
+    metric("fit_intercept", "比值拟合截距", "Ratio intercept", torqueAccuracy.intercept, ""),
+    metric("fit_hinge", "分段线性拐点", "Piecewise linear hinge", torqueAccuracy.hinge_nm, "Nm"),
+    metric("fit_rmse", "比值拟合残差 RMS", "Ratio fit RMS residual", torqueAccuracy.fit_rmse, ""),
+    metric("hysteresis_scale", "往返反馈比值差均值", "Mean approach ratio difference", torqueAccuracy.hysteresis_scale, ""),
+  ], notes: [torqueAccuracyModelLabel(torqueAccuracy.model, true), ...(torqueAccuracy.reason ? [torqueAccuracy.reason] : []),
+    "每点仅使用保持末 60% 的稳定样本；理论力矩按实际角度计算，剔除未完成、漂移、过大波动、饱和和指令过期的保持段。",
+    "反馈为电机 CAN 回包的总力矩估计，软件未叠加前馈。MIT 合成力矩指令为 Tff+Kp×位置误差+Kd×速度误差；反馈与理论的差值不能直接归因于力矩标度，也不能通过扣除位置环或前馈来得到真实输出力矩。",
+    "反馈/理论比值 k=反馈总力矩/实际角度理论重力矩，并非已验证的发送补偿系数。只有在负载、零点、摩擦和温度影响得到核对，且命令与反馈标度关系得到验证后，才可评估前馈补偿；测试不会自动应用该比值。",
+    "往返配对后比较恒定、线性、跃迁和边界后线性模型；边界仅给出相邻实测点的区间。线性模型 k(T)=截距+斜率×|T|；分段线性 k(T)=截距+斜率×max(0,|T|−拐点)。",
+    "负载质量、重心距离、摆臂质量、下垂零点和静摩擦均影响估计。" ] });
   if (kind === "StaticTorque") sections.push({ id: "static", title: "静态转矩与电流", title_en: "Static torque and current", metrics: [
     metric("stable_platforms", "有效稳定平台", "Stable plateaus", staticTorque.platforms.length, ""),
     metric("target_holding_peak", "目标角最大理论保持力矩", "Peak target holding torque", staticHoldingPeak, EL05_TORQUE_UNIT),
@@ -1009,7 +1032,8 @@ export function analyzeExperiment(data: El05ExperimentData): El05ExperimentAnaly
     metric("current_rms", "独立 Iq 样本 RMS", "Independent Iq RMS", thermal.fresh_current_rms_a, "A"),
   ], notes: [...(thermal.reason ? [thermal.reason] : []), "开始/结束取首尾 10% 样本均值；温升斜率覆盖实际记录全程。无法仅凭单次温升判断持续额定转矩或热稳态。"] });
   return { kind, sample_count: points.length, duration_s: duration, quality, sections, limitations, tracking,
-    static_torque: staticTorque, ...(staticFriction ? { static_friction: staticFriction } : {}), friction, free_decay: freeDecay, frequency_response: frequencyResponse, impedance, thermal, motion };
+    static_torque: staticTorque, ...(staticFriction ? { static_friction: staticFriction } : {}),
+    ...(torqueAccuracy ? { torque_accuracy: torqueAccuracy } : {}), friction, free_decay: freeDecay, frequency_response: frequencyResponse, impedance, thermal, motion };
 }
 
 /** Export only metadata frozen by the backend at the start of this run. */
@@ -1040,17 +1064,22 @@ export function experimentCsv(data: El05ExperimentData): string {
   const derivedFields = ["relative_position_rad", "angle_rad", "acceleration_rad_s2", "gravity_torque_nm", "target_holding_torque_nm", "inertial_torque_nm",
     "friction_torque_nm", "position_error_rad", "velocity_error_rad_s", "fresh_current_a"] as const;
   const headers = [...fields, "can_id_hex", "payload_hex", "target_position_rad", "target_velocity_rad_s", "target_torque_nm", "kp", "kd", "motor_id", "uid",
-    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields, "static_friction_direction", "static_friction_phase", "protocol", "feedback_velocity_bits"];
+    "derived_velocity_rad_s", "target_unwrapped_position_rad", ...derivedFields, "static_friction_direction", "static_friction_phase", "protocol", "feedback_velocity_bits",
+    "accuracy_hold_index", "accuracy_target_torque_nm", "accuracy_increasing", "accuracy_hold_completed", "accuracy_feedback_error_nm", "accuracy_feedback_theory_ratio"];
   const passes = staticFrictionPasses(data).reverse();
   const rows = data.samples.map((sample, i) => {
     const target = sample.target?.kind === "Mit" ? sample.target : null;
     const pass = passes.find(pass => sample.t_s >= (pass.started_s ?? 0));
     const phase = !pass ? "" : pass.return_started_s != null && sample.t_s >= pass.return_started_s ? "Returning"
       : pass.ramp_started_s != null && sample.t_s >= pass.ramp_started_s ? "Ramping" : "Settling";
+    const hold = data.status.torque_accuracy?.holds.find(h => sample.t_s >= h.started_s && sample.t_s < (h.ended_s ?? Infinity));
+    const theory = derived[i].gravity_torque_nm;
     return [...fields.map(field => sample[field] ?? ""), sample.can_id.toString(16).padStart(8, "0"), sample.payload.map(byte => byte.toString(16).padStart(2, "0")).join(" "), target?.position_rad ?? "", target?.velocity_rad_s ?? "",
       target?.torque_nm ?? "", target?.kp ?? "", target?.kd ?? "", data.motor_id ?? "", data.uid ?? "",
       derived[i].velocity_rad_s ?? "", derived[i].target_position_rad ?? "", ...derivedFields.map(field => derived[i][field] ?? ""),
-      pass ? pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1) : "", phase, data.protocol ?? "Native", feedbackVelocityBits(data)].join(",");
+      pass ? pass.direction ?? Math.sign(data.status.config?.torque_nm ?? 1) : "", phase, data.protocol ?? "Native", feedbackVelocityBits(data),
+      hold?.index ?? "", hold?.target_torque_nm ?? "", hold?.increasing ?? "", hold?.completed ?? "",
+      hold && theory != null ? sample.torque_nm - theory : "", hold && theory != null && Math.abs(theory) >= 0.1 ? sample.torque_nm / theory : ""].join(",");
   });
   return [headers.join(","), ...rows].join("\r\n") + "\r\n";
 }

@@ -1262,6 +1262,15 @@ impl El05Session {
                 {
                     bail!("EL05 temperature exceeds the experiment limit");
                 }
+                if config.kind == ExperimentKind::TorqueAccuracy {
+                    let zero = validate_torque_accuracy_reference(&s, &config)?;
+                    config.pendulum.as_mut().unwrap().downward_zero_rad = zero;
+                    config.duration_s = config
+                        .torque_accuracy
+                        .as_ref()
+                        .unwrap()
+                        .planned_duration_s();
+                }
             }
             if config.kind != ExperimentKind::Record {
                 self.enable_with_cancellation_locked(Some(stop_request_revision))
@@ -1279,12 +1288,14 @@ impl El05Session {
                 .as_ref()
                 .map(|identity| identity.uid.clone());
             config.origin_position_rad = s.view.unwrapped_position_rad.unwrap_or(0.0);
-            s.target = config.target_with_feedback(
-                0.0,
-                s.view.position_rad.unwrap_or(0.0),
-                config.origin_position_rad,
-            );
+            if config.kind == ExperimentKind::TorqueAccuracy {
+                validate_torque_accuracy_reference(&s, &config)?;
+            }
             s.experiment.begin(config, id, uid);
+            let wrapped = s.view.position_rad.unwrap_or(0.0);
+            let unwrapped = s.view.unwrapped_position_rad.unwrap_or(0.0);
+            let velocity = s.view.velocity_rad_s.unwrap_or(0.0);
+            s.target = s.experiment.runtime_target(wrapped, unwrapped, velocity);
             s.experiment.parameters = parameters;
             s.experiment.version = s.view.version.clone();
             s.client_seen = Instant::now();
@@ -1711,6 +1722,53 @@ impl Inner {
     }
 }
 
+fn validate_torque_accuracy_reference(s: &Shared, config: &ExperimentConfig) -> Result<f64> {
+    let a = config
+        .torque_accuracy
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing torque accuracy configuration"))?;
+    if s.view.protocol != El05Protocol::StandardMit {
+        bail!("torque accuracy testing is available in the Standard MIT app");
+    }
+    if s.standard_position_saturated() {
+        bail!("{MIT_SATURATED_POSITION_MESSAGE}");
+    }
+    if !s.gravity.reference_matches(
+        &a.reference_id,
+        s.view.motor_id.unwrap_or(0),
+        s.gravity_binding().as_deref(),
+    ) {
+        bail!("capture the downward reference again for this motor and coordinate session");
+    }
+    let zero = s.gravity.status.reference.as_ref().unwrap().position_rad;
+    let position = s
+        .view
+        .unwrapped_position_rad
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| anyhow!("accuracy testing requires finite position feedback"))?;
+    let wrapped = s
+        .view
+        .position_rad
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| anyhow!("accuracy testing requires finite position feedback"))?;
+    if (position - zero).abs() > std::f64::consts::FRAC_PI_2 + 0.3
+        || s.view
+            .velocity_rad_s
+            .is_none_or(|v| !v.is_finite() || v.abs() > 2.0)
+    {
+        bail!("accuracy testing exceeded its angle or 2 rad/s speed guard");
+    }
+    let end_angle = f64::from(a.direction)
+        * (a.end_nm / experiment::torque_accuracy::gravity_peak(config.pendulum.as_ref().unwrap()))
+            .asin();
+    for target in [zero, zero + end_angle] {
+        if !(-12.56..=12.56).contains(&(wrapped + target - position)) {
+            bail!("accuracy sweep or zero return exceeds the MIT position range; reset position zero and recapture the downward reference");
+        }
+    }
+    Ok(zero)
+}
+
 fn validate_gravity_reference(s: &Shared, config: &GravityCompensationConfig) -> Result<()> {
     if s.standard_position_saturated() {
         bail!("{MIT_SATURATED_POSITION_MESSAGE}");
@@ -1907,7 +1965,18 @@ async fn service_loop(inner: Arc<Inner>) {
                     Some("drive left enabled state".to_string())
                 } else {
                     let temperature = s.view.temperature_c.unwrap_or(f64::NAN);
-                    s.experiment.end_reason(temperature)
+                    let accuracy_problem = s
+                        .experiment
+                        .status
+                        .config
+                        .as_ref()
+                        .filter(|c| c.kind == ExperimentKind::TorqueAccuracy)
+                        .and_then(|c| validate_torque_accuracy_reference(&s, c).err());
+                    if let Some(error) = accuracy_problem {
+                        Some(error.to_string())
+                    } else {
+                        s.experiment.end_reason(temperature)
+                    }
                 };
                 if let Some(reason) = &reason {
                     s.experiment.finish(reason.clone());
