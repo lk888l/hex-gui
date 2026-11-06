@@ -1,5 +1,23 @@
 import type { SmartKnobKind, SmartKnobProfile, SmartKnobTuning } from "./types";
 
+/** Meow exposes one physical limit; legacy wire fields are derived, not edited. */
+export function smartknobClampTuning(
+  profile: Pick<SmartKnobProfile, "target" | "effortLimitMax">,
+  tuning: SmartKnobTuning,
+): SmartKnobTuning {
+  if (profile.target.kind !== "meow") return { ...tuning };
+  const peak = profile.effortLimitMax;
+  const validPeak = Number.isFinite(peak) && peak > 0;
+  const effortLimit = validPeak && Number.isFinite(tuning.effortLimit)
+    ? Math.max(0, Math.min(tuning.effortLimit, peak)) : 0;
+  return {
+    ...tuning,
+    effortLimit,
+    maxOutputPermille: validPeak ? Math.floor(effortLimit / peak * 1000) : 0,
+    frictionCompensation: effortLimit,
+  };
+}
+
 /** Preserve session-wide safety limits when restoring a new motor's mode. */
 export function smartknobModeTuning(
   kind: SmartKnobKind,

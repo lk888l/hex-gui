@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { smartknobInitialOutputLimits, smartknobModeTuning } from "../src/smartknobUi.ts";
+import { smartknobClampTuning, smartknobInitialOutputLimits, smartknobModeTuning } from "../src/smartknobUi.ts";
 
 const savedMode = {
   pGain: 4, dGain: 0.02, strengthScale: 0.15,
@@ -44,5 +44,38 @@ test("DM-H3510 defaults respect lower limits from the motor profile", () => {
 test("existing protocols retain their per-mode tuning behavior", () => {
   for (const kind of ["canopen", "rollercan"] as const) {
     assert.deepEqual(smartknobModeTuning(kind, { ...savedMode, effortLimit: 0 }, savedMode), savedMode);
+  }
+});
+
+test("Meow uses the live physical peak for its single limit, not a saved percent", () => {
+  const profile = { target: { kind: "meow" as const, nodeId: 1 }, effortLimitMax: 2.5 };
+  const tuned = smartknobClampTuning(profile, {
+    ...savedMode, effortLimit: 0.31, maxOutputPermille: 0, frictionCompensation: 0,
+  });
+  assert.equal(tuned.effortLimit, 0.31);
+  assert.equal(tuned.maxOutputPermille, 124);
+  assert.equal(tuned.frictionCompensation, 0.31);
+  const restored = smartknobModeTuning("meow", tuned, savedMode);
+  assert.equal(restored.effortLimit, 0.31);
+  assert.equal(restored.maxOutputPermille, 124);
+});
+
+test("Meow clamps cached limits to a replacement motor and preserves zero", () => {
+  const profile = { target: { kind: "meow" as const, nodeId: 1 }, effortLimitMax: 0.08 };
+  const capped = smartknobClampTuning(profile, savedMode);
+  assert.equal(capped.effortLimit, 0.08);
+  assert.equal(capped.maxOutputPermille, 1000);
+  for (const limit of [0, -1, NaN, Infinity]) {
+    const zero = smartknobClampTuning(profile, { ...savedMode, effortLimit: limit });
+    assert.equal(zero.effortLimit, 0);
+    assert.equal(zero.maxOutputPermille, 0);
+    assert.equal(zero.frictionCompensation, 0);
+  }
+  assert.equal(smartknobClampTuning({ ...profile, effortLimitMax: NaN }, savedMode).effortLimit, 0);
+});
+
+test("Other protocols retain their existing internal motor protection", () => {
+  for (const kind of ["canopen", "rollercan", "damiao"] as const) {
+    assert.deepEqual(smartknobClampTuning({ target: { kind, nodeId: 1 }, effortLimitMax: 2.5 }, savedMode), savedMode);
   }
 });

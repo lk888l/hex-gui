@@ -2539,7 +2539,7 @@ pub async fn smartknob_get_profile(
             effort_unit: SmartKnobEffortUnit::Nm,
             supports_temperature: true,
             supports_telemetry: false,
-            effort_limit_max: 10.0,
+            effort_limit_max: smartknob_device_peak(&state, target).await?,
             max_output_permille: crate::smartknob::DEFAULT_MAX_TORQUE_PERMILLE,
             telemetry_enabled: None,
             telemetry_rate_hz: None,
@@ -2574,6 +2574,215 @@ pub async fn smartknob_get_profile(
                 telemetry_enabled: Some(enabled),
                 telemetry_rate_hz: Some(rate_hz),
             })
+        }
+    }
+}
+
+/// Motor Control's device peak and calibration path, without enabling output.
+/// A running knob already owns a session-qualified physical peak snapshot.
+async fn smartknob_device_peak(state: &AppState, target: SmartKnobTarget) -> CmdResult<f64> {
+    let _operation = state.device_settings_operation.acquire().await;
+    let _ownership = state.calibration_start_gate.lock().await;
+    {
+        let active = state.smartknob.lock().await;
+        let knob = match (target.kind, active.as_ref()) {
+            (SmartKnobKind::Meow, Some(ActiveSmartKnob::Meow(knob)))
+            | (SmartKnobKind::Canopen, Some(ActiveSmartKnob::Canopen(knob))) => Some(knob),
+            _ => None,
+        };
+        if let Some(knob) = knob.filter(|knob| knob.node_id() == target.node_id) {
+            return Ok(knob.physical_peak_torque_nm());
+        }
+    }
+    ensure_motor_not_owned_by_smartknob(state, target.node_id).await?;
+    if target.kind == SmartKnobKind::Meow {
+        let manager = meow_manager(state).await?;
+        manager.identify(target.node_id).await.map_err(err)?;
+        let epoch = manager.status(target.node_id).map_err(err)?.session_epoch;
+        let factor = meow_calibration::factor_for(state, &manager, target.node_id).await?;
+        let bus = state
+            .calibration_bus()
+            .await
+            .ok_or_else(|| "not connected: motor bus is unavailable".to_string())?;
+        let peak = crate::smartknob::read_motor_peak_torque(bus.as_ref(), target.node_id)
+            .await
+            .map_err(err)?;
+        manager
+            .list()
+            .into_iter()
+            .find(|info| {
+                info.node_id == target.node_id && info.online && info.session_epoch == epoch
+            })
+            .ok_or_else(|| {
+                "SmartKnob motor session changed while reading output limits".to_string()
+            })?;
+        crate::meow_smartknob::physical_peak_torque(Some(peak), factor).map_err(err)
+    } else {
+        let manager = manager(state).await?;
+        manager.identify(target.node_id).await.map_err(err)?;
+        let epoch = manager
+            .list()
+            .into_iter()
+            .find(|info| info.node_id == target.node_id && info.online)
+            .ok_or_else(|| "SmartKnob motor is offline".to_string())?
+            .session_epoch;
+        let peak = crate::smartknob::read_motor_peak_torque(manager.bus().as_ref(), target.node_id)
+            .await
+            .map_err(err)?;
+        manager
+            .list()
+            .into_iter()
+            .find(|info| {
+                info.node_id == target.node_id && info.online && info.session_epoch == epoch
+            })
+            .ok_or_else(|| {
+                "SmartKnob motor session changed while reading output limits".to_string()
+            })?;
+        Ok(f64::from(peak))
+    }
+}
+
+#[cfg(test)]
+mod smartknob_profile_tests {
+    use super::*;
+    use can_transport::{CanBus, CanCapabilities, CanFilter, CanFrame, CanId, CanIoError, CanRx};
+    use hex_motor::meow_motor::MeowMotorLifecycle;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::mpsc;
+
+    /// A cold, uninitialized 4310. Only SDO uploads are accepted: profile
+    /// loading must never configure PDOs, change mode, or enable the motor.
+    struct ReadOnlyMotorBus {
+        peak: Option<f32>,
+        subscribers: StdMutex<Vec<(CanFilter, mpsc::UnboundedSender<CanFrame>)>>,
+        peak_reads: StdMutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CanBus for ReadOnlyMotorBus {
+        async fn send(&self, frame: CanFrame) -> Result<(), CanIoError> {
+            assert_eq!(frame.id(), CanId::Standard(0x601));
+            let data = frame.data();
+            assert_eq!(data[0], 0x40, "profile loading must only read SDOs");
+            let index = u16::from_le_bytes([data[1], data[2]]);
+            let value = match (index, data[3]) {
+                (0x1018, 1) => Some(0x0068_6578_u32),
+                (0x1018, 2) => Some(0x6C64_BC78_u32),
+                (0x1018, 3) => Some(0x6578_0001_u32),
+                (0x1018, 4) => Some(1_u32),
+                (0x4576, 0) => {
+                    *self.peak_reads.lock().unwrap() += 1;
+                    self.peak.map(f32::to_bits)
+                }
+                // Optional product name, CAN settings and factory calibration
+                // are absent. A successfully read missing calibration uses 1.0.
+                _ => None,
+            };
+            let mut response = [0_u8; 8];
+            response[0] = if value.is_some() { 0x43 } else { 0x80 };
+            response[1..4].copy_from_slice(&data[1..4]);
+            response[4..8].copy_from_slice(&value.unwrap_or(0x0602_0000).to_le_bytes());
+            let response = CanFrame::new_data(0x581_u16, &response)?;
+            for (filter, sender) in self.subscribers.lock().unwrap().iter() {
+                if filter.matches(&response) {
+                    let _ = sender.send(response.clone());
+                }
+            }
+            Ok(())
+        }
+
+        async fn subscribe(&self, filter: CanFilter) -> Result<Box<dyn CanRx>, CanIoError> {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let heartbeat = CanFrame::new_data(0x701_u16, &[0x7F])?;
+            if filter.matches(&heartbeat) {
+                sender.send(heartbeat).unwrap();
+            }
+            self.subscribers.lock().unwrap().push((filter, sender));
+            Ok(Box::new(ReadOnlyMotorRx(receiver)))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: true,
+                max_dlen: 64,
+            }
+        }
+    }
+
+    struct ReadOnlyMotorRx(mpsc::UnboundedReceiver<CanFrame>);
+
+    #[async_trait::async_trait]
+    impl CanRx for ReadOnlyMotorRx {
+        async fn recv(&mut self) -> Result<CanFrame, CanIoError> {
+            self.0.recv().await.ok_or(CanIoError::Disconnected)
+        }
+
+        fn try_recv(&mut self) -> Result<Option<CanFrame>, CanIoError> {
+            match self.0.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(CanIoError::Disconnected),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn smartknob_cold_profile_reads_peak_without_initializing_or_using_a_fallback() {
+        for peak in [Some(2.5), None, Some(0.0), Some(f32::NAN)] {
+            let bus = Arc::new(ReadOnlyMotorBus {
+                peak,
+                subscribers: StdMutex::new(Vec::new()),
+                peak_reads: StdMutex::new(0),
+            });
+            let manager = Arc::new(
+                MeowMotorManager::new(
+                    bus.clone(),
+                    MeowMotorManagerOptions {
+                        auto_identify: false,
+                        broadcast_heartbeat: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !manager
+                    .list()
+                    .iter()
+                    .any(|info| info.node_id == 1 && info.online)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let state = AppState::default();
+            *state.meow_manager.lock().await = Some(manager.clone());
+            *state.calibration_bus.lock().await = Some(bus.clone());
+            let result = smartknob_device_peak(
+                &state,
+                SmartKnobTarget {
+                    kind: SmartKnobKind::Meow,
+                    node_id: 1,
+                },
+            )
+            .await;
+            if peak == Some(2.5) {
+                assert_eq!(result.unwrap(), 2.5);
+            } else {
+                assert!(result.unwrap_err().contains("0x4576"));
+            }
+            assert_eq!(*bus.peak_reads.lock().unwrap(), 1);
+            let info = manager
+                .list()
+                .into_iter()
+                .find(|info| info.node_id == 1)
+                .unwrap();
+            assert_eq!(info.lifecycle, MeowMotorLifecycle::Identified);
+            assert!(
+                info.peak_torque_nm.is_none(),
+                "no initialized cache was needed"
+            );
         }
     }
 }

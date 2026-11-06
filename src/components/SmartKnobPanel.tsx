@@ -21,7 +21,7 @@ import {
 import { api, errMsg } from "../api";
 import { useI18n } from "../i18n";
 import { nid2hex } from "../format";
-import { smartknobInitialOutputLimits, smartknobModeTuning } from "../smartknobUi";
+import { smartknobClampTuning, smartknobInitialOutputLimits, smartknobModeTuning } from "../smartknobUi";
 import type {
   KnobConfig,
   SmartKnobDevice,
@@ -195,6 +195,10 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
         const nextEditor = cached
           ? cloneEditor(cached)
           : createEditor(key, nextProfile);
+        nextEditor.tuning = smartknobClampTuning(nextProfile, nextEditor.tuning);
+        nextEditor.perModeTuning = new Map([...nextEditor.perModeTuning].map(
+          ([index, tuning]) => [index, smartknobClampTuning(nextProfile, tuning)],
+        ));
         editorCache.current.set(key, cloneEditor(nextEditor));
         setProfile(nextProfile);
         setEditor(nextEditor);
@@ -418,9 +422,9 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
   }, [modeSwitching, readyProfile, readyEditor, running, commitEditor, enqueueLiveCommand, message, t, syncEditorFromState]);
 
   const applyTuning = useCallback((patch: Partial<SmartKnobTuning>) => {
-    if (!readyEditor || modeSwitchingRef.current) return;
+    if (!readyEditor || !readyProfile || modeSwitchingRef.current) return;
     lastEditRef.current = performance.now();
-    const tuning = { ...readyEditor.tuning, ...patch };
+    const tuning = smartknobClampTuning(readyProfile, { ...readyEditor.tuning, ...patch });
     const perModeTuning = new Map(readyEditor.perModeTuning);
     perModeTuning.set(readyEditor.modeIndex, tuning);
     const customConfig = readyEditor.modeIndex === 0 && readyEditor.customConfig
@@ -432,7 +436,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
         message.error(errMsg(error));
       });
     }
-  }, [readyEditor, modeSwitching, running, commitEditor, enqueueLiveCommand, message]);
+  }, [readyEditor, readyProfile, modeSwitching, running, commitEditor, enqueueLiveCommand, message]);
 
   const applyCustomConfig = useCallback((updates: Partial<KnobConfig>) => {
     if (!readyEditor?.customConfig || modeSwitchingRef.current) return;
@@ -791,7 +795,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                 </Space>
               )}
               <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
-                (p_gain &times; input &minus; d_gain &times; velocity) &times; strength_scale
+                {isMeow ? t("skDetentFeel") : "(p_gain × input − d_gain × velocity) × strength_scale"}
               </Typography.Text>
               <Space wrap align="end">
                 <Labeled label={t("skPGain")}>
@@ -822,7 +826,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                     onChange={(value) => applyTuning({ strengthScale: value ?? 0 })}
                   />
                 </Labeled>
-                <Labeled label={`${t(isMeow ? "skFrictionCap" : "skFrictionComp")} (${unit})`}>
+                {!isMeow && <Labeled label={`${t("skFrictionComp")} (${unit})`}>
                   <InputNumber
                     disabled={modeSwitching}
                     min={0}
@@ -831,7 +835,7 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                     value={readyEditor.tuning.frictionCompensation}
                     onChange={(value) => applyTuning({ frictionCompensation: value ?? 0 })}
                   />
-                </Labeled>
+                </Labeled>}
                 <Labeled label={`${t("skClickTorque")} (${unit})`}>
                   <InputNumber
                     disabled={modeSwitching}
@@ -846,6 +850,9 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
             </Card>
 
             <Card title={t("skTuningSafety")} size="small" style={{ marginTop: 16 }}>
+              <Typography.Paragraph type="secondary">
+                {t("skDeviceEffortMax")}: {fmt(readyProfile.effortLimitMax, 4)} {unit}
+              </Typography.Paragraph>
               {sessionLimits && (
                 <Typography.Paragraph type="secondary">{t("skSessionLimits")}</Typography.Paragraph>
               )}
@@ -855,19 +862,9 @@ export function SmartKnobPanel({ connected }: { connected: boolean }) {
                     disabled={modeSwitching}
                     min={0}
                     max={readyProfile.effortLimitMax}
-                    step={isDamiao ? 0.01 : readyProfile.effortUnit === "A" ? 0.05 : 0.1}
+                    step={isMeow ? readyProfile.effortLimitMax / 1000 : isDamiao ? 0.01 : readyProfile.effortUnit === "A" ? 0.05 : 0.1}
                     value={readyEditor.tuning.effortLimit}
                     onChange={(value) => applyTuning({ effortLimit: value ?? 0 })}
-                  />
-                </Labeled>
-                <Labeled label={`${t("skMaxTorque")} (‰)`}>
-                  <InputNumber
-                    disabled={modeSwitching}
-                    min={0}
-                    max={1000}
-                    step={50}
-                    value={readyEditor.tuning.maxOutputPermille}
-                    onChange={(value) => applyTuning({ maxOutputPermille: value ?? 0 })}
                   />
                 </Labeled>
               </Space>
@@ -1117,14 +1114,14 @@ function cloneEditor(editor: TargetEditor): TargetEditor {
 }
 
 function tuningForConfig(config: KnobConfig | null, profile: SmartKnobProfile): SmartKnobTuning {
-  return {
+  return smartknobClampTuning(profile, {
     pGain: config?.p_gain ?? 0,
     dGain: config?.d_gain ?? 0,
     strengthScale: config?.strength_scale ?? (profile.effortUnit === "A" ? 0.04 : 0.15),
     ...smartknobInitialOutputLimits(profile),
     frictionCompensation: config?.friction_compensation ?? 0,
     clickEffort: config?.click_torque_nm ?? 0,
-  };
+  });
 }
 
 function configWithTuning(config: KnobConfig, tuning: SmartKnobTuning): KnobConfig {

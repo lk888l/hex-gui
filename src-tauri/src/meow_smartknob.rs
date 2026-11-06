@@ -29,6 +29,29 @@ const POSITION_TIMEOUT: Duration = Duration::from_millis(20);
 const STATE_TIMEOUT: Duration = Duration::from_millis(100);
 const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 
+const STATIC_FRICTION_RATIO: f64 = 0.90;
+// Factory kinetic friction is an average at the calibration speed. Leave
+// margin for angle/temperature variation: 90% sustained unloaded motion on
+// the geared 4310 in the release test despite zero restoring demand.
+const KINETIC_FRICTION_RATIO: f64 = 0.75;
+
+/// Same physical-Nm range used by Motor Control: raw 0x4576 / factory factor.
+pub(crate) fn physical_peak_torque(peak: Option<f32>, factor: f64) -> Result<f64> {
+    let raw_peak =
+        f64::from(peak.ok_or_else(|| anyhow!("motor peak torque 0x4576 is unavailable"))?);
+    let physical = raw_peak / factor;
+    if !raw_peak.is_finite()
+        || raw_peak <= 0.0
+        || !factor.is_finite()
+        || factor <= 0.0
+        || !physical.is_finite()
+        || physical <= 0.0
+    {
+        bail!("motor peak torque or factory torque factor is invalid");
+    }
+    Ok(physical)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct KnobFeedback {
     /// Continuous output-shaft revolutions, already unwrapped by the driver.
@@ -65,6 +88,7 @@ pub(crate) struct MeowKnobMotor {
     torque_factor: f64,
     friction: Option<MeowFrictionCalibration>,
     calibration: KnobCalibration,
+    motion: Mutex<FrictionMotion>,
     heartbeat: Mutex<Option<CalibrationHeartbeat>>,
     stopped: AtomicBool,
 }
@@ -74,20 +98,20 @@ impl MeowKnobMotor {
         manager: Arc<MeowMotorManager>,
         bus: Arc<dyn CanBus>,
         node_id: u8,
-        max_torque: u16,
+        torque_limit_nm: f64,
         shutdown: &AtomicBool,
         host_node_id: u8,
     ) -> Result<Self> {
         startup_allowed(shutdown)?;
-        if max_torque > 1000 {
-            bail!("SmartKnob maximum output must be within 0..=1000 permille");
+        if !torque_limit_nm.is_finite() || torque_limit_nm < 0.0 {
+            bail!("SmartKnob total torque limit must be finite and non-negative");
         }
         if host_node_id == node_id {
             bail!("SmartKnob motor and host heartbeat node IDs must differ");
         }
         let heartbeat = CalibrationHeartbeat::start(bus.clone(), host_node_id)
             .map_err(|error| anyhow!(error))?;
-        let result = Self::initialize(&manager, &bus, node_id, max_torque, shutdown).await;
+        let result = Self::initialize(&manager, &bus, node_id, torque_limit_nm, shutdown).await;
         match result {
             Ok((live, brs, peak_torque_nm, torque_factor, friction, calibration)) => {
                 let motor = Self {
@@ -101,6 +125,7 @@ impl MeowKnobMotor {
                     torque_factor,
                     friction,
                     calibration,
+                    motion: Mutex::new(FrictionMotion::default()),
                     heartbeat: Mutex::new(Some(heartbeat)),
                     stopped: AtomicBool::new(false),
                 };
@@ -122,7 +147,7 @@ impl MeowKnobMotor {
         manager: &MeowMotorManager,
         bus: &Arc<dyn CanBus>,
         node_id: u8,
-        max_torque: u16,
+        torque_limit_nm: f64,
         shutdown: &AtomicBool,
     ) -> Result<(
         MeowMotorLiveState,
@@ -171,6 +196,8 @@ impl MeowKnobMotor {
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .ok_or_else(|| anyhow!("SmartKnob peak torque 0x4576 is unavailable"))?,
         );
+        let physical_peak = physical_peak_torque(Some(peak as f32), factor)?;
+        let max_torque = crate::smartknob::motor_output_permille(torque_limit_nm, physical_peak);
         // Initialize leaves the drive Disabled. Explicitly select uncompressed
         // MIT: another app may previously have selected 0x4103 compressed MIT.
         sdo::download_u8(bus.as_ref(), node_id, 0x4103, 1, 0, Some(SDO_TIMEOUT))
@@ -293,23 +320,44 @@ impl MeowKnobMotor {
         self.calibration.clone()
     }
 
+    pub(crate) fn physical_peak_torque_nm(&self) -> f64 {
+        self.peak_torque_nm / self.torque_factor
+    }
+
     pub(crate) fn friction_torque(
         &self,
+        position_rad: f64,
         velocity_rad_s: f64,
         restoring_nm: f64,
         cap_nm: f64,
     ) -> f64 {
+        if cap_nm <= 0.0 {
+            self.reset_friction();
+            return 0.0;
+        }
+        let now = Instant::now();
+        let (intent, breakaway) = {
+            let mut motion = self.motion.lock().unwrap();
+            let intent = motion.update(position_rad, velocity_rad_s, now);
+            (intent, motion.breakaway_scale(now))
+        };
         self.friction
             .map(|friction| {
                 calibrated_friction(
                     friction,
                     self.torque_factor,
                     velocity_rad_s,
+                    intent,
                     restoring_nm,
                     cap_nm,
+                    breakaway,
                 )
             })
             .unwrap_or(0.0)
+    }
+
+    pub(crate) fn reset_friction(&self) {
+        *self.motion.lock().unwrap() = FrictionMotion::default();
     }
 }
 
@@ -476,18 +524,108 @@ fn validate_feedback(
     Ok(())
 }
 
+/// Resolve slow hand motion before velocity feedback clears its noise floor.
+/// A leaky, bounded displacement accumulator rejects encoder jitter, unwinds
+/// on reversal and forgets old direction when released. All positions are
+/// output-shaft radians; the driver already accounts for the 10:1 gearbox.
+#[derive(Default)]
+struct FrictionMotion {
+    last: Option<(f64, Instant)>,
+    displacement: f64,
+    filtered_velocity: f64,
+    net_travel: f64,
+    total_travel: f64,
+    breakaway_since: Option<Instant>,
+    still_since: Option<Instant>,
+}
+
+impl FrictionMotion {
+    fn update(&mut self, position: f64, velocity: f64, now: Instant) -> f64 {
+        if !position.is_finite() || !velocity.is_finite() {
+            *self = Self::default();
+            return 0.0;
+        }
+        if let Some((previous, at)) = self.last {
+            let dt = now.saturating_duration_since(at).as_secs_f64();
+            if dt > 0.020 {
+                self.displacement = 0.0;
+                self.filtered_velocity = 0.0;
+                self.net_travel = 0.0;
+                self.total_travel = 0.0;
+                self.breakaway_since = None;
+                self.still_since = None;
+            } else {
+                let decay = (-dt / 0.040).exp();
+                let delta = position - previous;
+                self.displacement = (self.displacement * decay + delta).clamp(-0.0008, 0.0008);
+                self.net_travel = self.net_travel * decay + delta;
+                self.total_travel = self.total_travel * decay + delta.abs();
+                // Raw velocity sign feedback can excite gearbox/cogging
+                // rebounds. A 10 ms filter keeps slow hand motion intact
+                // without chasing each high-frequency velocity reversal.
+                self.filtered_velocity +=
+                    (velocity - self.filtered_velocity) * (1.0 - (-dt / 0.010).exp());
+            }
+        } else {
+            self.filtered_velocity = velocity;
+        }
+        self.last = Some((position, now));
+        let positional =
+            self.displacement.signum() * smoothstep((self.displacement.abs() - 0.0001) / 0.0005);
+        let moving = smoothstep((self.filtered_velocity.abs() - 0.002) / 0.018);
+        // A hand turn has net travel; a gearbox vibration mostly retraces
+        // itself. Suppress assistance for repeated reversals without adding
+        // drag to a steady, arbitrarily slow hand turn. This also requires
+        // encoder motion before trusting a velocity spike at rest.
+        let coherence = self.net_travel.abs() / self.total_travel.max(0.0001);
+        let confidence = smoothstep((coherence - 0.2) / 0.6);
+        let intent =
+            ((1.0 - moving) * positional + moving * self.filtered_velocity.signum()) * confidence;
+        // A cogging rebound or velocity zero crossing is not a fresh hand
+        // breakaway. Rearming on every reversal injects energy into a free
+        // shaft. Require 100 ms of genuinely quiet position AND velocity.
+        if velocity.abs() <= 0.002
+            && self.filtered_velocity.abs() <= 0.002
+            && self.displacement.abs() <= 0.0001
+        {
+            let at = *self.still_since.get_or_insert(now);
+            if now.saturating_duration_since(at) >= Duration::from_millis(100) {
+                self.breakaway_since = None;
+            }
+        } else {
+            self.still_since = None;
+        }
+        if intent.abs() > 0.1 && self.breakaway_since.is_none() {
+            self.breakaway_since = Some(now);
+        }
+        intent
+    }
+
+    fn breakaway_scale(&self, now: Instant) -> f64 {
+        self.breakaway_since
+            .map(|at| (-now.saturating_duration_since(at).as_secs_f64() / 0.040).exp())
+            .unwrap_or(1.0)
+    }
+}
+
 /// Directional Stribeck compensation. At rest only an existing restoring
 /// request can unlock stiction; a centered/free knob never receives a static
 /// kick. Smooth transitions and under-compensation avoid a discontinuous sign
 /// torque at zero speed. `cap_nm` remains the operator's physical-Nm ceiling.
+/// Once hand motion is observed it takes priority over an opposing spring,
+/// even below the old 0.02..0.12 rad/s velocity gate.
 fn calibrated_friction(
     friction: MeowFrictionCalibration,
     factor: f64,
     velocity: f64,
+    motion_intent: f64,
     restoring: f64,
     cap_nm: f64,
+    breakaway_scale: f64,
 ) -> f64 {
     if !velocity.is_finite()
+        || !motion_intent.is_finite()
+        || !breakaway_scale.is_finite()
         || !restoring.is_finite()
         || !cap_nm.is_finite()
         || cap_nm <= 0.0
@@ -504,23 +642,38 @@ fn calibrated_friction(
         }
     };
     let speed = velocity.abs();
-    let movement = smoothstep((speed - 0.02) / 0.10);
+    let intent = motion_intent.clamp(-1.0, 1.0);
+    let movement = intent.abs();
     let static_activation = if restoring.abs() <= 0.001 {
         0.0
     } else {
         ((restoring.abs() - 0.001) / 0.02).tanh() * restoring.signum()
     };
-    let at_rest = static_for(restoring) * static_activation;
-    let kinetic = if velocity >= 0.0 {
+    let at_rest = STATIC_FRICTION_RATIO * static_for(restoring) * static_activation;
+    let kinetic = if intent >= 0.0 {
         friction.kinetic_pos_raw_nm
     } else {
         friction.kinetic_neg_raw_nm
     };
     let transition_speed = (friction.kinetic_reference_speed_rad_per_s * 0.15).max(0.05);
-    let moving = velocity.signum()
-        * (kinetic
-            + (static_for(velocity) - kinetic) * (-(speed / transition_speed).powi(2)).exp());
-    let physical = 0.9 * ((1.0 - movement) * at_rest + movement * moving) / factor;
+    // Static friction is a breakaway aid, not a sustainable propulsive torque.
+    // Taper its excess over kinetic friction after motion starts from rest;
+    // a velocity-only Stribeck curve can otherwise sustain a slow free spin.
+    let kinetic_assist = KINETIC_FRICTION_RATIO * kinetic;
+    let moving = intent.signum()
+        * (kinetic_assist
+            + (STATIC_FRICTION_RATIO * static_for(intent) - kinetic_assist)
+                * (-(speed / transition_speed).powi(2)).exp()
+                * breakaway_scale.clamp(0.0, 1.0));
+    // Do not keep a breakaway boost pointed against an observed hand turn.
+    // Fade that term early; the moving assist still grows continuously with
+    // confidence, rather than jumping straight to full static friction.
+    let static_weight = if intent * restoring < 0.0 {
+        1.0 - smoothstep(movement / 0.1)
+    } else {
+        1.0 - movement
+    };
+    let physical = (static_weight * at_rest + movement * moving) / factor;
     physical.clamp(-cap_nm, cap_nm)
 }
 
@@ -532,6 +685,19 @@ fn smoothstep(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_peak_matches_motor_control_and_rejects_unknown_specs() {
+        assert_eq!(physical_peak_torque(Some(2.5), 0.5).unwrap(), 5.0);
+        assert_eq!(physical_peak_torque(Some(2.5), 2.0).unwrap(), 1.25);
+        assert!(physical_peak_torque(None, 1.0).is_err());
+        for raw in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(physical_peak_torque(Some(raw), 1.0).is_err());
+        }
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(physical_peak_torque(Some(2.5), factor).is_err());
+        }
+    }
 
     fn friction() -> MeowFrictionCalibration {
         MeowFrictionCalibration {
@@ -546,25 +712,227 @@ mod tests {
 
     #[test]
     fn static_compensation_requires_restoring_intent_and_uses_each_direction() {
-        assert_eq!(calibrated_friction(friction(), 2.0, 0.0, 0.0, 1.0), 0.0);
-        assert_eq!(calibrated_friction(friction(), 2.0, 0.01, 0.0, 1.0), 0.0);
-        let positive = calibrated_friction(friction(), 2.0, 0.0, 0.2, 1.0);
-        let negative = calibrated_friction(friction(), 2.0, 0.0, -0.2, 1.0);
+        assert_eq!(
+            calibrated_friction(friction(), 2.0, 0.0, 0.0, 0.0, 1.0, 1.0),
+            0.0
+        );
+        assert_eq!(
+            calibrated_friction(friction(), 2.0, 0.01, 0.0, 0.0, 1.0, 1.0),
+            0.0
+        );
+        let positive = calibrated_friction(friction(), 2.0, 0.0, 0.0, 0.2, 1.0, 1.0);
+        let negative = calibrated_friction(friction(), 2.0, 0.0, 0.0, -0.2, 1.0, 1.0);
         assert!((positive - 0.09).abs() < 1e-6);
         assert!((negative + 0.135).abs() < 1e-6);
-        assert_eq!(calibrated_friction(friction(), 2.0, 0.0, 0.2, 0.03), 0.03);
-        assert_eq!(calibrated_friction(friction(), 2.0, 0.0, 0.2, 0.0), 0.0);
+        assert_eq!(
+            calibrated_friction(friction(), 2.0, 0.0, 0.0, 0.2, 0.03, 1.0),
+            0.03
+        );
+        assert_eq!(
+            calibrated_friction(friction(), 2.0, 0.0, 0.0, 0.2, 0.0, 1.0),
+            0.0
+        );
     }
 
     #[test]
     fn moving_compensation_converges_to_directional_kinetic_friction() {
-        assert!((calibrated_friction(friction(), 2.0, 1.0, -0.1, 1.0) - 0.045).abs() < 1e-6);
-        assert!((calibrated_friction(friction(), 2.0, -1.0, 0.1, 1.0) + 0.0675).abs() < 1e-6);
-        for boundary in [0.02, 0.12] {
-            let before = calibrated_friction(friction(), 2.0, boundary - 1e-7, 0.05, 1.0);
-            let after = calibrated_friction(friction(), 2.0, boundary + 1e-7, 0.05, 1.0);
+        assert!(
+            (calibrated_friction(friction(), 2.0, 1.0, 1.0, -0.1, 1.0, 1.0) - 0.0375).abs() < 1e-6
+        );
+        assert!(
+            (calibrated_friction(friction(), 2.0, -1.0, -1.0, 0.1, 1.0, 1.0) + 0.05625).abs()
+                < 1e-6
+        );
+        let now = Instant::now();
+        for boundary in [-0.02, -0.002, 0.002, 0.02] {
+            let sample = |velocity| {
+                let intent = FrictionMotion::default().update(0.0, velocity, now);
+                calibrated_friction(friction(), 2.0, velocity, intent, 0.05, 1.0, 1.0)
+            };
+            let before = sample(boundary - 1e-7);
+            let after = sample(boundary + 1e-7);
             assert!((after - before).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn slow_hand_motion_overrides_opposing_spring_and_reverses() {
+        let start = Instant::now();
+        let mut motion = FrictionMotion::default();
+        let mut position = 0.0;
+        for direction in [1.0, -1.0] {
+            for tick in 0..200 {
+                position += direction * 0.01 * 0.001;
+                let elapsed = if direction > 0.0 { tick } else { 200 + tick };
+                let intent = motion.update(
+                    position,
+                    direction * 0.01,
+                    start + Duration::from_millis(elapsed),
+                );
+                let torque = calibrated_friction(
+                    friction(),
+                    2.0,
+                    direction * 0.01,
+                    intent,
+                    -direction * 0.2,
+                    0.15,
+                    motion.breakaway_scale(start + Duration::from_millis(elapsed)),
+                );
+                if tick > 80 {
+                    assert!(
+                        torque * direction > 0.025,
+                        "slow motion should assist the hand: {torque}"
+                    );
+                    assert!(torque.abs() <= 0.135);
+                }
+            }
+        }
+        for tick in 400..700 {
+            let intent = motion.update(position, 0.0, start + Duration::from_millis(tick));
+            let torque = calibrated_friction(
+                friction(),
+                2.0,
+                0.0,
+                intent,
+                0.0,
+                0.15,
+                motion.breakaway_scale(start + Duration::from_millis(tick)),
+            );
+            if tick > 600 {
+                assert_eq!(torque, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_jitter_cannot_arm_static_assistance() {
+        let now = Instant::now();
+        let mut motion = FrictionMotion::default();
+        for tick in 0..1000 {
+            let noise = if tick % 2 == 0 { 0.00002 } else { -0.00002 };
+            let intent = motion.update(noise, noise * 10.0, now + Duration::from_millis(tick));
+            assert_eq!(intent, 0.0);
+            assert_eq!(
+                calibrated_friction(friction(), 2.0, 0.0, intent, 0.0, 0.15, 1.0),
+                0.0
+            );
+        }
+        motion.update(0.001, 0.0, now + Duration::from_millis(1000));
+        assert_eq!(motion.update(0.001, 0.0, now + Duration::from_secs(2)), 0.0);
+    }
+
+    #[test]
+    fn displacement_detects_motion_even_with_zero_velocity_readback() {
+        let now = Instant::now();
+        let mut motion = FrictionMotion::default();
+        let mut intent = 0.0;
+        for tick in 0..100 {
+            intent = motion.update(
+                tick as f64 * 0.00001,
+                0.0,
+                now + Duration::from_millis(tick),
+            );
+        }
+        let assist = calibrated_friction(friction(), 2.0, 0.0, intent, -0.2, 0.15, 1.0);
+        assert!(
+            assist > 0.04,
+            "encoder motion should beat an opposing spring: {assist}"
+        );
+    }
+
+    #[test]
+    fn transient_velocity_reversal_does_not_flip_full_friction_assist() {
+        let now = Instant::now();
+        let mut motion = FrictionMotion::default();
+        for tick in 0..100 {
+            motion.update(
+                tick as f64 * 0.00005,
+                0.05,
+                now + Duration::from_millis(tick),
+            );
+        }
+        let rebound = motion.update(0.0049, -0.05, now + Duration::from_millis(100));
+        assert!(
+            rebound > 0.0,
+            "a brief rebound should not receive full accelerating torque"
+        );
+        let mut reversed = rebound;
+        for tick in 1..100 {
+            reversed = motion.update(
+                0.0049 - tick as f64 * 0.00005,
+                -0.05,
+                now + Duration::from_millis(100 + tick),
+            );
+        }
+        assert_eq!(
+            reversed, -1.0,
+            "a sustained hand reversal must receive assistance"
+        );
+    }
+
+    #[test]
+    fn repeated_gearbox_rebounds_lose_assistance_but_a_steady_turn_keeps_it() {
+        let now = Instant::now();
+        let mut shaking = FrictionMotion::default();
+        let mut turning = FrictionMotion::default();
+        for tick in 0..1000 {
+            let seconds = tick as f64 / 1000.0;
+            let phase = seconds * std::f64::consts::TAU * 20.0;
+            let at = now + Duration::from_millis(tick);
+            let shake_intent = shaking.update(
+                0.002 * phase.sin(),
+                0.002 * std::f64::consts::TAU * 20.0 * phase.cos(),
+                at,
+            );
+            let hand_intent = turning.update(0.01 * seconds, 0.01, at);
+            if tick > 300 {
+                assert!(
+                    shake_intent.abs() < 0.2,
+                    "rebound assist must fade: {shake_intent}"
+                );
+                assert!(
+                    hand_intent > 0.7,
+                    "slow monotonic hand motion must stay light"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_static_boost_expires_and_rebounds_cannot_rearm_it() {
+        let now = Instant::now();
+        let mut motion = FrictionMotion::default();
+        for tick in 0..500 {
+            let at = now + Duration::from_millis(tick);
+            let intent = motion.update(tick as f64 * 0.00003, 0.03, at);
+            let scale = motion.breakaway_scale(at);
+            if tick == 0 {
+                assert_eq!(scale, 1.0);
+            }
+            let assist = calibrated_friction(friction(), 2.0, 0.03, intent, 0.0, 0.15, scale);
+            if tick > 400 {
+                assert!(
+                    (assist - 0.0375).abs() < 0.00001,
+                    "sustained motion must not keep static-friction torque: {assist}"
+                );
+            }
+        }
+        let reversed = now + Duration::from_millis(500);
+        motion.update(0.0149, -0.03, reversed);
+        assert!(motion.breakaway_scale(reversed) < 0.00001);
+        for tick in 501..900 {
+            motion.update(0.0149, 0.0, now + Duration::from_millis(tick));
+        }
+        assert!(motion.breakaway_since.is_none());
+        let restart = now + Duration::from_millis(900);
+        for tick in 0..20 {
+            motion.update(
+                0.015 + tick as f64 * 0.00003,
+                0.03,
+                restart + Duration::from_millis(tick),
+            );
+        }
+        assert!(motion.breakaway_since.is_some_and(|at| at >= restart));
     }
 
     #[test]

@@ -68,6 +68,18 @@ const MIT_SUB_KP: u8 = 0x04; // u16        (position gain, → 0)
 const MIT_SUB_KD: u8 = 0x05; // u16        (velocity gain, streamed; default 0)
 const OD_MAX_TORQUE: u16 = 0x6072; // u16 ‰ of peak
 
+/// Read-only device specification, available before motor initialization.
+/// `identify()` does not populate the driver's peak-torque cache.
+pub(crate) async fn read_motor_peak_torque(bus: &dyn CanBus, nid: u8) -> anyhow::Result<f32> {
+    let peak = sdo::upload_f32(bus, nid, 0x4576, 0, Some(Duration::from_millis(500)))
+        .await
+        .map_err(|error| anyhow::anyhow!("read motor 0x{nid:02X} peak torque 0x4576: {error}"))?;
+    if !peak.is_finite() || peak <= 0.0 {
+        anyhow::bail!("motor 0x{nid:02X} peak torque 0x4576 is invalid: {peak}");
+    }
+    Ok(peak)
+}
+
 /// Direction sign (the firmware's `SK_INVERT_ROTATION`). Applied to both the
 /// read angle and the output torque so the haptic spring stays *stable* either
 /// way; flipping it only reverses **which way you turn to increase the value**.
@@ -118,6 +130,19 @@ pub const DEFAULT_MAX_TORQUE_PERMILLE: u16 = 700; // motor-side safety clamp
 /// Coulomb friction compensation (Nm). A small torque applied in the
 /// direction of motion to cancel the motor's mechanical drag.
 pub const DEFAULT_FRICTION_COMPENSATION: f64 = 0.03;
+
+/// Derive the wire ceiling from the one user-facing physical torque limit.
+/// Round down so the device ceiling also stays within the requested total.
+pub(crate) fn motor_output_permille(limit_nm: f64, physical_peak_nm: f64) -> u16 {
+    if !limit_nm.is_finite()
+        || limit_nm <= 0.0
+        || !physical_peak_nm.is_finite()
+        || physical_peak_nm <= 0.0
+    {
+        return 0;
+    }
+    ((limit_nm / physical_peak_nm).min(1.0) * 1000.0).floor() as u16
+}
 
 // ───────────────────────────── presets (modes) ──────────────────────────────
 
@@ -439,7 +464,7 @@ pub struct Tuning {
     pub strength_scale: f64,
     /// Hard host-side torque clamp (Nm).
     pub torque_limit_nm: f64,
-    /// Motor-side `0x6072` safety clamp (‰ of peak).
+    /// Derived motor-side safety clamp (‰ of the live physical peak).
     pub max_torque_permille: u16,
     /// Coulomb friction compensation (Nm). Added in the direction of motion
     /// to cancel mechanical drag.
@@ -473,6 +498,13 @@ impl Default for Tuning {
 }
 
 impl Tuning {
+    fn with_motor_limit(mut self, physical_peak_nm: f64) -> Self {
+        self = self.sanitized();
+        self.torque_limit_nm = self.torque_limit_nm.min(physical_peak_nm);
+        self.max_torque_permille = motor_output_permille(self.torque_limit_nm, physical_peak_nm);
+        self
+    }
+
     fn from_config(config: &KnobConfig) -> Self {
         Self {
             p_gain: config.p_gain,
@@ -641,6 +673,7 @@ impl Drop for SmartKnobTimerResolution {
 /// A running SmartKnob: owns the high-rate haptic loop for one motor.
 pub struct SmartKnob {
     node_id: u8,
+    physical_peak_torque_nm: f64,
     /// Index of the requested config; the loop picks it up and applies it.
     requested_config: Arc<StdMutex<usize>>,
     tuning: Arc<StdMutex<Tuning>>,
@@ -680,6 +713,7 @@ enum HapticMotor {
     Legacy {
         mgr: Arc<Cia402Manager>,
         bus: Arc<dyn CanBus>,
+        peak_torque_nm: f64,
     },
     Meow(Arc<MeowKnobMotor>),
     Damiao(Arc<DamiaoKnobMotor>),
@@ -690,6 +724,14 @@ impl HapticMotor {
         match self {
             Self::Damiao(_) => crate::damiao_smartknob::preset_configs(),
             _ => preset_configs(),
+        }
+    }
+
+    fn physical_peak_torque_nm(&self) -> f64 {
+        match self {
+            Self::Legacy { peak_torque_nm, .. } => *peak_torque_nm,
+            Self::Meow(motor) => motor.physical_peak_torque_nm(),
+            Self::Damiao(_) => crate::damiao_smartknob::PEAK_TORQUE_NM,
         }
     }
 }
@@ -707,6 +749,8 @@ impl SmartKnob {
         let configs = preset_configs();
         let config_index = config_index.min(configs.len() - 1);
         let sdo_timeout = Some(mgr.options().sdo_timeout);
+        mgr.identify(nid).await?;
+        let peak_torque_nm = f64::from(read_motor_peak_torque(bus.as_ref(), nid).await?);
         // Seed live tunables from the selected preset so the sliders show the
         // preset's defaults on start.
         let tuning = Tuning::from_config(&configs[config_index]);
@@ -756,7 +800,11 @@ impl SmartKnob {
         ensure_startup_allowed(&mgr, nid, shutdown_requested).await?;
 
         Ok(Self::spawn_loop(
-            HapticMotor::Legacy { mgr, bus },
+            HapticMotor::Legacy {
+                mgr,
+                bus,
+                peak_torque_nm,
+            },
             nid,
             config_index,
             InitialSettings::default(),
@@ -789,7 +837,7 @@ impl SmartKnob {
                 mgr,
                 bus,
                 nid,
-                tuning.max_torque_permille,
+                tuning.torque_limit_nm,
                 shutdown_requested,
                 host_node_id,
             )
@@ -837,6 +885,7 @@ impl SmartKnob {
         initial: InitialSettings,
     ) -> Self {
         let configs = motor.configs();
+        let physical_peak_torque_nm = motor.physical_peak_torque_nm();
         let initial_custom = initial
             .custom_config
             .map(sanitize_custom_config)
@@ -866,6 +915,9 @@ impl SmartKnob {
             HapticMotor::Damiao(motor) => Some(motor.clone()),
             _ => None,
         };
+        if meow.is_some() {
+            tuning = tuning.with_motor_limit(physical_peak_torque_nm);
+        }
         if damiao.is_some() {
             tuning.torque_limit_nm = tuning
                 .torque_limit_nm
@@ -936,6 +988,7 @@ impl SmartKnob {
 
         Self {
             node_id: nid,
+            physical_peak_torque_nm,
             requested_config,
             tuning,
             output_limits,
@@ -989,11 +1042,14 @@ impl SmartKnob {
             d_gain,
             strength_scale,
             torque_limit_nm,
-            max_torque_permille: max_torque_permille.min(1000),
+            max_torque_permille,
             friction_compensation,
             click_torque_nm,
         }
         .sanitized();
+        if self.meow.is_some() {
+            clamped = clamped.with_motor_limit(self.physical_peak_torque_nm);
+        }
         if self.damiao.is_some() {
             clamped.torque_limit_nm = clamped
                 .torque_limit_nm
@@ -1032,6 +1088,10 @@ impl SmartKnob {
 
     pub fn node_id(&self) -> u8 {
         self.node_id
+    }
+
+    pub(crate) fn physical_peak_torque_nm(&self) -> f64 {
+        self.physical_peak_torque_nm
     }
 
     /// Stop the loop, zero torque and disable the motor.
@@ -1290,6 +1350,26 @@ fn idle_recenter(detent: &mut DetentState, shaft_angle: f64, velocity_rad_s: f64
     }
 }
 
+/// Signed snap thresholds, including the position-dependent bias.
+fn snap_thresholds(config: &KnobConfig, current_position: i32) -> (f64, f64) {
+    let width = config.position_width_radians;
+    let snap_point_radians = width * config.snap_point;
+    let bias_radians = width * config.snap_point_bias;
+    let snap_dec = snap_point_radians
+        + if current_position <= 0 {
+            bias_radians
+        } else {
+            -bias_radians
+        };
+    let snap_inc = -snap_point_radians
+        + if current_position >= 0 {
+            -bias_radians
+        } else {
+            bias_radians
+        };
+    (snap_dec, snap_inc)
+}
+
 /// Snap-to-detent state machine (firmware logic, verbatim).
 /// Returns `(angle_to_detent_center, dead_zone_adjustment, out_of_bounds)`.
 fn snap_to_detent(
@@ -1300,21 +1380,7 @@ fn snap_to_detent(
 ) -> (f64, f64, bool) {
     let width = config.position_width_radians;
     let mut angle_to_detent_center = shaft_angle - detent.detent_center;
-
-    let snap_point_radians = width * config.snap_point;
-    let bias_radians = width * config.snap_point_bias;
-    let snap_dec = snap_point_radians
-        + if detent.current_position <= 0 {
-            bias_radians
-        } else {
-            -bias_radians
-        };
-    let snap_inc = -snap_point_radians
-        + if detent.current_position >= 0 {
-            -bias_radians
-        } else {
-            bias_radians
-        };
+    let (snap_dec, snap_inc) = snap_thresholds(config, detent.current_position);
 
     if angle_to_detent_center > snap_dec
         && (num_positions <= 0 || detent.current_position > config.min_position)
@@ -1610,6 +1676,9 @@ async fn haptic_loop(
             h.click.prev_current_position = h.detent.current_position;
             h.click.started_at = None;
             h.click.dir = 1.0;
+            if let HapticMotor::Meow(motor) = &motor {
+                motor.reset_friction();
+            }
             // Restore per-mode tuning (user-tweaked values, or preset defaults on
             // first visit).  Also write them back into the shared Tuning so the
             // frontend sees the restored values on the next poll.
@@ -1630,6 +1699,9 @@ async fn haptic_loop(
         // ── 2b. pick up custom-config edits on the fly (no mode switch, no
         //        detent recentering — avoids a knob jump while editing live).
         if config.is_custom && custom_config_dirty.swap(false, Ordering::SeqCst) {
+            if let HapticMotor::Meow(motor) = &motor {
+                motor.reset_friction();
+            }
             config = custom_config
                 .lock()
                 .expect("custom_config poisoned")
@@ -1683,6 +1755,8 @@ async fn haptic_loop(
             snap_to_detent(&mut h.detent, h.angle.shaft_angle, &config, num_positions);
 
         // ── 5. haptic PID torque ──
+        // Apply the configured P/D throughout the detent travel. Keep the
+        // spring independent of speed; velocity contributes only damping.
         let haptic_component = compute_haptic_pid(
             &config,
             &tun,
@@ -1736,6 +1810,7 @@ async fn haptic_loop(
             HapticMotor::Meow(motor) => {
                 DIRECTION
                     * motor.friction_torque(
+                        feedback.raw_rev * std::f64::consts::TAU,
                         DIRECTION * velocity_rad_s,
                         DIRECTION
                             * (compute_haptic_pid(
@@ -1747,7 +1822,7 @@ async fn haptic_loop(
                                 0.0,
                                 out_of_bounds,
                             ) + min_restoring),
-                        tun.friction_compensation,
+                        tun.torque_limit_nm,
                     )
             }
         };
@@ -1861,7 +1936,11 @@ async fn haptic_loop(
             s.strength_scale = tun.strength_scale;
             s.torque_limit_nm = tun.torque_limit_nm;
             s.max_torque_permille = tun.max_torque_permille;
-            s.friction_compensation = tun.friction_compensation;
+            s.friction_compensation = if matches!(&motor, HapticMotor::Meow(_)) {
+                tun.torque_limit_nm
+            } else {
+                tun.friction_compensation
+            };
             s.click_torque_nm = tun.click_torque_nm;
             s.p_gain = tun.p_gain;
             s.d_gain = tun.d_gain;
@@ -1905,6 +1984,40 @@ async fn haptic_loop(
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_physical_limit_derives_the_motor_ceiling_and_overrides_old_percent() {
+        for old_permille in [0, 50, 700, 1000] {
+            let tuning = Tuning {
+                torque_limit_nm: 0.31,
+                max_torque_permille: old_permille,
+                ..Tuning::default()
+            }
+            .with_motor_limit(2.5);
+            assert_eq!(tuning.torque_limit_nm, 0.31);
+            assert_eq!(tuning.max_torque_permille, 124);
+            assert_eq!(
+                Tuning {
+                    torque_limit_nm: 0.0,
+                    ..tuning
+                }
+                .with_motor_limit(2.5)
+                .max_torque_permille,
+                0
+            );
+            let capped = Tuning {
+                torque_limit_nm: 99.0,
+                ..tuning
+            }
+            .with_motor_limit(2.5);
+            assert_eq!(capped.torque_limit_nm, 2.5);
+            assert_eq!(capped.max_torque_permille, 1000);
+        }
+        assert_eq!(motor_output_permille(0.06, 2.5 / 0.947998046875), 22);
+        assert_eq!(motor_output_permille(f64::NAN, 2.5), 0);
+        assert_eq!(motor_output_permille(0.5, 0.0), 0);
+        assert_eq!(motor_output_permille(0.5, f64::INFINITY), 0);
+    }
+
     // ── unwrap_shaft_angle ──
 
     #[test]
@@ -1941,6 +2054,124 @@ mod tests {
     }
 
     // ── snap_to_detent ──
+
+    #[test]
+    fn detent_spring_preserves_full_strength_across_travel_and_speed() {
+        for index in [4, 7, 8, 9] {
+            // Isolate the spring from explicitly configured damping/clicks.
+            let cfg = preset_configs()[index].clone();
+            let tun = Tuning {
+                d_gain: 0.0,
+                ..Tuning::from_config(&cfg)
+            };
+            let width = cfg.position_width_radians;
+            let dead = (width * DEAD_ZONE_DETENT_PERCENT).min(DEAD_ZONE_RAD);
+            for direction in [-1.0, 1.0] {
+                let position = if direction < 0.0 {
+                    cfg.min_position
+                } else {
+                    cfg.max_position
+                };
+                let mut d = DetentState {
+                    detent_center: 0.0,
+                    current_position: position,
+                    idle_velocity_ewma: 0.0,
+                    last_idle_start: None,
+                    latest_sub_position_unit: 0.0,
+                };
+                let threshold = width * cfg.snap_point;
+                let peak = compute_haptic_pid(
+                    &cfg,
+                    &tun,
+                    position,
+                    direction * threshold,
+                    direction * dead,
+                    0.0,
+                    false,
+                );
+                assert!(peak * direction < 0.0);
+                for progress in [0.25, 0.5, 0.65, 0.8, 0.9] {
+                    let travel = direction * (dead + progress * (threshold - dead));
+                    let (angle, dz, wall) =
+                        snap_to_detent(&mut d, travel, &cfg, position_count(&cfg));
+                    assert_eq!(d.current_position, position);
+                    assert!(!wall);
+                    for speed in [0.0, 0.01, 0.1, 1.0, 10.0, MAX_VEL_RAD_S] {
+                        let torque = compute_haptic_pid(
+                            &cfg,
+                            &tun,
+                            position,
+                            angle,
+                            dz,
+                            direction * speed,
+                            wall,
+                        );
+                        // The entire travel follows the configured spring,
+                        // including the region formerly reduced to 5%.
+                        assert!((torque - peak * progress).abs() < 1e-10);
+                    }
+                }
+                let (before, dz, wall) = snap_to_detent(
+                    &mut d,
+                    direction * (threshold - 1e-9),
+                    &cfg,
+                    position_count(&cfg),
+                );
+                assert!(!wall);
+                let original_before =
+                    compute_haptic_pid(&cfg, &tun, position, before, dz, direction, wall);
+                assert!((original_before - peak).abs() < 1e-7);
+
+                let (after, dz, wall) = snap_to_detent(
+                    &mut d,
+                    direction * (threshold + 1e-9),
+                    &cfg,
+                    position_count(&cfg),
+                );
+                assert_ne!(d.current_position, position);
+                let original_after =
+                    compute_haptic_pid(&cfg, &tun, d.current_position, after, dz, 0.0, wall);
+                for speed in [0.01, 0.1, 1.0, 10.0, MAX_VEL_RAD_S] {
+                    let torque = compute_haptic_pid(
+                        &cfg,
+                        &tun,
+                        d.current_position,
+                        after,
+                        dz,
+                        direction * speed,
+                        wall,
+                    );
+                    assert!((torque - original_after).abs() < 1e-10);
+                }
+                assert!(original_before.abs() > original_after.abs());
+            }
+        }
+    }
+
+    #[test]
+    fn snap_respects_bias_in_both_directions() {
+        let cfg = KnobConfig {
+            min_position: -10,
+            snap_point_bias: 0.2,
+            ..test_config()
+        };
+        for position in [-2, 0, 2] {
+            let (positive, negative) = snap_thresholds(&cfg, position);
+            for (threshold, direction) in [(positive, 1), (negative, -1)] {
+                let mut d = DetentState {
+                    detent_center: 0.0,
+                    current_position: position,
+                    idle_velocity_ewma: 0.0,
+                    last_idle_start: None,
+                    latest_sub_position_unit: 0.0,
+                };
+                snap_to_detent(&mut d, threshold * (1.0 - 1e-6), &cfg, position_count(&cfg));
+                assert_eq!(d.current_position, position);
+                snap_to_detent(&mut d, threshold * (1.0 + 1e-6), &cfg, position_count(&cfg));
+                assert_eq!(d.current_position, position - direction);
+            }
+        }
+    }
 
     fn test_config() -> KnobConfig {
         KnobConfig {
@@ -2021,8 +2252,18 @@ mod tests {
             strength_scale: 1.0,
             ..Default::default()
         };
-        let result = compute_haptic_pid(&cfg, &tun, 5, 0.0, 0.0, MAX_VEL_RAD_S + 1.0, false);
-        assert_eq!(result, 0.0);
+        for direction in [-1.0, 1.0] {
+            let result = compute_haptic_pid(
+                &cfg,
+                &tun,
+                5,
+                0.0,
+                0.0,
+                direction * (MAX_VEL_RAD_S + 1.0),
+                false,
+            );
+            assert_eq!(result, 0.0);
+        }
     }
 
     #[test]
@@ -2058,6 +2299,25 @@ mod tests {
         let result = compute_haptic_pid(&cfg, &tun, 5, 0.01, 0.0, 0.0, false);
         // input = -0.01, pid = 4.0 * (-0.01) = -0.04, scaled: 0.5 * (-0.04) = -0.02
         assert!((result - (-0.02)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pid_velocity_only_adds_configured_damping() {
+        let cfg = test_config();
+        let tun = Tuning {
+            p_gain: 4.0,
+            d_gain: 0.1,
+            strength_scale: 0.5,
+            ..Default::default()
+        };
+        for angle in [-0.08, 0.08] {
+            let stationary = compute_haptic_pid(&cfg, &tun, 5, angle, 0.0, 0.0, false);
+            for velocity in [-10.0, -1.0, -0.01, 0.01, 1.0, 10.0] {
+                let moving = compute_haptic_pid(&cfg, &tun, 5, angle, 0.0, velocity, false);
+                let damping = -tun.strength_scale * tun.d_gain * velocity;
+                assert!((moving - stationary - damping).abs() < 1e-10);
+            }
+        }
     }
 
     #[test]

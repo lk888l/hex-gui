@@ -5,6 +5,7 @@
 //! the motor for five seconds, switches haptic modes, and confirms Disabled.
 //! `--friction` compares four short, displacement-limited torque passes with
 //! factory friction disabled/enabled, using the same driver as the haptic loop.
+//! Compensated passes also check settling with assistance still enabled.
 //! No calibration, identity, or communication setting is saved to flash.
 
 #![allow(dead_code)]
@@ -37,7 +38,7 @@ const HOST_NODE_ID: u8 = 10;
 const RUN_DURATION: Duration = Duration::from_secs(5);
 const TORQUE_LIMIT_NM: f64 = 0.06;
 const MOTOR_LIMIT_PERMILLE: u16 = 40;
-const FRICTION_CAP_NM: f64 = 0.03;
+const FRICTION_CAP_NM: f64 = 0.15;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
         "motor node ID must differ from the host node ID ({HOST_NODE_ID})"
     );
     let bus = open_bus(&iface)?;
-    probe(bus.as_ref(), node_id).await?;
+    probe(&bus, node_id).await?;
     match operation.as_str() {
         "--run" => smoke(bus, node_id).await?,
         "--friction" => friction_comparison(bus, node_id).await?,
@@ -96,7 +97,8 @@ fn parse_node_id(value: &str) -> Result<u8> {
     Ok(id)
 }
 
-async fn probe(bus: &dyn CanBus, nid: u8) -> Result<()> {
+async fn probe(bus_handle: &Arc<dyn CanBus>, nid: u8) -> Result<()> {
+    let bus = bus_handle.as_ref();
     let timeout = Some(Duration::from_millis(500));
     let identity = MotorIdentity {
         node_id: nid,
@@ -118,6 +120,29 @@ async fn probe(bus: &dyn CanBus, nid: u8) -> Result<()> {
     );
     let factory =
         calibration::read_from_device(bus, nid, &identity, Duration::from_millis(500)).await?;
+    // Reproduce the first-connection path: identification alone leaves the
+    // driver's peak cache empty, but the read-only device query must succeed.
+    let manager = manager_for(bus_handle.clone(), nid).await?;
+    let info = manager
+        .list()
+        .into_iter()
+        .find(|info| info.node_id == nid)
+        .context("identified motor disappeared")?;
+    ensure!(
+        info.peak_torque_nm.is_none(),
+        "expected an empty peak cache before initialization"
+    );
+    let raw_peak = smartknob::read_motor_peak_torque(bus, nid).await?;
+    let factor = match &factory {
+        MeowFactoryCalibration::Valid(v1) => v1.torque.factor,
+        MeowFactoryCalibration::Missing { .. } => 1.0,
+    };
+    let physical_peak = meow_smartknob::physical_peak_torque(Some(raw_peak), factor)?;
+    println!("OUTPUT_RANGE raw_peak_nm={raw_peak:.8} physical_peak_nm={physical_peak:.8}");
+    println!(
+        "COLD_PROFILE lifecycle={:?} cached_peak=None read_only_peak=ok",
+        info.lifecycle
+    );
     match factory {
         MeowFactoryCalibration::Valid(v1) => {
             println!(
@@ -146,7 +171,9 @@ async fn probe(bus: &dyn CanBus, nid: u8) -> Result<()> {
 }
 
 async fn smoke(bus: Arc<dyn CanBus>, nid: u8) -> Result<()> {
-    println!("RUN duration=5s host_limit={TORQUE_LIMIT_NM}Nm motor_limit={MOTOR_LIMIT_PERMILLE}permille friction_cap={FRICTION_CAP_NM}Nm");
+    println!(
+        "RUN duration=5s total_limit={TORQUE_LIMIT_NM}Nm motor_limit=automatic friction=automatic"
+    );
     let manager = manager_for(bus.clone(), nid).await?;
     let shutdown = AtomicBool::new(false);
     let mut knob = smartknob::SmartKnob::start_meow(
@@ -240,6 +267,8 @@ fn test_tuning(restoring: bool) -> smartknob::Tuning {
 async fn observe(knob: &smartknob::SmartKnob) -> Result<()> {
     let started = Instant::now();
     let mut switched = false;
+    let mut strong_switched = false;
+    let mut zero_switched = false;
     let mut samples = 0;
     let mut max_speed: f64 = 0.0;
     let mut max_torque: f64 = 0.0;
@@ -252,6 +281,27 @@ async fn observe(knob: &smartknob::SmartKnob) -> Result<()> {
             apply_test_tuning(knob, true);
             switched = true;
             println!("MODE return-to-center; reference is the present shaft position");
+        }
+        if !strong_switched && started.elapsed() >= Duration::from_millis(3500) {
+            let config = smartknob::preset_configs()[8].clone();
+            knob.set_config(8);
+            knob.set_tuning(
+                config.p_gain,
+                config.d_gain,
+                config.strength_scale,
+                TORQUE_LIMIT_NM,
+                MOTOR_LIMIT_PERMILLE,
+                FRICTION_CAP_NM,
+                config.click_torque_nm,
+            );
+            strong_switched = true;
+            println!("MODE progressive strong detents; retain reduced session output limits");
+        }
+        if !zero_switched && started.elapsed() >= Duration::from_millis(4250) {
+            knob.set_tuning(10.0, 0.05, 0.75, 0.0, 700, 0.15, 0.0);
+            knob.set_config(4);
+            zero_switched = true;
+            println!("MODE on/off with total limit zero; old percent must not restore output");
         }
         let state = knob.state();
         ensure!(
@@ -269,6 +319,27 @@ async fn observe(knob: &smartknob::SmartKnob) -> Result<()> {
             state.applied_torque_nm
         );
         ensure!(
+            state.torque_limit_nm <= TORQUE_LIMIT_NM,
+            "mode switch raised the total output limit"
+        );
+        ensure!(
+            state.max_torque_permille
+                == smartknob::motor_output_permille(
+                    state.torque_limit_nm,
+                    knob.physical_peak_torque_nm()
+                ),
+            "motor-side ceiling was not derived from the total limit"
+        );
+        if zero_switched && started.elapsed() >= Duration::from_millis(4400) {
+            ensure!(
+                state.torque_limit_nm == 0.0
+                    && state.max_torque_permille == 0
+                    && state.applied_torque_nm == 0.0
+                    && state.friction_torque_nm == 0.0,
+                "zero total limit did not silence all output across a mode switch"
+            );
+        }
+        ensure!(
             state.shaft_velocity_rev_per_s.abs() < 0.8,
             "shaft speed exceeded smoke limit: {} rev/s",
             state.shaft_velocity_rev_per_s
@@ -279,9 +350,10 @@ async fn observe(knob: &smartknob::SmartKnob) -> Result<()> {
         max_friction = max_friction.max(state.friction_torque_nm.abs());
         if started.elapsed() >= next_report {
             println!(
-                "SAMPLE t={:.3} mode={} angle_rad={:.6} velocity_rev_s={:.6} torque_nm={:.6} friction_nm={:.6}",
+                "SAMPLE t={:.3} mode={} angle_rad={:.6} velocity_rev_s={:.6} torque_nm={:.6} friction_nm={:.6} total_limit_nm={:.6} motor_permille={}",
                 started.elapsed().as_secs_f64(), state.config_index, state.shaft_angle_rad,
                 state.shaft_velocity_rev_per_s, state.applied_torque_nm, state.friction_torque_nm,
+                state.torque_limit_nm, state.max_torque_permille,
             );
             if samples == 1 {
                 println!(
@@ -301,6 +373,7 @@ const FRICTION_TEST_CAP_NM: f64 = 0.13;
 const FRICTION_TEST_LIMIT_NM: f64 = 0.18;
 const FRICTION_TEST_MOTOR_PERMILLE: u16 = 80;
 const FRICTION_TEST_MAX_TRAVEL_RAD: f64 = 0.05;
+const FRICTION_RELEASE_MAX_TRAVEL_RAD: f64 = 0.20;
 const FRICTION_TEST_MAX_SPEED_REV_S: f64 = 0.5;
 
 async fn friction_comparison(bus: Arc<dyn CanBus>, nid: u8) -> Result<()> {
@@ -310,7 +383,7 @@ async fn friction_comparison(bus: Arc<dyn CanBus>, nid: u8) -> Result<()> {
         manager.clone(),
         bus,
         nid,
-        FRICTION_TEST_MOTOR_PERMILLE,
+        FRICTION_TEST_LIMIT_NM,
         &AtomicBool::new(false),
         HOST_NODE_ID,
     )
@@ -328,6 +401,9 @@ async fn friction_comparison(bus: Arc<dyn CanBus>, nid: u8) -> Result<()> {
         for (direction, compensated) in [(1.0, false), (1.0, true), (-1.0, false), (-1.0, true)] {
             wait_still(&driver).await?;
             friction_pass(&driver, direction, compensated).await?;
+            if compensated {
+                release_with_compensation(&driver).await?;
+            }
         }
         wait_still(&driver).await?;
         Ok::<(), anyhow::Error>(())
@@ -387,7 +463,9 @@ async fn friction_pass(
     let mut max_speed: f64 = 0.0;
     let mut samples = 0;
     let mut displacement;
-    let static_request = driver.friction_torque(0.0, base, cap);
+    driver.reset_friction();
+    let static_request =
+        driver.friction_torque(initial_position * std::f64::consts::TAU, 0.0, base, cap);
     loop {
         let feedback = driver.feedback()?;
         displacement = (feedback.raw_rev - initial_position) * std::f64::consts::TAU;
@@ -405,6 +483,7 @@ async fn friction_pass(
             break;
         }
         let compensation = driver.friction_torque(
+            feedback.raw_rev * std::f64::consts::TAU,
             feedback.velocity_rev_per_s * std::f64::consts::TAU,
             base,
             cap,
@@ -427,5 +506,66 @@ async fn friction_pass(
         "FRICTION_PASS direction={direction:+.0} compensated={compensated} elapsed_ms={} samples={samples} displacement_rad={displacement:.8} moved={} static_compensation_nm={static_request:.8} max_friction_nm={max_friction:.8} max_applied_nm={max_torque:.8} max_speed_rev_s={max_speed:.8}",
         started.elapsed().as_millis(), displacement.abs() >= 0.005,
     );
+    ensure!(
+        !compensated || displacement.abs() >= 0.005,
+        "calibrated compensation failed to break unloaded stiction"
+    );
     Ok(())
+}
+
+/// Remove the driving request but keep automatic friction assistance enabled.
+/// A zero-torque stop alone cannot detect self-sustained low-speed motion.
+async fn release_with_compensation(driver: &meow_smartknob::MeowKnobMotor) -> Result<()> {
+    let started = Instant::now();
+    let origin = driver.feedback()?.raw_rev;
+    let mut still_since = None;
+    let mut max_travel: f64 = 0.0;
+    let mut next_report = Duration::ZERO;
+    loop {
+        let feedback = driver.feedback()?;
+        let travel = (feedback.raw_rev - origin) * std::f64::consts::TAU;
+        max_travel = max_travel.max(travel.abs());
+        ensure!(
+            travel.abs() < FRICTION_RELEASE_MAX_TRAVEL_RAD,
+            "release with compensation drifted {travel:.6} rad after {} ms at {:.6} rev/s",
+            started.elapsed().as_millis(),
+            feedback.velocity_rev_per_s
+        );
+        ensure!(
+            feedback.velocity_rev_per_s.abs() < FRICTION_TEST_MAX_SPEED_REV_S,
+            "release with compensation exceeded speed limit"
+        );
+        let assist = driver.friction_torque(
+            feedback.raw_rev * std::f64::consts::TAU,
+            feedback.velocity_rev_per_s * std::f64::consts::TAU,
+            0.0,
+            FRICTION_CAP_NM,
+        );
+        if started.elapsed() >= next_report {
+            println!("RELEASE_SAMPLE elapsed_ms={} travel_rad={travel:.6} velocity_rev_s={:.6} assist_nm={assist:.6}",
+                started.elapsed().as_millis(), feedback.velocity_rev_per_s);
+            next_report += Duration::from_millis(100);
+        }
+        driver
+            .send_torque(
+                assist.clamp(-FRICTION_TEST_LIMIT_NM, FRICTION_TEST_LIMIT_NM),
+                FRICTION_TEST_MOTOR_PERMILLE,
+            )
+            .await?;
+        if feedback.velocity_rev_per_s.abs() < 0.001 && assist.abs() < 0.002 {
+            if still_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(200)
+            {
+                println!("RELEASE_PASS elapsed_ms={} max_travel_rad={max_travel:.8} final_assist_nm={assist:.8}",
+                    started.elapsed().as_millis());
+                return Ok(());
+            }
+        } else {
+            still_since = None;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(2),
+            "friction assistance sustained motion after releasing the drive request"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
