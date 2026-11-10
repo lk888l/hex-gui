@@ -369,6 +369,29 @@ const AUTHENTICITY_SLIDES: Slide[] = [
 export const TUTORIALS: Record<string, Slide[]> = {
   home: HOME_SLIDES,
   control: CONTROL_SLIDES,
+  dualDemo: [
+    {
+      title: { en: "1 · Connect two CAN channels", zh: "1 · 连接两路 CAN" },
+      body: {
+        en: "Connect hexmeow-4310 to CAN0 (gs_usb0, 5 Mbit/s data) and DAMIAO to CAN1 (gs_usb1, 1 Mbit/s). Both channels and bitrates are editable. Leave the motor IDs blank for discovery, then click Connect & discover.",
+        zh: "hexmeow-4310 接 CAN0（gs_usb0，数据段 5 Mbit/s），达妙接 CAN1（gs_usb1，1 Mbit/s）。两路通道和波特率均可修改。电机 ID 留空可自动识别，然后点击「连接并识别」。",
+      },
+    },
+    {
+      title: { en: "2 · Start the MIT pendulum", zh: "2 · 启动 MIT 钟摆" },
+      body: {
+        en: "Each Start uses the current motor positions as swing centers. Set the amplitude, base period, speed variation and each motor's Kp/Kd, then Start demo. Defaults are ±180°, 5 seconds and 35% speed variation. Enable Mirror DAMIAO swing to move the motors in opposite directions.",
+        zh: "每次启动以两台电机各自的当前位置为中心。设置摆幅、基准周期、变速幅度和两台电机的 Kp/Kd，然后点击「开始演示」。默认 ±180°、5 秒和 35% 变速幅度。打开「达妙镜像摆动」可让两台反向摆动。",
+      },
+    },
+    {
+      title: { en: "3 · Watch and stop", zh: "3 · 观察与停止" },
+      body: {
+        en: "The chart compares target and actual angles around the swing centers. Stop both motors or Esc disables both outputs. Leaving this app and closing the window also stop both motors. Stop before adjusting motion settings; Start captures new centers.",
+        zh: "图表对比两台电机相对摆动中心的目标角度和实际角度。「停止两台电机」或 Esc 会让两台失能，离开此 app 和关闭窗口也会停止。先停止再修改运动设置；再次启动会重新采集摆动中心。",
+      },
+    },
+  ],
   settings: SETTINGS_SLIDES,
   hopea3: placeholderSlides("hopea3"),
   lift: LIFT_SLIDES,

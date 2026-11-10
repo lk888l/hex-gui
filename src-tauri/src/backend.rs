@@ -346,6 +346,45 @@ pub async fn open_damiao_bus(
     open_with_profile(spec, LinkProfile::Damiao { bitrate }, can_lease, true).await
 }
 
+/// A dual-motor workspace owns the adapter as one unit. USB channels share a
+/// single claim and RX demultiplexer, while SocketCAN uses two system links.
+pub async fn open_demo_buses(
+    meow_iface: &str,
+    meow_bitrate: u32,
+    dm_iface: &str,
+    dm_bitrate: u32,
+    lease: crate::can_lease::CanLease,
+) -> Result<[Arc<dyn CanBus>; 2]> {
+    let meow_config = can_transport::gs_usb::GsUsbConfig::fd_1m(gs_usb_data_rate(meow_bitrate)?);
+    let dm_config = damiao_gs_usb_config(dm_bitrate)?;
+    let buses = match (gs_usb_channel(meow_iface), gs_usb_channel(dm_iface)) {
+        (Some(a), Some(b)) => crate::dual_can_usb::open([
+            meow_config.with_channel(a), dm_config.with_channel(b),
+        ]).await?,
+        (None, None) => {
+            #[cfg(target_os = "linux")]
+            {
+                let a = meow_iface.strip_prefix("socketcan:").unwrap_or(meow_iface);
+                let b = dm_iface.strip_prefix("socketcan:").unwrap_or(dm_iface);
+                if a == b { bail!("Select two different CAN interfaces"); }
+                let mut buses: Vec<Arc<dyn CanBus>> = Vec::new();
+                for name in [a, b] {
+                    let bus = can_transport::socketcan::SocketCanBus::open(name)?;
+                    ensure_socketcan_up(&bus, name).await?;
+                    buses.push(Arc::new(bus));
+                }
+                [buses.remove(0), buses.remove(0)]
+            }
+            #[cfg(not(target_os = "linux"))]
+            { bail!("Use gs_usb0 / gs_usb1 on Windows and macOS"); }
+        }
+        _ => bail!("Select two gs_usb channels or two SocketCAN interfaces"),
+    };
+    let buses = buses.map(with_exact_sdo_filter);
+    Ok(crate::can_lease::hold_open_bus_pair(buses, lease)
+        .map_err(anyhow::Error::msg)?.map(protect_feature_bus))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LinkProfile {
     Fd1M {

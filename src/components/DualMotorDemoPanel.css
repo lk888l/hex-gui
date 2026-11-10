@@ -1,0 +1,23 @@
+.dual-demo { padding: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 1600px; margin: 0 auto; }
+.dual-demo__toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 5; padding: 10px 0; background: #14171b; }
+.dual-demo__motors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.dual-demo__motor--meow { border-top: 3px solid #56c8ef; }
+.dual-demo__motor--dm { border-top: 3px solid #e9b366; }
+.dual-demo__fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.dual-demo label { display: flex; flex-direction: column; gap: 7px; color: #aeb9c9; font-size: 12px; }
+.dual-demo label .ant-select, .dual-demo label .ant-input-number { width: 100%; }
+.dual-demo__readout { display: flex; flex-wrap: wrap; gap: 22px; align-items: center; padding: 24px 0 18px; }
+.dual-demo__readout span { display: block; font-size: 12px; color: #aeb9c9; }
+.dual-demo__readout strong { font-size: 30px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.dual-demo__motor--meow .dual-demo__readout strong { color: #56c8ef; }
+.dual-demo__motor--dm .dual-demo__readout strong { color: #e9b366; }
+.dual-demo__readout small { color: #8e9bad; font-size: 12px; font-weight: 400; }
+.dual-demo__protocol { font-size: 12px; }
+.dual-demo__motion { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px; }
+.dual-demo__gains { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-top: 20px; }
+.dual-demo__gains > div { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.dual-demo__gains > div > .ant-typography { grid-column: 1 / -1; }
+.dual-demo__motion .ant-switch { align-self: flex-start; margin-top: 5px; }
+.dual-demo__hint { margin: 18px 0 6px; }
+@media (max-width: 1050px) { .dual-demo__motion { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .dual-demo__motors { grid-template-columns: 1fr; } .dual-demo__motion { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dual-demo { padding: 12px; } }

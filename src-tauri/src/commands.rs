@@ -355,6 +355,7 @@ pub async fn connect(
 
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> CmdResult<()> {
+    state.dual_demo.disconnect().await.map_err(err)?;
     // Dormant v1.4 operation only pays for an uncontended mutex acquisition.
     // If lazy extension startup is in flight, this makes the active check and
     // its cleanup decision atomic with that startup.

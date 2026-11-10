@@ -299,6 +299,37 @@ bus with the right settings:
 
 - **Motor Control** — everything above. Broadcasts our heartbeat (the motor's
   `0x1016` consumer needs it).
+- **Dual Motor MIT Pendulum / 双电机 MIT 钟摆** — an independent workspace for
+  hexmeow-4310 and DM-J4310-2EC on two CAN channels. On Windows/macOS the
+  defaults are `gs_usb0` (physical CAN0, 1 Mbit/s arbitration / 5 Mbit/s data)
+  and `gs_usb1` (physical CAN1, Classic CAN 1 Mbit/s); both channel names and
+  bitrates remain editable and are remembered after a successful connection.
+  Linux defaults to `can0` / `can1` and uses system-configured link timing.
+  Click **Connect & discover**, then **Start demo**. Leave motor IDs blank
+  for automatic discovery, or specify decimal IDs when needed. The default
+  MIT position pendulum swings ±180° around each motor's position at Start,
+  with a 5-second base cycle and smoothly varying phase speed (±35%, changing
+  over four base cycles). A one-second smooth startup envelope starts at
+  zero displacement and velocity. Position and its analytic velocity are
+  sent together with zero feed-forward torque. Each motor has editable Kp/Kd
+  (default 3 Nm/rad and 0.15 Nm·s/rad); hexmeow gains use its live gain factor.
+  DAMIAO can mirror the swing. Amplitude (1–180°), base cycle (2–30 s), speed
+  variation (0–80%) and gains are editable while stopped. Charts show target
+  and measured angles relative to each start center; numeric panels also show
+  actual RPM. The demo never sets a motor zero or saves parameters to Flash.
+  If DAMIAO's true multi-turn position exceeds its MIT mapping, the runtime
+  temporarily widens PMAX before enable and restores the original value after
+  confirmed disable. It never substitutes wrapped feedback for the true center.
+  **Stop both motors / Esc**, leaving the workspace, and normal window close
+  disable both motors. Loss of fresh motor feedback stops the demo and
+  attempts both disable commands; an unconfirmed stop remains visible and
+  retryable. USB channels share one device claim and receive dispatcher, so
+  mixed Classic/FD traffic cannot steal the other channel's frames. This
+  workspace exclusively owns the adapter while connected.
+  An attended hardware check of the same runtime is available with
+  `cargo run --manifest-path src-tauri/Cargo.toml --example dual_motor_bench -- 20`
+  (append `mirror` for opposite swing directions). It prints JSON telemetry and
+  stops/disconnects both motors at the end; duration is capped at 120 seconds.
 - **Product Authenticity** — a public, always-visible verification and
   first-registration workspace. It passively discovers heartbeat sessions,
   but reads a proprietary proof object only after a complete `0x1018:00..04`

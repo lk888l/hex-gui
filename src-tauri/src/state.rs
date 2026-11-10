@@ -66,6 +66,7 @@ pub(crate) struct DeviceSettingsOperationGuard<'a> {
 
 #[derive(Default)]
 pub struct AppState {
+    pub dual_demo: crate::dual_motor_demo::DualMotorDemo,
     /// Set synchronously by the native close handler. Long SmartKnob startup
     /// transactions poll this flag between bounded bus operations so shutdown
     /// can roll them back before waiting for the lifecycle lock.

@@ -17,6 +17,8 @@ mod dfu_gate;
 mod dfu_release;
 mod diag;
 mod dto;
+mod dual_can_usb;
+mod dual_motor_demo;
 mod friction_calibration;
 mod hopea3;
 mod hpm_dfu;
@@ -53,6 +55,8 @@ use std::time::Duration;
 
 use state::AppState;
 use tauri::{Emitter, Manager};
+
+pub use dual_motor_demo::run_bench as run_dual_motor_bench;
 
 /// Time budget for the best-effort safe stop on window close. Long enough for a
 /// clean confirmed detach on a healthy bus, short enough that a dead bus doesn't
@@ -93,6 +97,9 @@ fn request_safe_close(window: tauri::Window) {
 
     tauri::async_runtime::spawn(async move {
         let state = handle.state::<AppState>();
+        if tokio::time::timeout(SAFE_SHUTDOWN_BUDGET, state.dual_demo.close()).await.is_err() {
+            log::error!("Dual motor demo stop on close timed out");
+        }
         commands::stop_friction_calibration(&state).await;
         commands::stop_torque_calibration(&state).await;
         match tokio::time::timeout(LIFT_CLOSE_STOP_BUDGET, commands::stop_lift_session(&state))
@@ -167,6 +174,7 @@ fn begin_extension_safe_shutdown<R: tauri::Runtime>(
     tauri::async_runtime::spawn(async move {
         let state = app_handle.state::<AppState>();
         let cleanup = async {
+            state.dual_demo.close().await;
             match tokio::time::timeout(LIFT_CLOSE_STOP_BUDGET, commands::stop_lift_session(&state))
                 .await
             {
@@ -239,6 +247,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            dual_motor_demo::dual_demo_connect,
+            dual_motor_demo::dual_demo_start,
+            dual_motor_demo::dual_demo_get,
+            dual_motor_demo::dual_demo_stop,
+            dual_motor_demo::dual_demo_disconnect,
             commands::connect,
             commands::disconnect,
             commands::is_connected,

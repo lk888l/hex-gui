@@ -19,6 +19,7 @@ pub enum CanOwner {
     Analyzer,
     DfuDiscovery,
     DfuUpdate,
+    DualMotorDemo,
 }
 
 impl fmt::Display for CanOwner {
@@ -28,6 +29,7 @@ impl fmt::Display for CanOwner {
             Self::Analyzer => "CAN Analyzer",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
+            Self::DualMotorDemo => "Dual Motor Demo",
         })
     }
 }
@@ -157,6 +159,17 @@ pub fn hold_open_bus(
     Ok(Arc::new(LeasedCanBus { inner, anchor }))
 }
 
+/// Both channels belong to one exclusive workspace. Keep the process gate
+/// held until the last bus AND receive subscription on either channel drops.
+pub fn hold_open_bus_pair(
+    buses: [Arc<dyn CanBus>; 2],
+    mut lease: CanLease,
+) -> Result<[Arc<dyn CanBus>; 2], String> {
+    lease.mark_held()?;
+    let anchor = Arc::new(LeaseAnchor { _lease: lease });
+    Ok(buses.map(|inner| Arc::new(LeasedCanBus { inner, anchor: anchor.clone() }) as Arc<dyn CanBus>))
+}
+
 struct LeaseAnchor {
     _lease: CanLease,
 }
@@ -269,6 +282,20 @@ mod tests {
         drop(opening);
         let _next = gate.try_acquire(CanOwner::Analyzer).unwrap();
         assert_eq!(gate.active(), Some((CanOwner::Analyzer, "opening")));
+    }
+
+    #[tokio::test]
+    async fn dual_bus_lease_survives_either_channel_and_its_subscriptions() {
+        let gate = CanTransportGate::default();
+        let lease = gate.try_acquire(CanOwner::DualMotorDemo).unwrap();
+        let [a, b] = hold_open_bus_pair([Arc::new(TestBus), Arc::new(TestBus)], lease).unwrap();
+        let rx = b.subscribe(CanFilter::pass_all_standard()).await.unwrap();
+        drop(a);
+        assert!(gate.try_acquire(CanOwner::Manager).is_err());
+        drop(b);
+        assert!(gate.try_acquire(CanOwner::Analyzer).is_err());
+        drop(rx);
+        assert!(gate.try_acquire(CanOwner::Manager).is_ok());
     }
 
     #[test]

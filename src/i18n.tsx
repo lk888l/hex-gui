@@ -419,6 +419,11 @@ const STRINGS = {
 
   // Dedicated DAMIAO DM-J4310-2EC workspace
   toolDamiao: { en: "DM-J4310-2EC Motor Control", zh: "DM-J4310-2EC 电机控制" },
+  toolDualDemo: { en: "Dual Motor MIT Pendulum", zh: "双电机 MIT 钟摆" },
+  toolDualDemoDesc: {
+    en: "Swing hexmeow-4310 and DM-J4310-2EC in MIT mode with variable-speed position targets on two CAN channels.",
+    zh: "通过两路 CAN 同时驱动 hexmeow-4310 与 DM-J4310-2EC，在 MIT 模式下展示变速位置钟摆。",
+  },
   toolDamiaoDesc: {
     en: "Configure and control DAMIAO DM-J4310-2EC 24 V / 48 V motors with live CAN feedback.",
     zh: "面向达妙 DM-J4310-2EC 24 V / 48 V 电机的配置、控制与实时 CAN 反馈。",

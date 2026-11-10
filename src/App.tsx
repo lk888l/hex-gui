@@ -24,6 +24,8 @@ import { CanAnalyzerPanel } from "./components/CanAnalyzerPanel";
 import { DfuPanel } from "./components/DfuPanel";
 import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
+import { DualMotorDemoPanel } from "./components/DualMotorDemoPanel";
+import { dualDemoApi } from "./dualDemoApi";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
 import { TutorialModal, TUTORIALS } from "./components/Tutorial";
 import { canDfuApi, hpmDfuApi } from "./dfuApi";
@@ -48,6 +50,7 @@ type Tool =
   | "calibrationUpdate"
   | "console"
   | "damiao"
+  | "dualDemo"
   | "rollercanControl";
 
 const DEVICE_POLL_MS = 700;
@@ -72,6 +75,7 @@ export default function App() {
   // locked until the backend command has actually returned.
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [damiaoBusy, setDamiaoBusy] = useState(false);
+  const [dualDemoBusy, setDualDemoBusy] = useState(false);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [calibrationUpdateBusy, setCalibrationUpdateBusy] = useState(false);
 
@@ -138,6 +142,7 @@ export default function App() {
   }, []);
 
   const switchTool = useCallback(async () => {
+    if (tool === "dualDemo" && dualDemoBusy) return;
     if (tool === "damiao" && damiaoBusy) {
       message.warning(t("settingsBusyLeave"));
       return;
@@ -164,6 +169,8 @@ export default function App() {
     try {
       if (tool === "dfu") {
         await Promise.all([hpmDfuApi.leave(), canDfuApi.leave()]);
+      } else if (tool === "dualDemo") {
+        await dualDemoApi.disconnect();
       } else {
         await api.disconnect();
       }
@@ -177,7 +184,7 @@ export default function App() {
     setDevices([]);
     setTutorialOpen(false);
     setTool(null);
-  }, [calibrationBusy, calibrationUpdateBusy, damiaoBusy, dfuBusy, message, settingsBusy, t, tool]);
+  }, [calibrationBusy, calibrationUpdateBusy, damiaoBusy, dualDemoBusy, dfuBusy, message, settingsBusy, t, tool]);
 
   const onToggleLog = useCallback(
     async (nid: number, on: boolean, meowMotor = false) => {
@@ -231,6 +238,7 @@ export default function App() {
     liftApi: { title: t("toolLiftZenoh"), desc: t("toolLiftZenohDesc") },
     console: { title: t("toolConsole"), desc: t("toolConsoleDesc") },
     damiao: { title: t("toolDamiao"), desc: t("toolDamiaoDesc") },
+    dualDemo: { title: t("toolDualDemo"), desc: t("toolDualDemoDesc") },
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
@@ -256,8 +264,10 @@ export default function App() {
     tool !== "torqueCalibration" &&
     tool !== "calibrationUpdate" &&
     tool !== "damiao" &&
+    tool !== "dualDemo" &&
     tool !== "rollercanControl";
   const showConnectBar =
+    tool !== "dualDemo" &&
     tool !== "console" &&
     tool !== "zenoh" &&
     tool !== "arm" &&
@@ -276,6 +286,7 @@ export default function App() {
             disabled={
               (tool === "dfu" && dfuBusy) ||
               (tool === "damiao" && damiaoBusy) ||
+              (tool === "dualDemo" && dualDemoBusy) ||
               (tool === "settings" && settingsBusy) ||
               ((tool === "calibration" || tool === "torqueCalibration") && calibrationBusy)
               || (tool === "calibrationUpdate" && calibrationUpdateBusy)
@@ -353,6 +364,8 @@ export default function App() {
             <CanAnalyzerPanel />
           ) : tool === "damiao" ? (
             <DamiaoMotorPanel connected={connected} onBusyChange={setDamiaoBusy} />
+          ) : tool === "dualDemo" ? (
+            <DualMotorDemoPanel onBusyChange={setDualDemoBusy} />
           ) : tool === "rollercanControl" ? (
             <RollerCanControlPanel connected={connected} />
           ) : tool === "dfu" ? (
@@ -495,6 +508,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
             tag={t("tagLiveControl")}
             accent="blue"
             onClick={() => onPick("control")}
+          />
+          <ToolCard
+            title={t("toolDualDemo")}
+            desc={t("toolDualDemoDesc")}
+            tag="DUAL CAN"
+            accent="green"
+            onClick={() => onPick("dualDemo")}
           />
         </ToolSection>
 
