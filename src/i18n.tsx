@@ -438,6 +438,8 @@ const STRINGS = {
 
   // Tool selector
   toolControl: { en: "Motor Control", zh: "电机控制" },
+  toolHpmImu: { en: "HPM IMU", zh: "HPM IMU" },
+  toolHpmImuDesc: { en: "Initialize bimu, configure PDOs, inspect attitude, sensors and diagnostics.", zh: "bimu 初始化、PDO 配置、姿态与传感器观测、诊断和数据导出。" },
   toolSettings: { en: "Device Settings", zh: "设备设置" },
   toolCalibration: { en: "Motor Friction Calibration", zh: "电机摩擦力标定" },
   toolCalibrationDesc: {

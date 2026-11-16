@@ -304,6 +304,15 @@ bus with the right settings:
 
 - **Motor Control** — everything above. Broadcasts our heartbeat (the motor's
   `0x1016` consumer needs it).
+- **HPM IMU** — a standalone, always-visible bimu workspace with its own CAN
+  connection (Linux default `can2`, other platforms `gs_usb0`). Provides
+  one-click initialization, four editable TPDO mappings with readback and
+  rollback, on-chip SFLP attitude, sensor charts, diagnostics and full-rate
+  recent CSV export, plus motor-referenced raw SFLP angle accuracy tests for
+  hexmeow-4310 / 4342 (configurable angle, repeats and per-round zero).
+  Uses CAN FD 1M/4M, default IMU node 31, without a developer-mode unlock.
+  Passive viewing has no host heartbeat; starting a motor test creates a
+  heartbeat producer until disconnection. See [HPM IMU](docs/hpm-imu.md).
 - **Product Authenticity** — a public, always-visible verification and
   first-registration workspace. It passively discovers heartbeat sessions,
   but reads a proprietary proof object only after a complete `0x1018:00..04`

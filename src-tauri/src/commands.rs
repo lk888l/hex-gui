@@ -405,6 +405,7 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
     if let Some(app) = state.imu.lock().await.take() {
         app.stop().await;
     }
+    crate::hpm_imu::disconnect_session(state).await?;
     // The analyzer owns its own bus, so stop it unconditionally (it may be the
     // only thing running — the user never called the manager-based connect()).
     if let Some(app) = state.analyzer.lock().await.take() {
@@ -428,6 +429,8 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
 /// Confirm every extension-owned output is disabled before a manual
 /// disconnect releases the stock v1.4 manager and physical adapter.
 async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
+    // Retain the extended close path if motor disable needs another attempt.
+    crate::hpm_imu::disconnect_session(state).await?;
     let failures = collect_extension_stop_failures(
         stop_active_smartknob(state),
         stop_rollercan_control(state, false),

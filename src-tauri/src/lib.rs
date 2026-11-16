@@ -25,6 +25,7 @@ mod hpm_dfu;
 mod hpm_v3_can;
 mod hpm_can_profiles;
 mod imu;
+mod hpm_imu;
 mod lift;
 mod lift_commission;
 mod logging;
@@ -375,6 +376,17 @@ pub fn run() {
             commands::smartknob_set_custom_config,
             commands::smartknob_set_telemetry,
             commands::imu_start,
+            hpm_imu::hpm_imu_connect,
+            hpm_imu::hpm_imu_disconnect,
+            hpm_imu::hpm_imu_state,
+            hpm_imu::hpm_imu_read,
+            hpm_imu::hpm_imu_configure,
+            hpm_imu::hpm_imu_nmt,
+            hpm_imu::hpm_imu_sync,
+            hpm_imu::hpm_imu_diagnostics,
+            hpm_imu::hpm_imu_export_csv,
+            hpm_imu::angle_test::hpm_imu_test_start,
+            hpm_imu::angle_test::hpm_imu_test_stop,
             commands::imu_stop,
             commands::imu_get_state,
             commands::imu_bias_trim,

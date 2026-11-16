@@ -10,6 +10,7 @@ import { Sidebar } from "./components/Sidebar";
 import { MotorDetail } from "./components/MotorDetail";
 import { MeowMotorPanel } from "./components/MeowMotorPanel";
 import { ImuPanel } from "./components/ImuPanel";
+import { HpmImuPanel } from "./components/HpmImuPanel";
 import { DeviceSettingsTool } from "./components/DeviceSettingsTool";
 import { MotorFrictionCalibrationPanel } from "./components/MotorFrictionCalibrationPanel";
 import { MotorTorqueCalibrationPanel } from "./components/MotorTorqueCalibrationPanel";
@@ -34,6 +35,7 @@ import "./App.css";
 
 type Tool =
   | "control"
+  | "hpmImu"
   | "settings"
   | "hopea3"
   | "lift"
@@ -211,6 +213,7 @@ export default function App() {
   const selected = devices.find((d) => d.node_id === selectedNid) ?? null;
   const toolMeta = {
     control: { title: t("toolControl"), desc: t("toolControlDesc") },
+    hpmImu: { title: t("toolHpmImu"), desc: t("toolHpmImuDesc") },
     settings: { title: t("toolSettings"), desc: t("toolSettingsDesc") },
     hopea3: { title: t("toolHopeA3"), desc: t("toolHopeA3Desc") },
     lift: { title: t("toolLift"), desc: t("toolLiftDesc") },
@@ -243,6 +246,7 @@ export default function App() {
   // hopea3 / smartknob / zenoh / arm / canalyzer 都是整屏面板;zenoh/arm 走 Zenoh,
   // canalyzer 自带总线连接,都不使用顶栏的电机 ConnectBar。
   const showSidebar =
+    tool !== "hpmImu" &&
     tool !== "console" &&
     tool !== "hopea3" &&
     tool !== "lift" &&
@@ -260,6 +264,7 @@ export default function App() {
     tool !== "damiao" &&
     tool !== "rollercanControl";
   const showConnectBar =
+    tool !== "hpmImu" &&
     tool !== "console" &&
     tool !== "zenoh" &&
     tool !== "arm" &&
@@ -338,6 +343,8 @@ export default function App() {
           {tool === "control" && devices.filter(d => d.online && ["cia402_motor", "meow_motor"].includes(d.device_type) && isReservedCanNode(d.node_id)).map(d => <Alert key={`reserved-${d.node_id}`} type="error" showIcon message={reservedCanNodeMessage(lang, d.node_id)} style={{ marginBottom: 12 }} />)}
           {tool === "console" ? (
             <RobotConsole />
+          ) : tool === "hpmImu" ? (
+            <HpmImuPanel />
           ) : tool === "hopea3" ? (
             <Hopea3Panel connected={connected} />
           ) : tool === "lift" ? (
@@ -504,6 +511,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
         </ToolSection>
 
         <ToolSection title={t("catRawCanApp")} hint={t("catRawCanAppHint")}>
+          <ToolCard
+            title={t("toolHpmImu")}
+            desc={t("toolHpmImuDesc")}
+            tag="HPM bimu · CAN FD"
+            accent="cyan"
+            onClick={() => onPick("hpmImu")}
+          />
           <ToolCard
             title={t("toolSmartKnob")}
             desc={t("toolSmartKnobDesc")}

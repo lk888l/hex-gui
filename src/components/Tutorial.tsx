@@ -369,6 +369,28 @@ const AUTHENTICITY_SLIDES: Slide[] = [
 export const TUTORIALS: Record<string, Slide[]> = {
   home: HOME_SLIDES,
   control: CONTROL_SLIDES,
+  hpmImu: [
+    { title: { zh: "1 · 连接 IMU", en: "1 · Connect the IMU" }, body: {
+      zh: "选择 CAN 接口（Linux 默认 can2；其他系统为 gs_usb0），点击连接。SocketCAN 需预先设为 CAN FD 1 Mbit/s 仲裁、4 Mbit/s 数据、80% 采样点。界面被动发现心跳，也可手动指定 Node-ID，固件默认 31。",
+      en: "Select the interface (can2 on Linux, gs_usb0 elsewhere) and connect. Configure SocketCAN for CAN FD 1 Mbit/s arbitration, 4 Mbit/s data, 80% sample points. Nodes appear from heartbeats; manual Node-ID is also available, default 31.",
+    } },
+    { title: { zh: "2 · 一键初始化", en: "2 · Initialize" }, body: {
+      zh: "点击一键初始化：读取 bimu 身份，定向进入 Pre-op，设置并回读 TPDO1/2 默认映射，禁用 TPDO3/4，然后 Start。默认周期 8 ms，可修改。读取当前配置只读取设备，不改变 NMT。处于 Stopped 时先点击 Pre-op 恢复 SDO。",
+      en: "Initialize reads bimu identity, enters directed Pre-op, writes and verifies TPDO1/2 defaults, disables TPDO3/4, then starts. The default event period is 8 ms. Read configuration leaves NMT unchanged. If stopped, use Pre-op first to restore SDO access.",
+    } },
+    { title: { zh: "3 · 修改 PDO", en: "3 · Configure PDOs" }, body: {
+      zh: "PDO 页可编辑四路 TPDO，包括 COB-ID、事件周期、同步类型、抑制时间、SYNC start 和有序对象映射。每路最多 24 项、64 字节。应用后回读核对并启动，失败尝试恢复原配置。配置仅在 RAM，复位后恢复默认。",
+      en: "Edit all four TPDOs, including COB-ID, event timer, type, inhibit time, SYNC start and ordered mapping. Each supports 24 entries / 64 bytes. Apply reads back and starts; failures attempt rollback. Configuration is volatile and resets to firmware defaults.",
+    } },
+    { title: { zh: "4 · 观察与导出", en: "4 · Observe and export" }, body: {
+      zh: "SFLP 为片上六轴融合，Yaw 为相对航向；显示归零只影响视图。数据过期或无效时姿态冻结。诊断页可读取传感器年龄、错误、溢出和只读配置。CSV 记录最近 60 秒原始 PDO，每帧独立接收时间及字段，不强行配对两路数据。断开后 IMU 继续运行；如有电机测试则先停止并确认电机失能。",
+      en: "SFLP is on-chip six-axis fusion with relative yaw. Zero display only changes the view; stale or invalid attitude freezes. Diagnostics expose ages, errors, overflows and read-only sensor settings. CSV retains up to 60 seconds of original PDOs, with independent receive times and fields. The IMU continues running after disconnect; an active motor test is cancelled with confirmed motor disable first.",
+    } },
+    { title: { zh: "5 · Raw 角度测试", en: "5 · Raw angle test" }, body: {
+      zh: "将 IMU 固定在 4310 或 4342 电机输出轴，接入同一 CAN 总线。在 Raw 角度测试页设置电机 ID、角度、次数、测量轴及正方向。每轮回已有零位、转到目标角并稳定采样，显示误差百分比和回零残差。逐次置零开关重设测试参考，关闭时保留首次参考以观察漂移。测试启动后发送主机心跳，主机 ID 必须空闲。",
+      en: "Mount the IMU on a 4310 or 4342 output shaft on the same CAN bus. Set the motor ID, angle, repeat count, sensor axis and direction in Raw angle test. Each round returns to the existing zero, rotates to target and samples after settling, showing percentage errors and return residuals. Per-round zero replaces the test reference; turning it off retains the first reference to observe drift. Starting a test sends host heartbeats; select an unused host ID.",
+    } },
+  ],
   settings: SETTINGS_SLIDES,
   hopea3: placeholderSlides("hopea3"),
   lift: LIFT_SLIDES,

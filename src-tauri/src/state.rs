@@ -142,6 +142,8 @@ pub struct AppState {
     /// The running IMU session, if started. At most one at a time; it streams
     /// the selected IMU's TPDO1 and publishes a snapshot for the UI to poll.
     pub imu: Mutex<Option<crate::imu::ImuManager>>,
+    /// Standalone HPM bimu workspace; owns a passive raw CAN bus.
+    pub hpm_imu: Mutex<Option<crate::hpm_imu::Session>>,
     /// Direct DAMIAO protocol sessions keyed by motor CAN ID. All sessions
     /// borrow the same manager-owned CAN bus, so one adapter can control
     /// several DM-J4310-2EC V1.1 motors independently.

@@ -1,0 +1,15 @@
+.hpm-imu { display: flex; flex-direction: column; gap: 16px; max-width: 1600px; margin: 0 auto; }
+.hpm-imu-actions { margin-top: 14px; margin-bottom: 12px; }
+.hpm-imu-note.ant-typography { margin: 10px 0 0; font-size: 12px; }
+.hpm-imu-stale { color: #92959f; }
+.hpm-imu-values { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.hpm-imu-values th, .hpm-imu-values td { text-align: right; padding: 9px 5px; border-bottom: 1px solid #ffffff12; }
+.hpm-imu-values td:first-child { text-align: left; }
+.hpm-imu-values th:nth-child(2) { color: #ff6b6b; }
+.hpm-imu-values th:nth-child(3) { color: #2ecc71; }
+.hpm-imu-values th:nth-child(4) { color: #4f8cff; }
+.hpm-imu-map-row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.hpm-imu-map-row > .ant-typography { min-width: 82px; }
+.hpm-imu-test-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; }
+.hpm-imu-test-field { display: flex; flex-direction: column; gap: 6px; }
+.hpm-imu-test-field .ant-input-number-group-wrapper, .hpm-imu-test-field .ant-input-number { width: 100%; }
