@@ -355,6 +355,7 @@ pub async fn connect(
 
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> CmdResult<()> {
+    state.pull_cord.request_stop();
     // Dormant v1.4 operation only pays for an uncontended mutex acquisition.
     // If lazy extension startup is in flight, this makes the active check and
     // its cleanup decision atomic with that startup.
@@ -393,9 +394,7 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
     if stop_lift {
         stop_lift_session(state).await?;
     }
-    if let (Some(app), Some(mgr)) = (state.hopea3.lock().await.take(), state.manager().await) {
-        app.stop(&mgr).await;
-    }
+    stop_active_hopea3(state).await?;
     // An active SmartKnob always marks the extension runtime active and is
     // stopped before this function. Retain a fail-safe fallback for malformed
     // state without changing the dormant v1.4 path.
@@ -428,12 +427,18 @@ async fn disconnect_v1_4_locked(state: &AppState, stop_lift: bool) -> CmdResult<
 /// Confirm every extension-owned output is disabled before a manual
 /// disconnect releases the stock v1.4 manager and physical adapter.
 async fn stop_extension_runtime_locked(state: &AppState) -> CmdResult<()> {
-    let failures = collect_extension_stop_failures(
+    let mut failures = collect_extension_stop_failures(
         stop_active_smartknob(state),
         stop_rollercan_control(state, false),
         stop_damiao_sessions(state),
     )
     .await;
+    if let Err(error) = stop_active_hopea3(state).await {
+        failures.push(format!("HopeA3: {error}"));
+    }
+    if let Err(error) = state.pull_cord.disconnect().await {
+        failures.push(format!("Pull Cord Control: {error}"));
+    }
     if !failures.is_empty() {
         // Keep every failed subsystem handle, the shared feature bus, and the
         // active marker intact so Stop/disconnect can retry confirmed disable.
@@ -475,6 +480,12 @@ async fn collect_extension_stop_failures(
 
 /// Best-effort variant used only after an extended window-close request.
 async fn force_stop_extension_runtime_locked(state: &AppState) {
+    if let Err(error) = stop_active_hopea3(state).await {
+        log::warn!("HopeA3 stop during forced close failed: {error}");
+    }
+    if let Err(error) = state.pull_cord.disconnect().await {
+        log::warn!("Pull Cord Control stop during forced close failed: {error}");
+    }
     if let Err(error) = stop_rollercan_control(state, true).await {
         log::warn!(
             "RollerCAN control disable during forced close failed; motor power must be removed before handling it: {error}"
@@ -1995,15 +2006,38 @@ pub async fn stop_log(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
 /// Initialize the three HopeA3 motors and start the 500 Hz uncompressed-MIT velocity loop.
 #[tauri::command]
 pub async fn hopea3_start(state: State<'_, AppState>) -> CmdResult<()> {
-    let mgr = manager(&state).await?;
+    let _extension_op = state.extension_op.lock().await;
+    mark_extension_runtime_active(&state);
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return Err("application shutdown is in progress".into());
+    }
+    // The shared legacy manager owns the bus heartbeat, not HopeA3's motor
+    // protocol. All identity, mode, feedback and disable operations use Meow.
+    let transport = manager(&state).await?;
+    if transport.options().heartbeat_node_id != 10 || !transport.options().broadcast_heartbeat {
+        return Err("HopeA3 requires host Node-ID 10 with heartbeat broadcast enabled".into());
+    }
+    let mgr = meow_manager(&state).await?;
+    let bus = feature_bus_locked(&state).await?;
     let mut guard = state.hopea3.lock().await;
     if guard.is_some() {
         return Err("HopeA3 already running; stop it first".into());
     }
-    let app = crate::hopea3::Hopea3::start(mgr, &state.hopea3_init)
-        .await
-        .map_err(err)?;
+    let app = crate::hopea3::Hopea3::start(
+        mgr,
+        bus,
+        Some(transport.options().sdo_timeout),
+        &state.hopea3_init,
+        &state.shutdown_requested,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
     *guard = Some(app);
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        guard.as_mut().unwrap().stop().await.map_err(err)?;
+        guard.take();
+        return Err("HopeA3 startup cancelled by application shutdown".into());
+    }
     log::info!("HopeA3 started");
     Ok(())
 }
@@ -2019,10 +2053,16 @@ pub async fn hopea3_init_progress(
 /// Stop the control loop and disable all HopeA3 motors. No-op if not running.
 #[tauri::command]
 pub async fn hopea3_stop(state: State<'_, AppState>) -> CmdResult<()> {
-    let app = state.hopea3.lock().await.take();
-    if let Some(app) = app {
-        let mgr = manager(&state).await?;
-        app.stop(&mgr).await;
+    let _extension_op = state.extension_op.lock().await;
+    stop_active_hopea3(&state).await
+}
+
+async fn stop_active_hopea3(state: &AppState) -> CmdResult<()> {
+    let mut guard = state.hopea3.lock().await;
+    if let Some(app) = guard.as_mut() {
+        // Retain the session on an unconfirmed disable so Stop/disconnect can retry.
+        app.stop().await.map_err(err)?;
+        guard.take();
         log::info!("HopeA3 stopped");
     }
     Ok(())
@@ -2058,7 +2098,7 @@ pub async fn hopea3_set_max_torque(
 #[tauri::command]
 pub async fn hopea3_set_kd(state: State<'_, AppState>, kd_si: [f64; 3]) -> CmdResult<()> {
     if let Some(app) = state.hopea3.lock().await.as_ref() {
-        app.set_kd(kd_si);
+        app.set_kd(kd_si).map_err(err)?;
     }
     Ok(())
 }
@@ -2076,25 +2116,31 @@ pub async fn hopea3_set_limits(
     Ok(())
 }
 
-/// Re-initialize a single HopeA3 motor (e.g. one that faulted) while the chassis
-/// keeps running. The other motors are unaffected.
+/// Reinitialize a single HopeA3 HexMeow motor while motion is inhibited on all wheels.
 #[tauri::command]
 pub async fn hopea3_reinit_motor(state: State<'_, AppState>, nid: u8) -> CmdResult<()> {
     crate::can_node_policy::check(nid)?;
+    let _extension_op = state.extension_op.lock().await;
     let guard = state.hopea3.lock().await;
     match guard.as_ref() {
-        Some(app) => app.reinit_motor(nid).await.map_err(err),
+        Some(app) => app
+            .reinit_motor(nid, &state.shutdown_requested)
+            .await
+            .map_err(|error| format!("{error:#}")),
         None => Err("HopeA3 is not running".into()),
     }
 }
 
-/// Clear CiA402 faults on all three HopeA3 motors (best-effort). Useful before
+/// Clear HexMeow faults on all three HopeA3 motors. Useful before
 /// starting if a previous run left them in a heartbeat-lost / fault state.
 #[tauri::command]
 pub async fn hopea3_clear_errors(state: State<'_, AppState>) -> CmdResult<()> {
-    let mgr = manager(&state).await?;
-    crate::hopea3::clear_errors(&mgr).await;
-    Ok(())
+    let _extension_op = state.extension_op.lock().await;
+    if state.hopea3.lock().await.is_some() {
+        return Err("stop HopeA3 before clearing all motor errors".into());
+    }
+    let mgr = meow_manager(&state).await?;
+    crate::hopea3::clear_errors(&mgr).await.map_err(err)
 }
 
 /// Set chassis acceleration (slew-rate) limits. `0` = unlimited. Linear is m/s²

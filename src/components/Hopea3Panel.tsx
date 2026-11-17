@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   App as AntdApp,
+  Alert,
   Button,
   InputNumber,
   Space,
@@ -32,8 +33,12 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
   const [running, setRunning] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [reinitNid, setReinitNid] = useState<number | null>(null);
   const [initProg, setInitProg] = useState<{ current: number; total: number; attempt: number } | null>(null);
   const [state, setState] = useState<Hopea3State | null>(null);
+  const canDrive = connected && running && !!state?.running && !state.fault
+    && !starting && !stopping && reinitNid === null;
 
   // Limits + torque (applied on button).
   const [maxLinear, setMaxLinear] = useState(3);
@@ -52,15 +57,16 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
   const [odomViewVersion, setOdomViewVersion] = useState(0);
 
-  // Poll backend state while running.
+  // Keep a failed-stop session visible so confirmed disable can be retried.
   useEffect(() => {
-    if (!running) return;
+    if (!connected) return;
     let alive = true;
     const tick = async () => {
       try {
         const s = await api.hopea3GetState();
         if (!alive) return;
         setState(s);
+        setRunning(s.running || !!s.fault);
       } catch {
         /* transient */
       }
@@ -71,7 +77,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       alive = false;
       window.clearInterval(h);
     };
-  }, [running]);
+  }, [connected]);
 
   // While starting, poll init progress so the user sees which motor is going.
   useEffect(() => {
@@ -108,13 +114,17 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
   }, [message, t]);
 
   const stop = useCallback(async () => {
+    setStopping(true);
     try {
       await api.hopea3Stop();
+      setRunning(false);
+      setState(null);
     } catch (e) {
+      setState(current => current ? { ...current, running: false, fault: errMsg(e) } : current);
       message.error(errMsg(e));
+    } finally {
+      setStopping(false);
     }
-    setRunning(false);
-    setState(null);
   }, [message]);
 
   // If the bus disconnects under us, drop back to the stopped view.
@@ -139,7 +149,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
 
   // Keyboard key tracking (WASD/QE), only while running and not typing in a field.
   useEffect(() => {
-    if (!running || !keyboardEnabled) {
+    if (!canDrive || !keyboardEnabled) {
       keysDown.current.clear();
       return;
     }
@@ -164,12 +174,15 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       window.removeEventListener("blur", onBlur);
       keysDown.current.clear();
     };
-  }, [running, keyboardEnabled]);
+  }, [canDrive, keyboardEnabled]);
 
   // Manual-input loop: gamepad takes priority over keyboard; releasing all
   // input sends one zero then yields the command back to the pointer controls.
   useEffect(() => {
-    if (!running) return;
+    if (!canDrive) {
+      manualWasActive.current = false;
+      return;
+    }
     const h = window.setInterval(() => {
       const gp = readGamepad(manualLinear, manualAngular);
       const kb = keyboardEnabled ? readKeyboard(keysDown.current, manualLinear, manualAngular) : null;
@@ -183,7 +196,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       }
     }, MANUAL_MS);
     return () => window.clearInterval(h);
-  }, [running, keyboardEnabled, manualLinear, manualAngular, cmd, stopMotion]);
+  }, [canDrive, keyboardEnabled, manualLinear, manualAngular, cmd, stopMotion]);
 
   const clearErrors = useCallback(async () => {
     try {
@@ -194,7 +207,6 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
     }
   }, [message, t]);
 
-  const [reinitNid, setReinitNid] = useState<number | null>(null);
   const reinitMotor = useCallback(async (nid: number) => {
     setReinitNid(nid);
     try {
@@ -224,15 +236,14 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
     }
   };
   const applyKd = async (next: [number, number, number]) => {
-    setKd(next);
     try {
       await api.hopea3SetKd(next);
+      setKd(next);
     } catch (e) {
       message.error(errMsg(e));
     }
   };
 
-  const canDrive = connected && running;
   const startLabel = starting
     ? initProg
       ? `${t("hopeStarting")} ${initProg.current}/${initProg.total}${initProg.attempt > 1 ? ` (#${initProg.attempt})` : ""}`
@@ -244,6 +255,7 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
       <section className="hope-start-panel zenoh-connect-panel">
         <div className="hope-start-panel__copy">
           <Typography.Text strong>{t("hopeStart")}</Typography.Text>
+          <Tag color="blue">HexMeow</Tag>
           <Typography.Text type="secondary">
             {connected ? t("hopeStartHint") : t("hopeNeedConnect")}
           </Typography.Text>
@@ -254,11 +266,11 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
               {startLabel}
             </Button>
           ) : (
-            <Button danger onClick={stop}>
+            <Button danger loading={stopping} disabled={reinitNid !== null} onClick={stop}>
               {t("hopeStop")}
             </Button>
           )}
-          <Button disabled={!connected || running} onClick={clearErrors}>{t("hopeClearErrors")}</Button>
+          <Button disabled={!connected || running || starting} onClick={clearErrors}>{t("hopeClearErrors")}</Button>
         </div>
         {starting && initProg && (
           <div className="hope-start-panel__progress">
@@ -266,6 +278,8 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
           </div>
         )}
       </section>
+
+      {state?.fault && <Alert type="error" showIcon message={state.fault} />}
 
       <div className="zenoh-dashboard hope-dashboard">
         <section className="zenoh-card hope-drive">
@@ -438,7 +452,8 @@ export function Hopea3Panel({ connected }: { connected: boolean }) {
               <Typography.Text type="secondary">{state?.motors?.length ?? 0} motors</Typography.Text>
             </div>
           </div>
-          <MotorTable motors={state?.motors ?? []} t={t} onReinit={reinitMotor} busyNid={reinitNid} disabled={!canDrive} />
+          <MotorTable motors={state?.motors ?? []} t={t} onReinit={reinitMotor} busyNid={reinitNid}
+            disabled={!connected || !state?.running || starting || stopping || reinitNid !== null} />
         </div>
       </section>
     </div>

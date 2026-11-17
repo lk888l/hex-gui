@@ -1,4 +1,4 @@
-//! Motor Control App 使用的出厂力矩系数（`0x4001` v1）。
+//! Motor Control 与 HopeA3 使用的出厂力矩系数（`0x4001` v1）。
 //!
 //! 这里只回答一个问题：**这台电机的 `torque_factor` 是多少**。它与 Product
 //! Authenticity APP 的职责严格分开 —— 那边回答"来源是否可信"并且会联网；这边只做
@@ -129,7 +129,18 @@ pub(crate) async fn refresh(
         Ok(epoch) => epoch,
         Err(detail) => return MeowTorqueFactorView::Unavailable { detail },
     };
-    let view = match manager.read_factory_calibration(node_id).await {
+    let view = read(manager, node_id).await;
+    state
+        .meow_calibration
+        .store(node_id, epoch, view.clone())
+        .await;
+    view
+}
+
+/// Shared interpretation for applications that keep their own session-bound
+/// calibration snapshot. A failed read must never become a neutral factor.
+pub(crate) async fn read(manager: &MeowMotorManager, node_id: u8) -> MeowTorqueFactorView {
+    match manager.read_factory_calibration(node_id).await {
         Ok(MeowFactoryCalibration::Valid(v1)) => {
             let factor = v1.torque.factor;
             if !factor.is_finite() || factor <= 0.0 {
@@ -150,12 +161,7 @@ pub(crate) async fn refresh(
         Err(error) => MeowTorqueFactorView::Unavailable {
             detail: error.to_string(),
         },
-    };
-    state
-        .meow_calibration
-        .store(node_id, epoch, view.clone())
-        .await;
-    view
+    }
 }
 
 /// 快照轮询使用：只查缓存，永远不做 SDO I/O。

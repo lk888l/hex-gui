@@ -122,6 +122,8 @@ pub struct AppState {
     /// Live init progress for the UI to poll while `hopea3_start` runs. A `std`
     /// mutex: only short, await-free updates happen under it.
     pub hopea3_init: StdMutex<InitProgress>,
+    /// Combined MHF5010 / HopeA3 app, owning separate Classic CAN and CAN-FD links.
+    pub pull_cord: crate::pull_cord_app::PullCordApp,
     /// Direct-CANopen lift debug session. It owns heartbeat/TPDO subscriptions
     /// and the velocity watchdog stream for exactly one lift node.
     pub lift: Mutex<Option<Arc<LiftSession>>>,

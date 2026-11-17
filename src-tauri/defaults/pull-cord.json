@@ -1,0 +1,61 @@
+{
+  "drum_radius_m": 0.026,
+  "cord_total_length_m": 3.0,
+  "retract_positive": false,
+  "a1_current": {
+    "homing_raw": 400,
+    "near_raw": 150,
+    "alert_raw": 600,
+    "max_raw": 2048,
+    "full_current_raw": 2048
+  },
+  "a2_speed": {
+    "homing_raw": 200,
+    "near_raw": 150,
+    "payout_raw": 100,
+    "retract_raw": 200,
+    "alert_raw": 200,
+    "max_raw": 300,
+    "full_torque_raw": 2048,
+    "speed_kp": 20,
+    "speed_ki": 0,
+    "speed_kd": 0,
+    "speed_ramp_dps2": 2500
+  },
+  "spring_compensation": {
+    "enabled": false,
+    "stiffness_nm_per_rad": 0.001247884615384615,
+    "preload_length_m": 0.52,
+    "gain": 1.0,
+    "alert_scale": 0.3,
+    "max_torque_nm": 0.2,
+    "slew_rate_nm_s": 0.5
+  },
+  "friction_compensation": {
+    "mode": "off",
+    "use_factory_calibration": true,
+    "static_ratio": 0.6,
+    "kinetic_ratio": 0.8,
+    "transition_speed_m_s": 0.01,
+    "max_torque_nm": 0.15,
+    "slew_rate_nm_s": 0.5,
+    "origin_fade_m": 0.03
+  },
+  "homing_torque_nm": 0.3,
+  "homing_speed_m_s": 2.0,
+  "homing_stall_speed_m_s": 0.02,
+  "homing_stall_hold_ms": 600,
+  "homing_timeout_s": 20.0,
+  "zone_near_end_m": 1.8,
+  "zone_alert_start_m": 2.706122448979592,
+  "torque_near_nm": 0.25,
+  "torque_alert_nm": 0.4,
+  "retract_boost_torque_nm": 0.53,
+  "zero_friction_assist_nm": 0.0,
+  "alert_pulse_hz": 2.0,
+  "alert_duty": 0.35,
+  "alert_pulse_nm": 0.0,
+  "kd_nm_per_rev_per_s": 2.0,
+  "retract_speed_m_s": 2.0,
+  "max_torque_permille": 1000
+}

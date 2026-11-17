@@ -16,6 +16,7 @@ use can_transport::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanOwner {
     Manager,
+    PullCord,
     Analyzer,
     DfuDiscovery,
     DfuUpdate,
@@ -25,6 +26,7 @@ impl fmt::Display for CanOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Manager => "the normal CAN session",
+            Self::PullCord => "Pull Cord Control",
             Self::Analyzer => "CAN Analyzer",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
@@ -52,6 +54,7 @@ struct ActiveLease {
     owner: CanOwner,
     phase: LeasePhase,
     generation: u64,
+    holders: usize,
 }
 
 #[derive(Debug, Default)]
@@ -67,8 +70,27 @@ pub struct CanTransportGate {
 
 impl CanTransportGate {
     pub fn try_acquire(&self, owner: CanOwner) -> Result<CanLease, String> {
+        self.acquire(owner, false)
+    }
+
+    /// The combined pull-cord application opens distinct Classic and FD
+    /// channels under one exclusive application owner. Its lifecycle mutex
+    /// and canonical interface checks prevent opening the same channel twice.
+    pub fn try_acquire_pull_channel(&self) -> Result<CanLease, String> {
+        self.acquire(CanOwner::PullCord, true)
+    }
+
+    fn acquire(&self, owner: CanOwner, grouped: bool) -> Result<CanLease, String> {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(active) = state.active {
+        if let Some(active) = state.active.as_mut() {
+            if grouped && active.owner == CanOwner::PullCord {
+                active.holders += 1;
+                return Ok(CanLease {
+                    inner: self.inner.clone(),
+                    owner,
+                    generation: active.generation,
+                });
+            }
             return Err(format!(
                 "cannot open {owner}: {} is already {}",
                 active.owner, active.phase
@@ -83,6 +105,7 @@ impl CanTransportGate {
             owner,
             phase: LeasePhase::Opening,
             generation,
+            holders: 1,
         });
         Ok(CanLease {
             inner: self.inner.clone(),
@@ -138,7 +161,11 @@ impl Drop for CanLease {
         if state.active.is_some_and(|active| {
             active.owner == self.owner && active.generation == self.generation
         }) {
-            state.active = None;
+            let active = state.active.as_mut().unwrap();
+            active.holders -= 1;
+            if active.holders == 0 {
+                state.active = None;
+            }
         }
     }
 }
@@ -218,6 +245,18 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn pull_channels_keep_exclusive_ownership_until_both_release() {
+        let gate = CanTransportGate::default();
+        let cord = gate.try_acquire_pull_channel().unwrap();
+        let chassis = gate.try_acquire_pull_channel().unwrap();
+        assert!(gate.try_acquire(CanOwner::Manager).is_err());
+        drop(cord);
+        assert!(gate.try_acquire(CanOwner::DfuUpdate).is_err());
+        drop(chassis);
+        assert!(gate.try_acquire(CanOwner::Manager).is_ok());
+    }
 
     struct TestBus;
     struct TestRx;
@@ -314,9 +353,31 @@ mod tests {
         assert_eq!(gate.active(), Some((CanOwner::DfuUpdate, "held")));
         assert!(gate.try_acquire(CanOwner::Manager).is_err());
         assert!(gate.try_acquire(CanOwner::Analyzer).is_err());
+        assert!(gate.try_acquire(CanOwner::PullCord).is_err());
 
         drop(permit);
         assert_eq!(gate.active(), None);
+    }
+
+    #[test]
+    fn pull_cord_excludes_other_apps_and_dfu_until_confirmed_disconnect() {
+        let gate = CanTransportGate::default();
+        let bus = hold_open_bus(
+            Arc::new(TestBus),
+            gate.try_acquire(CanOwner::PullCord).unwrap(),
+        )
+        .unwrap();
+        for owner in [
+            CanOwner::Manager,
+            CanOwner::Analyzer,
+            CanOwner::DfuDiscovery,
+            CanOwner::DfuUpdate,
+            CanOwner::PullCord,
+        ] {
+            assert!(gate.try_acquire(owner).is_err());
+        }
+        drop(bus);
+        assert!(gate.try_acquire(CanOwner::Manager).is_ok());
     }
 
     #[test]

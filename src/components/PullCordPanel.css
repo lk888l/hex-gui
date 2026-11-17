@@ -1,0 +1,27 @@
+.pull-cord-panel { width: 100%; max-width: 1440px; margin: 0 auto; }
+.pull-cord-settings { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.pull-cord-panel .ant-card { border-radius: 14px; }
+.pull-cord-panel .ant-descriptions-item-content { font-variant-numeric: tabular-nums; }
+@media (max-width: 1100px) { .pull-cord-settings { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 800px) { .pull-cord-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 540px) { .pull-cord-settings { grid-template-columns: 1fr; } }
+.pull-chassis-grid,
+.pull-chassis .simulator-calibration-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.pull-chassis-field,
+.pull-chassis .simulator-calibration-row > label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pull-chassis-field .ant-input-number,
+.pull-chassis .simulator-calibration-row .ant-input-number { width: 100%; }
+.pull-chassis .simulator-wide-control { grid-column: 1 / -1; }
+.pull-chassis { width: 100%; min-width: 0; }
+.pull-chassis .ant-alert { margin-bottom: 10px; }

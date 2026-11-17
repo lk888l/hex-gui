@@ -723,6 +723,7 @@ export interface Hopea3State {
   max_angular: number;
   motors: Hopea3Motor[];
   running: boolean;
+  fault: string | null;
 }
 
 export interface LiftCommissionView {

@@ -371,6 +371,43 @@ export const TUTORIALS: Record<string, Slide[]> = {
   control: CONTROL_SLIDES,
   settings: SETTINGS_SLIDES,
   hopea3: placeholderSlides("hopea3"),
+  pullCord: [
+    {
+      title: { en: "1 · Connect Classic CAN", zh: "1 · 连接经典 CAN" },
+      body: {
+        en: "Connect MHF5010 and the direction encoder to one Classic CAN 1 Mbps bus. Enter can1 (Linux, preconfigured with FD off) or gs_usb0 (USB-CAN). The default encoder node is decimal 16 (0x10), motor ID 1. Connecting only starts feedback monitoring.",
+        zh: "MHF5010 和方向编码器共用 1 Mbps 经典 CAN。填写 can1（Linux，预先配置并关闭 FD）或 gs_usb0（USB-CAN）。默认编码器节点十进制 16（0x10）、电机 ID 1。连接只开启反馈监测。",
+      },
+    },
+    {
+      title: { en: "2 · Start and home", zh: "2 · 启动与归零" },
+      body: {
+        en: "Check drum radius and retract direction, then select Start / home. The main-branch defaults use a 26 mm radius and negative retraction. Homing confirms zero after measured cord speed stays below 0.02 m/s for 600 ms. Stop if direction is incorrect.",
+        zh: "核对卷筒半径和收线方向后，点击“启动 / 归零”。主分支默认参数为 26 mm 半径、负向收线。实测线速绝对值低于 0.02 m/s 持续 600 ms 后确认零点。方向错误时立即停机。",
+      },
+    },
+    {
+      title: { en: "3 · Start chassis follow", zh: "3 · 启动底盘跟随" },
+      body: {
+        en: "Connect the HexMeow HopeA3 motors (21/22/23) on a separate CAN-FD interface, can0 or gs_usb1. After cord homing, select Live device and Start physical follow. Cord direction turns the body while it moves forward or backward. Behind/Ahead behavior, pace matching and retraction restart follow the reference project.",
+        zh: "将 HexMeow HopeA3 三电机（21/22/23）接入另一 CAN-FD 接口 can0 或 gs_usb1。拉线归零后，选择“实时设备”并“启动真机跟随”。方向偏角使车身转向，底盘前后行进；身后/身前、步速同步和收线重启行为对齐参考工程。",
+      },
+    },
+    {
+      title: { en: "4 · Manual input and stop", zh: "4 · 手动输入与停机" },
+      body: {
+        en: "Manual test arms at zero. Editing is draft-only; Apply manual input drives the real chassis until released or stopped. STOP / Esc disables all three chassis motors. Stopping or rehoming the cord also stops the chassis; feedback recovery never restarts it automatically.",
+        zh: "手动测试使能后保持零指令，编辑只修改草稿；点击“应用手动输入”才驱动真实底盘，保持到释放或停机。“立即停机 / Esc”失能三个底盘电机。停止拉线或重新归零也会停止底盘，恢复反馈不会自动重启。",
+      },
+    },
+    {
+      title: { en: "5 · Tune and save", zh: "5 · 调参与保存" },
+      body: {
+        en: "Apply to run updates the controller; Save locally stores the next-start template; Reset defaults only edits the draft. Compare confirmed global limit, A2 target and feedback current separately. Stop and close motor verifies the drive is closed. A failed close retains the session for retry.",
+        zh: "“应用到运行”更新控制器；“保存到本机”保存下次使用的模板；“恢复默认”只修改草稿。分别观察已确认全局限矩、A2 目标和电流反馈。“停机并关闭电机”会核对关闭状态，失败时保留会话供重试。",
+      },
+    },
+  ],
   lift: LIFT_SLIDES,
   smartknob: SMARTKNOB_SLIDES,
   zenoh: placeholderSlides("zenoh"),

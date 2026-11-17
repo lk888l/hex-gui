@@ -15,6 +15,7 @@ import { MotorFrictionCalibrationPanel } from "./components/MotorFrictionCalibra
 import { MotorTorqueCalibrationPanel } from "./components/MotorTorqueCalibrationPanel";
 import { MotorCalibrationUpdatePanel } from "./components/MotorCalibrationUpdatePanel";
 import { Hopea3Panel } from "./components/Hopea3Panel";
+import { PullCordPanel } from "./components/PullCordPanel";
 import { LiftPanel } from "./components/LiftPanel";
 import { SmartKnobPanel } from "./components/SmartKnobPanel";
 import RobotConsole from "./components/RobotConsole";
@@ -36,6 +37,7 @@ type Tool =
   | "control"
   | "settings"
   | "hopea3"
+  | "pullCord"
   | "lift"
   | "smartknob"
   | "zenoh"
@@ -213,6 +215,7 @@ export default function App() {
     control: { title: t("toolControl"), desc: t("toolControlDesc") },
     settings: { title: t("toolSettings"), desc: t("toolSettingsDesc") },
     hopea3: { title: t("toolHopeA3"), desc: t("toolHopeA3Desc") },
+    pullCord: { title: t("toolPullCord"), desc: t("toolPullCordDesc") },
     lift: { title: t("toolLift"), desc: t("toolLiftDesc") },
     smartknob: { title: t("toolSmartKnob"), desc: t("toolSmartKnobDesc") },
     zenoh: { title: t("toolBaseZenoh"), desc: t("toolBaseZenohDesc") },
@@ -243,6 +246,7 @@ export default function App() {
   // hopea3 / smartknob / zenoh / arm / canalyzer 都是整屏面板;zenoh/arm 走 Zenoh,
   // canalyzer 自带总线连接,都不使用顶栏的电机 ConnectBar。
   const showSidebar =
+    tool !== "pullCord" &&
     tool !== "console" &&
     tool !== "hopea3" &&
     tool !== "lift" &&
@@ -260,6 +264,7 @@ export default function App() {
     tool !== "damiao" &&
     tool !== "rollercanControl";
   const showConnectBar =
+    tool !== "pullCord" &&
     tool !== "console" &&
     tool !== "zenoh" &&
     tool !== "arm" &&
@@ -340,6 +345,8 @@ export default function App() {
             <RobotConsole />
           ) : tool === "hopea3" ? (
             <Hopea3Panel connected={connected} />
+          ) : tool === "pullCord" ? (
+            <PullCordPanel />
           ) : tool === "lift" ? (
             <LiftPanel connected={connected} />
           ) : tool === "smartknob" ? (
@@ -517,6 +524,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
             tag={t("tagMobileBase")}
             accent="orange"
             onClick={() => onPick("hopea3")}
+          />
+          <ToolCard
+            title={t("toolPullCord")}
+            desc={t("toolPullCordDesc")}
+            tag={t("tagHaptics")}
+            accent="blue"
+            onClick={() => onPick("pullCord")}
           />
           <ToolCard
             title={t("toolLift")}

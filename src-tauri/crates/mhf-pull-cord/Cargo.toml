@@ -1,0 +1,17 @@
+[package]
+name = "mhf-pull-cord"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+can-transport = { version = "0.1.3", default-features = false }
+magnetic-encoder = { path = "../magnetic-encoder" }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
+log = "0.4"
+
+[dev-dependencies]
+async-trait = "0.1"

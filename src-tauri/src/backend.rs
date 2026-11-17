@@ -555,7 +555,7 @@ fn socketcan_down_hint(state: Option<CanBusState>, name: &str) -> Option<String>
 /// Parse a gs_usb interface spec into a channel number, or `None` if `spec`
 /// is not a gs_usb spec. Accepts `gs_usb`, `gs_usb0`, `gs_usb1`, `gs_usb:1`,
 /// and the underscore-less `gsusb2` variants.
-fn gs_usb_channel(spec: &str) -> Option<u16> {
+pub(crate) fn gs_usb_channel(spec: &str) -> Option<u16> {
     let s = spec.trim().to_ascii_lowercase();
     let rest = s
         .strip_prefix("gs_usb")

@@ -1,0 +1,621 @@
+{
+  "cases": [
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.12,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.12,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 0.9,
+        "cordSpeedMps": 1.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.12,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.12,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.0,
+        "cordSpeedMps": 1.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.15000000000000002,
+        "encoder_error_deg": 20.0,
+        "linear_mps": 0.15000000000000002,
+        "steering_angle_deg": 200.0
+      },
+      "input": {
+        "cordLengthM": 1.01,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 20
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.15000000000000002,
+        "encoder_error_deg": 20.0,
+        "linear_mps": 0.15000000000000002,
+        "steering_angle_deg": 200.0
+      },
+      "input": {
+        "cordLengthM": 1.05,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 20
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.06666666666666664,
+        "encoder_error_deg": 30.0,
+        "linear_mps": 0.06666666666666664,
+        "steering_angle_deg": 210.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": -2.0,
+        "encoderAngleDeg": 30
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": 45.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 225.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 45
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": 65.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 245.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 65
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": 90.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 270.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 90
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": -180.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 0.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 180
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.041039999999999986,
+        "encoder_error_deg": -1.0,
+        "linear_mps": 0.041039999999999986,
+        "steering_angle_deg": 179.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 359
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": true,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 45.0,
+        "linear_mps": 0.2,
+        "steering_angle_deg": 225.0
+      },
+      "input": {
+        "cordLengthM": 1.1,
+        "cordSpeedMps": -1.0,
+        "encoderAngleDeg": 45
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 0.9,
+        "cordSpeedMps": 1.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.0,
+        "cordSpeedMps": 1.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.009000000000000008,
+        "encoder_error_deg": 20.0,
+        "linear_mps": -0.009000000000000008,
+        "steering_angle_deg": 200.0
+      },
+      "input": {
+        "cordLengthM": 1.01,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 20
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.04500000000000004,
+        "encoder_error_deg": 20.0,
+        "linear_mps": -0.04500000000000004,
+        "steering_angle_deg": 200.0
+      },
+      "input": {
+        "cordLengthM": 1.05,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 20
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 30.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 210.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": -2.0,
+        "encoderAngleDeg": 30
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 0.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 0
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 45.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 225.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 45
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 65.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 245.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 65
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 90.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 270.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 90
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": -180.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 0.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 180
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": -1.0,
+        "linear_mps": -0.2,
+        "steering_angle_deg": 179.0
+      },
+      "input": {
+        "cordLengthM": 1.6,
+        "cordSpeedMps": 0.1,
+        "encoderAngleDeg": 359
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": true,
+      "expected": {
+        "speed_mps": -0.1,
+        "encoder_error_deg": 45.0,
+        "linear_mps": 0.1,
+        "steering_angle_deg": 225.0
+      },
+      "input": {
+        "cordLengthM": 1.1,
+        "cordSpeedMps": -1.0,
+        "encoderAngleDeg": 45
+      },
+      "mode": "ahead"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.8,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 2.2,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.08999999999999968,
+        "encoder_error_deg": 0.0,
+        "linear_mps": -0.08999999999999968,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 2.3,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.2,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.2,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": -0.12,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.17,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.17,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": -0.06,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.15000000000000002,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.15000000000000002,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": -0.02,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.15000000000000002,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.15000000000000002,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": 0.0,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.15000000000000002,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.15000000000000002,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": 0.02,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.13499999999999998,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.13499999999999998,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": 0.07,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.12,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.12,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.2,
+        "cordSpeedMps": 0.12,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0003333333333333706,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0003333333333333706,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.799,
+        "cordSpeedMps": -0.12,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    },
+    {
+      "allowReverse": false,
+      "expected": {
+        "speed_mps": 0.0,
+        "encoder_error_deg": 0.0,
+        "linear_mps": 0.0,
+        "steering_angle_deg": 180.0
+      },
+      "input": {
+        "cordLengthM": 1.8,
+        "cordSpeedMps": -0.12,
+        "encoderAngleDeg": 0
+      },
+      "mode": "behind"
+    }
+  ],
+  "defaults": {
+    "follow": {
+      "allowReverse": false,
+      "behindAheadSwitchCordLengthM": 2.2,
+      "behindSpeed": {
+        "adaptiveAccelerationMps2": 1.2,
+        "adaptiveDecelerationMps2": 1.2,
+        "adaptiveEnabled": true,
+        "adaptiveGain": 2.0,
+        "decelerationMps2": 0.3,
+        "enabled": true,
+        "filterMs": 120.0,
+        "neutralBoostRatio": 0.15,
+        "payoutAccelerationMps2": 0.1,
+        "payoutBlendMps": 0.1,
+        "payoutSpeedRatio": 0.6,
+        "payoutStopConfirmMs": 40.0,
+        "payoutStopDecelerationMps2": 1.2,
+        "payoutStopEnabled": true,
+        "payoutStopMinPayoutM": 0.02,
+        "payoutStopSpeedMps": 0.5,
+        "pullBackAccelerationGain": 2.0,
+        "pullBackAccelerationMps2": 1.2,
+        "pullBackDecelerationMps2": 0.8,
+        "pullBackLengthGain": 2.0,
+        "pullBackMinRetractM": 0.01,
+        "responseAccelerationMps2": 0.3,
+        "retractGain": 0.5,
+        "speedDeadbandMps": 0.02,
+        "stopDecelerationMps2": 1.5,
+        "switchDecelerationMps2": 3
+      },
+      "behindStartCordLengthM": 0.75,
+      "behindStopCordLengthM": 1.8,
+      "behindTargetCordLengthM": 1.2,
+      "cordSpeedFeedforward": 0.45,
+      "directionDeadbandDeg": 0.0,
+      "encoderCenterDeg": 0.0,
+      "lengthGainPerS": 0.9,
+      "maxReverseSpeedMps": 0.1,
+      "maxSpeedMps": 0.2,
+      "pace": {
+        "accelerationMps2": 1.0,
+        "decelerationMps2": 1.2,
+        "enabled": true,
+        "filterMs": 250.0,
+        "lengthDeadbandM": 0.04,
+        "lengthGainPerS": 0.6,
+        "maxCorrectionMps": 0.12,
+        "stopMarginM": 0.5,
+        "targetLengthM": 0.68
+      },
+      "smoothingMs": 180.0,
+      "startCordLengthM": 1
+    },
+    "mode": "behind",
+    "source": "live",
+    "cord_exit_side": "driven_axle",
+    "wheelbase_m": 0.49917,
+    "max_wheel_speed_mps": 0.2,
+    "acceleration_mps2": 0.3,
+    "drive_node_id": 1,
+    "steering_node_id": 2,
+    "drive_inverted": false,
+    "steering_inverted": false,
+    "wheel_diameter_m": 0.12,
+    "gear_ratio": 1.0,
+    "drive_max_torque_nm": 3,
+    "steering_max_torque_nm": 3,
+    "drive_overcurrent_ratio": 0.8,
+    "steering_overcurrent_ratio": 0.8,
+    "drive_imax_a": 0,
+    "steering_imax_a": 0,
+    "steering_driver": null,
+    "steering_speed_at_rest_rad_s": 1.0471975511965976,
+    "steering_speed_at_full_speed_rad_s": 1.0471975511965976
+  }
+}

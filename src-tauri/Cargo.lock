@@ -1870,7 +1870,9 @@ dependencies = [
  "hpm-usb-dfu",
  "if-addrs",
  "log",
+ "magnetic-encoder",
  "mdns-sd",
+ "mhf-pull-cord",
  "motor-img-release",
  "nusb",
  "p256",
@@ -2658,6 +2660,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetic-encoder"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "can-transport",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2709,6 +2721,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mhf-pull-cord"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "can-transport",
+ "log",
+ "magnetic-encoder",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ mod diag;
 mod dto;
 mod friction_calibration;
 mod hopea3;
+mod pull_cord_app;
 mod hpm_dfu;
 mod hpm_v3_can;
 mod hpm_can_profiles;
@@ -165,6 +166,7 @@ fn begin_extension_safe_shutdown<R: tauri::Runtime>(
         .state::<AppState>()
         .shutdown_requested
         .store(true, Ordering::SeqCst);
+    app_handle.state::<AppState>().pull_cord.request_stop();
 
     let app_handle = app_handle.clone();
     let phase = phase.clone();
@@ -244,6 +246,26 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            pull_cord_app::pull_cord_connect,
+            pull_cord_app::pull_cord_disconnect,
+            pull_cord_app::pull_cord_status,
+            pull_cord_app::pull_cord_start,
+            pull_cord_app::pull_cord_stop,
+            pull_cord_app::pull_cord_rehome,
+            pull_cord_app::pull_cord_set_config,
+            pull_cord_app::pull_cord_default_config,
+            pull_cord_app::pull_cord_settings_get,
+            pull_cord_app::pull_cord_settings_save,
+            pull_cord_app::pull_cord_encoder_zero,
+            pull_cord_app::pull_chassis_connect,
+            pull_cord_app::pull_chassis_disconnect,
+            pull_cord_app::pull_chassis_start,
+            pull_cord_app::pull_chassis_stop,
+            pull_cord_app::pull_chassis_set_manual,
+            pull_cord_app::pull_chassis_set_config,
+            pull_cord_app::pull_chassis_default_config,
+            pull_cord_app::pull_chassis_settings_get,
+            pull_cord_app::pull_chassis_settings_save,
             commands::connect,
             commands::disconnect,
             commands::is_connected,

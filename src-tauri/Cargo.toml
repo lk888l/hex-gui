@@ -18,6 +18,8 @@ members = [
     "crates/image-container",
     "crates/mcu-series",
     "crates/od-consts",
+    "crates/mhf-pull-cord",
+    "crates/magnetic-encoder",
 ]
 resolver = "2"
 
@@ -48,6 +50,8 @@ getrandom = "0.3"
 chrono = "0.4"
 # Published driver with 3525 support and protocol-aware position presets.
 hex-motor = "0.3.2"
+mhf-pull-cord = { path = "crates/mhf-pull-cord" }
+magnetic-encoder = { path = "crates/magnetic-encoder" }
 
 # Public, secret-free runtime for the current HPM USB Bootloader. It owns the
 # strict legacy profile/package parser and flash state machine; the Tauri

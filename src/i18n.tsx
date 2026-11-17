@@ -504,9 +504,21 @@ const STRINGS = {
   tagAuthenticity: { en: "Verify & register", zh: "验证与注册" },
   tagQuickStart: { en: "Quick start", zh: "快速上手" },
   toolHopeA3: { en: "HopeA3(Raw Motor)", zh: "HopeA3(原始电机)" },
+  toolPullCord: { en: "Cord Follow (HopeA3)", zh: "拉线底盘（HopeA3）" },
+  toolPullCordDesc: {
+    en: "MHF5010 cord and direction encoder driving the HexMeow HopeA3 base: live follow, ahead guidance, pace matching and manual bench control.",
+    zh: "MHF5010 拉线与方向编码器驱动 HexMeow HopeA3 底盘：实时跟随、身前引导、步速同步和手动台架。",
+  },
+  chartLength: { en: "Length (m)", zh: "线长 (m)" },
+  chartRaw: { en: "Raw counts", zh: "原始值" },
+  chartTorqueLimit: { en: "A2 limit target", zh: "A2 帧内限矩目标" },
+  chartGlobalTorqueLimit: { en: "Confirmed global limit", zh: "已确认全局限矩" },
+  chartCurrentFeedback: { en: "Current feedback", zh: "电流反馈" },
+  chartSpeed: { en: "Speed (m/s)", zh: "速度 (m/s)" },
+  chartTargetSpeed: { en: "Target speed (m/s)", zh: "目标速度 (m/s)" },
   toolHopeA3Desc: {
-    en: "Triple-omni mobile base: 3 motors, 500 Hz uncompressed-MIT velocity control over one shared CAN-FD RPDO + live odometry.",
-    zh: "三全向轮移动底盘：3 电机，单帧共享 CAN-FD RPDO 的 500 Hz 非压缩 MIT 速度控制 + 实时里程计。",
+    en: "Triple-omni mobile base with 3 HexMeow motors, 500 Hz MIT velocity control and live odometry.",
+    zh: "三全向轮移动底盘：3 台 HexMeow 电机，500 Hz MIT 速度控制与实时里程计。",
   },
   toolSmartKnob: { en: "SmartKnob", zh: "智能旋钮" },
   toolSmartKnobDesc: {

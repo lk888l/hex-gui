@@ -2,11 +2,11 @@
 //!
 //! Unlike Direct Control (discover unknown motors, drive each over SDO), a
 //! Robot Application has a *fixed* motor count and layout, so it can use PDO
-//! for control. HopeA3 drives all three HEX motors in **uncompressed MIT** mode
+//! for control. HopeA3 drives all three HexMeow motors in **uncompressed MIT** mode
 //! used as a direct velocity loop: with KP=0 and PDES unused, the motor's torque
 //! law reduces to `τ = KD·(VDES − v) + TFF`, clamped by max torque — no profile
 //! ramp (which is why this replaced PV). Each motor's **RPDO1** maps its MIT
-//! velocity `0x2003:02` (f32 rev/s) + KD `0x2003:05` (u16) + max torque `0x6072`
+//! velocity `0x4102:02` (f32 rev/s) + KD `0x4102:05` (u16) + max torque `0x4572`
 //! (u16, ‰). The master streams targets at **500 Hz** as **one shared CAN-FD
 //! frame** that all three motors receive — each reads its own 8-byte slice, the
 //! other slices are consumed by placeholder mappings. This mirrors the
@@ -23,14 +23,18 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use can_transport::CanFrame;
+use anyhow::{bail, Context};
+use can_transport::{CanBus, CanFrame};
 use hex_motor::canopen::rpdo_config::{build_rpdo_config_writes, RpdoRecipe};
 use hex_motor::canopen::sdo;
 use hex_motor::canopen::tpdo_config::TpdoEntry;
-use hex_motor::cia402::{Cia402Manager, Logic};
-use hex_motor::types::MotorMode;
+use hex_motor::cia402::PdoProfile;
+use hex_motor::meow_motor::{
+    MeowMitTarget, MeowMotorCanSettingsStatus, MeowMotorLifecycle, MeowMotorLiveState,
+    MeowMotorLogic, MeowMotorManager, MeowMotorMode, MeowMotorTarget,
+};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
@@ -39,7 +43,7 @@ use tokio::task::JoinHandle;
 // NOTE: the 4310/4342 motors report **and** accept velocity at the *output*
 // (post-gearbox) shaft — i.e. the wheel shaft — so the reduction ratio cancels
 // out of the kinematics entirely. The uncompressed-MIT velocity target
-// (`0x2003:02`) and feedback velocity are both wheel rev/s; no gear factor is
+// (`0x4102:02`) and feedback velocity are both wheel rev/s; no gear factor is
 // applied anywhere below.
 
 /// Wheel radius (m). Wheel diameter is 0.154 m.
@@ -54,7 +58,7 @@ const HOST_NODE_ID: u8 = 10;
 
 /// The three motors' Node-IDs, indexed the same as [`CONTACTS_M`]:
 /// `[motor1 (top-left), motor2 (bottom), motor3 (top-right)]`.
-const NODE_IDS: [u8; 3] = [21, 22, 23];
+pub(crate) const NODE_IDS: [u8; 3] = [21, 22, 23];
 
 /// Wheel ground-contact points in the chassis frame (ROS convention: +X
 /// forward toward the "head" = the motor-1↔motor-3 edge, +Y left, +Z up),
@@ -96,24 +100,21 @@ const SHARED_RPDO_COB_ID: u16 = 0x180 + HOST_NODE_ID as u16;
 const CONTROL_HZ: u64 = 500;
 
 /// Bytes per motor in the shared frame: uncompressed-MIT velocity
-/// `0x2003:02`(4) + KD `0x2003:05`(2) + max torque `0x6072`(2) = 8.
+/// `0x4102:02`(4) + KD `0x4102:05`(2) + max torque `0x4572`(2) = 8.
 const SLICE_LEN: usize = 8;
 
-/// Uncompressed-MIT control parameter object (`0x2003`). With KP=0 and PDES
-/// unused, torque = KD·(VDES − v) + TFF, clamped by max torque (`0x6072`) — a
+/// Uncompressed-MIT control parameter object (`0x4102`). With KP=0 and PDES
+/// unused, torque = KD·(VDES − v) + TFF, clamped by max torque (`0x4572`) — a
 /// direct velocity loop with no profile ramp (unlike PV).
-const OD_MIT: u16 = 0x2003;
-const MIT_SUB_PDES: u8 = 0x01; // f32 Rev      (position, unused → 0)
+const OD_MIT: u16 = 0x4102;
 const MIT_SUB_VDES: u8 = 0x02; // f32 Rev/s    (velocity target, streamed)
-const MIT_SUB_TFF: u8 = 0x03; // f32 Nm       (torque feedforward, → 0)
-const MIT_SUB_KP: u8 = 0x04; // u16 0..=10000 (position gain, → 0)
-const MIT_SUB_KD: u8 = 0x05; // u16 0..=10000 (velocity gain, streamed)
-const MIT_SUB_FACTOR: u8 = 0x07; // f32       (kp/kd phys→int divisor)
-const OD_MAX_TORQUE: u16 = 0x6072; // u16 ‰ of peak
+const MIT_SUB_KD: u8 = 0x05; // u16 0..=65535 (velocity gain, streamed)
+const OD_MAX_TORQUE: u16 = 0x4572; // u16 ‰ of raw peak torque
+const FEEDBACK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Placeholder mapping object for the bytes belonging to *other* motors. Using
-/// the vendor object the proven reference implementation uses (`0x3000:03`,
-/// 32-bit) rather than a CiA dummy, since the motor firmware is known to accept it.
+/// the same vendor filler as the SDK's HexMeow shared Host PDO (`0x3000:03`,
+/// 32-bit).
 /// One per 4 bytes ⇒ two per 8-byte slice.
 const PAD_ENTRY: TpdoEntry = TpdoEntry {
     index: 0x3000,
@@ -139,6 +140,9 @@ pub const DEFAULT_MAX_ANG_ACC: f64 = 6.0; // rad/s²
 
 #[derive(Clone, Copy)]
 struct Command {
+    /// Follow sessions refresh this in the native loop; standalone manual
+    /// control leaves it unset. An expired producer cannot retain wheel speed.
+    deadline: Option<Instant>,
     /// Body-frame twist (m/s, m/s, rad/s). Stored already clamped.
     vx: f64,
     vy: f64,
@@ -159,6 +163,7 @@ struct Command {
 impl Default for Command {
     fn default() -> Self {
         Self {
+            deadline: None,
             vx: 0.0,
             vy: 0.0,
             wz: 0.0,
@@ -191,6 +196,8 @@ pub struct Hopea3State {
     pub max_angular: f64,
     pub motors: Vec<Hopea3Motor>,
     pub running: bool,
+    /// Motion is inhibited while feedback/mode is invalid or CAN sending fails.
+    pub fault: Option<String>,
 }
 
 /// Init progress, polled by the UI while `hopea3_start` runs.
@@ -241,7 +248,10 @@ impl Kinematics {
             (CONTACTS_M[0][0] + CONTACTS_M[1][0] + CONTACTS_M[2][0]) / 3.0,
             (CONTACTS_M[0][1] + CONTACTS_M[1][1] + CONTACTS_M[2][1]) / 3.0,
         ];
-        let origin = [centroid[0] + BODY_OFFSET_M[0], centroid[1] + BODY_OFFSET_M[1]];
+        let origin = [
+            centroid[0] + BODY_OFFSET_M[0],
+            centroid[1] + BODY_OFFSET_M[1],
+        ];
 
         let mut j = [[0.0f64; 3]; 3];
         for i in 0..3 {
@@ -260,7 +270,7 @@ impl Kinematics {
         Self { j, j_inv }
     }
 
-    /// Body twist → per-wheel velocity (output-shaft rev/s, = `0x60FF` target).
+    /// Body twist → per-wheel velocity (output-shaft rev/s, `0x4102:02`).
     fn twist_to_motor_rev_s(&self, vx: f64, vy: f64, wz: f64) -> [f64; 3] {
         let mut out = [0.0; 3];
         for i in 0..3 {
@@ -318,13 +328,22 @@ pub struct Hopea3 {
     cmd: Arc<StdMutex<Command>>,
     state: Arc<StdMutex<Hopea3State>>,
     running: Arc<AtomicBool>,
-    task: JoinHandle<()>,
-    // Kept for single-motor re-init while the chassis keeps running.
-    mgr: Arc<Cia402Manager>,
-    bus: Arc<dyn can_transport::CanBus>,
+    task: Option<JoinHandle<()>>,
+    mgr: Arc<MeowMotorManager>,
+    bus: Arc<dyn CanBus>,
     sdo_timeout: Option<Duration>,
-    /// Per-motor kp/kd factor, shared with the loop so re-init can update it.
-    kd_factor: Arc<StdMutex<[f32; 3]>>,
+    parameters: Arc<StdMutex<[MotorParameters; 3]>>,
+    reinitializing: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MotorParameters {
+    kd_factor: f32,
+    peak_torque_nm: Option<f32>,
+    torque_factor: f64,
+    session_epoch: u64,
+    nmt_revision: u64,
+    brs: bool,
 }
 
 /// How many times to attempt each motor's init before giving up. Motor init
@@ -333,21 +352,24 @@ pub struct Hopea3 {
 const INIT_ATTEMPTS: u8 = 3;
 
 impl Hopea3 {
-    /// Configure the three motors (init + RPDO mapping + PV mode + enable) and
-    /// start the 500 Hz control/odometry loop. The manager must already be
-    /// connected with heartbeat broadcast on. `progress` is updated in place so
+    /// Configure the three HexMeow motors (init + RPDO mapping + zero MIT target) and
+    /// start the 500 Hz control/odometry loop. The shared bus must already have
+    /// host-10 heartbeat broadcast on. `progress` is updated in place so
     /// the UI can show which motor is being initialized.
     pub async fn start(
-        mgr: Arc<Cia402Manager>,
+        mgr: Arc<MeowMotorManager>,
+        bus: Arc<dyn CanBus>,
+        sdo_timeout: Option<Duration>,
         progress: &StdMutex<InitProgress>,
+        shutdown: &AtomicBool,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bus.capabilities().fd && bus.capabilities().max_dlen >= 24,
+            "HopeA3 requires CAN-FD with a 24-byte shared PDO"
+        );
         let kin = Kinematics::new();
         let cmd = Arc::new(StdMutex::new(Command::default()));
         let state = Arc::new(StdMutex::new(Hopea3State::default()));
-
-        let sdo_timeout = Some(mgr.options().sdo_timeout);
-        let bus = mgr.bus();
-        let default_torque = cmd.lock().unwrap().max_torque;
 
         *progress.lock().unwrap() = InitProgress {
             active: true,
@@ -356,53 +378,71 @@ impl Hopea3 {
             attempt: 0,
         };
 
-        // Per-motor init, each retried up to INIT_ATTEMPTS times. Between
-        // attempts we clear faults and wait, since the most common failure is
-        // the firmware's phase-dependent heartbeat-fault clear.
-        let mut kd_factor = [1.0f32; 3];
-        for (slice, &nid) in NODE_IDS.iter().enumerate() {
-            let mut last_err = None;
-            for attempt in 1..=INIT_ATTEMPTS {
-                {
-                    let mut p = progress.lock().unwrap();
-                    p.current = (slice + 1) as u8;
-                    p.attempt = attempt;
-                }
-                match init_one_motor(&mgr, &bus, sdo_timeout, slice, nid, default_torque[slice]).await
-                {
-                    Ok(factor) => {
-                        log::info!("HopeA3: motor 0x{nid:02X} ready (slice {slice}, attempt {attempt}, kd_factor {factor})");
-                        kd_factor[slice] = factor;
-                        last_err = None;
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("HopeA3: motor 0x{nid:02X} init attempt {attempt}/{INIT_ATTEMPTS} failed: {e}");
-                        last_err = Some(e);
-                        let _ = mgr.clear_error(nid).await;
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                    }
-                }
+        // Retry transient per-motor failures. Each attempt uses SDK initialization
+        // to clear existing errors and confirm Disabled before configuring MIT.
+        let initialized = async {
+            let mut parameters = [MotorParameters::default(); 3];
+            for (slice, &nid) in NODE_IDS.iter().enumerate() {
+                parameters[slice] = init_with_retry(
+                    &mgr,
+                    &bus,
+                    sdo_timeout,
+                    slice,
+                    DEFAULT_KD_SI,
+                    shutdown,
+                    Some(progress),
+                )
+                .await
+                .with_context(|| format!("HexMeow motor 0x{nid:02X} initialization failed"))?;
             }
-            if let Some(e) = last_err {
-                progress.lock().unwrap().active = false;
-                return Err(e.context(format!("motor 0x{nid:02X} failed after {INIT_ATTEMPTS} attempts")));
-            }
+            check_shutdown(shutdown)?;
+            Ok::<_, anyhow::Error>(parameters)
         }
+        .await;
         progress.lock().unwrap().active = false;
+        let parameters = match initialized {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                // Every newly enabled motor still has KD=0, TFF=0 and max
+                // torque=0. Also disable all exact-identified chassis nodes.
+                let known: Vec<u8> = mgr
+                    .list()
+                    .iter()
+                    .filter(|info| NODE_IDS.contains(&info.node_id) && info.model.is_some())
+                    .map(|info| info.node_id)
+                    .collect();
+                if let Err(cleanup) = disable_motors(&mgr, &known).await {
+                    return Err(error.context(format!("startup rollback also failed: {cleanup}")));
+                }
+                return Err(error);
+            }
+        };
 
         // 2) Control + odometry loop.
-        let kd_factor = Arc::new(StdMutex::new(kd_factor));
+        let parameters = Arc::new(StdMutex::new(parameters));
+        let reinitializing = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        state.lock().unwrap().running = true;
         let task = {
             let mgr = mgr.clone();
             let bus = bus.clone();
-            let kd_factor = kd_factor.clone();
+            let parameters = parameters.clone();
+            let reinitializing = reinitializing.clone();
             let cmd = cmd.clone();
             let state = state.clone();
             let running = running.clone();
             tokio::spawn(async move {
-                control_loop(mgr, bus, kin, kd_factor, cmd, state, running).await;
+                control_loop(
+                    mgr,
+                    bus,
+                    kin,
+                    parameters,
+                    cmd,
+                    state,
+                    running,
+                    reinitializing,
+                )
+                .await;
             })
         };
 
@@ -410,46 +450,81 @@ impl Hopea3 {
             cmd,
             state,
             running,
-            task,
+            task: Some(task),
             mgr,
             bus,
             sdo_timeout,
-            kd_factor,
+            parameters,
+            reinitializing,
         })
     }
 
-    /// Re-initialize a single motor (e.g. one that faulted) while the chassis
-    /// keeps running. Clears its fault, re-runs the full per-motor init
-    /// (retried), and updates its kp/kd factor. The other motors are unaffected.
-    pub async fn reinit_motor(&self, nid: u8) -> anyhow::Result<()> {
+    /// Reinitialize one motor with all three wheels held at zero output.
+    /// Refresh calibration/session fences and discard the old motion command.
+    pub async fn reinit_motor(&self, nid: u8, shutdown: &AtomicBool) -> anyhow::Result<()> {
         let slice = NODE_IDS
             .iter()
             .position(|&n| n == nid)
             .ok_or_else(|| anyhow::anyhow!("nid 0x{nid:02X} is not a HopeA3 motor"))?;
-        let torque = self.cmd.lock().unwrap().max_torque[slice];
-
-        let mut last_err = None;
-        for attempt in 1..=INIT_ATTEMPTS {
-            let _ = self.mgr.clear_error(nid).await;
-            match init_one_motor(&self.mgr, &self.bus, self.sdo_timeout, slice, nid, torque).await {
-                Ok(factor) => {
-                    self.kd_factor.lock().unwrap()[slice] = factor;
-                    log::info!("HopeA3: re-init motor 0x{nid:02X} ok (attempt {attempt})");
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::warn!("HopeA3: re-init 0x{nid:02X} attempt {attempt}/{INIT_ATTEMPTS}: {e}");
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
+        anyhow::ensure!(
+            self.running.load(Ordering::SeqCst),
+            "stop HopeA3 before restarting"
+        );
+        self.reinitializing.store(true, Ordering::SeqCst);
+        let kd = {
+            let mut c = self.cmd.lock().unwrap();
+            c.vx = 0.0;
+            c.vy = 0.0;
+            c.wz = 0.0;
+            c.kd_si[slice]
+        };
+        let result = init_with_retry(
+            &self.mgr,
+            &self.bus,
+            self.sdo_timeout,
+            slice,
+            kd,
+            shutdown,
+            None,
+        )
+        .await;
+        let result = match result {
+            Ok(parameters) => {
+                self.parameters.lock().unwrap()[slice] = parameters;
+                Ok(())
             }
-        }
-        Err(last_err.unwrap().context(format!("re-init 0x{nid:02X} failed")))
+            Err(error) => match self.mgr.disable(nid).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("disable after failed re-init: {cleanup}")))
+                }
+            },
+        };
+        self.reinitializing.store(false, Ordering::SeqCst);
+        result
     }
 
     /// Update the commanded twist (clamped to the current limits, never errored).
     pub fn set_cmd(&self, vx: f64, vy: f64, wz: f64) {
+        self.update_command(vx, vy, wz, false);
+    }
+
+    pub fn set_follow_cmd(&self, vx: f64, vy: f64, wz: f64) {
+        self.update_command(vx, vy, wz, true);
+    }
+
+    fn update_command(&self, vx: f64, vy: f64, wz: f64, follow: bool) {
         let mut c = self.cmd.lock().unwrap();
+        if follow {
+            c.deadline = Some(Instant::now() + Duration::from_millis(150));
+        }
+        let (vx, vy, wz) = if self.reinitializing.load(Ordering::SeqCst)
+            || ![vx, vy, wz].iter().all(|v| v.is_finite())
+        {
+            (0.0, 0.0, 0.0)
+        } else {
+            (vx, vy, wz)
+        };
         let (vx, vy, wz) = clamp_twist(vx, vy, wz, c.max_linear, c.max_angular);
         c.vx = vx;
         c.vy = vy;
@@ -463,9 +538,14 @@ impl Hopea3 {
     }
 
     /// Update per-motor MIT velocity gain KD (SI, Nm·s/rad), streamed next tick.
-    pub fn set_kd(&self, kd_si: [f64; 3]) {
+    pub fn set_kd(&self, kd_si: [f64; 3]) -> anyhow::Result<()> {
+        let parameters = *self.parameters.lock().unwrap();
+        for i in 0..3 {
+            kd_to_raw(kd_si[i], parameters[i].kd_factor)?;
+        }
         let mut c = self.cmd.lock().unwrap();
-        c.kd_si = kd_si.map(|k| k.max(0.0));
+        c.kd_si = kd_si;
+        Ok(())
     }
 
     /// Update the acceleration (slew-rate) limits. `0` disables limiting for
@@ -500,34 +580,126 @@ impl Hopea3 {
     }
 
     /// Stop the loop, zero the targets and disable all motors.
-    pub async fn stop(self, mgr: &Cia402Manager) {
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
         self.running.store(false, Ordering::SeqCst);
-        let _ = self.task.await;
-        for &nid in &NODE_IDS {
-            if let Err(e) = mgr.disable(nid).await {
-                log::warn!("HopeA3: disable 0x{nid:02X} on stop: {e}");
+        if let Some(task) = self.task.take() {
+            if let Err(error) = task.await {
+                log::warn!("HopeA3: control task ended unexpectedly: {error}");
             }
         }
+        let brs = self.parameters.lock().unwrap().iter().all(|p| p.brs);
+        // Even if the task panicked or a previous stop failed, retry a zero
+        // frame before SDK-confirmed 0x4401=0 on every motor.
+        let _ = self
+            .bus
+            .send(shared_frame([0.0; 3], [0; 3], [0; 3], brs))
+            .await;
+        let result = disable_motors(&self.mgr, &NODE_IDS).await;
+        let mut state = self.state.lock().unwrap();
+        state.running = false;
+        state.cmd_vx = 0.0;
+        state.cmd_vy = 0.0;
+        state.cmd_wz = 0.0;
+        for motor in &mut state.motors {
+            motor.target_rev_per_s = 0.0;
+            if let Ok(live) = self.mgr.status(motor.node_id) {
+                motor.enabled = live.logic == Some(MeowMotorLogic::Enabled(MeowMotorMode::Mit));
+            }
+        }
+        state.fault = result
+            .as_ref()
+            .err()
+            .map(|error| format!("Stop failed: {error}; retry Stop"));
+        result
     }
 }
 
-/// Initialize a single motor for uncompressed-MIT velocity control: CiA402 init
-/// (TPDO1 + NMT Op + fault clear), overwrite RPDO1 with the shared-frame
-/// mapping, zero the static MIT params (PDES/KP/TFF — we only stream VDES + KD),
-/// read the kp/kd phys→int factor, set max torque, switch to MIT mode (which
-/// also enables). Returns the motor's `0x2003:07` factor (for KD conversion).
-/// One attempt; the caller retries.
-async fn init_one_motor(
-    mgr: &Cia402Manager,
-    bus: &Arc<dyn can_transport::CanBus>,
+impl Drop for Hopea3 {
+    fn drop(&mut self) {
+        // Never leave a detached task streaming motion after its owner goes away.
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+fn check_shutdown(shutdown: &AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !shutdown.load(Ordering::SeqCst),
+        "HopeA3 initialization cancelled by shutdown"
+    );
+    Ok(())
+}
+
+async fn init_with_retry(
+    mgr: &MeowMotorManager,
+    bus: &Arc<dyn CanBus>,
     sdo_timeout: Option<Duration>,
     slice: usize,
-    nid: u8,
-    max_torque: u16,
-) -> anyhow::Result<f32> {
-    mgr.initialize(nid)
+    kd_si: f64,
+    shutdown: &AtomicBool,
+    progress: Option<&StdMutex<InitProgress>>,
+) -> anyhow::Result<MotorParameters> {
+    let nid = NODE_IDS[slice];
+    for attempt in 1..=INIT_ATTEMPTS {
+        check_shutdown(shutdown)?;
+        if let Some(progress) = progress {
+            let mut p = progress.lock().unwrap();
+            p.current = (slice + 1) as u8;
+            p.attempt = attempt;
+        }
+        match init_one_motor(mgr, bus, sdo_timeout, slice, kd_si, shutdown).await {
+            Ok(parameters) => return Ok(parameters),
+            Err(error) => {
+                log::warn!("HopeA3: HexMeow 0x{nid:02X} init {attempt}/{INIT_ATTEMPTS}: {error:#}");
+                if attempt == INIT_ATTEMPTS || shutdown.load(Ordering::SeqCst) {
+                    return Err(error);
+                }
+                // initialize() itself clears errors and confirms Disabled.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// SDK identity/TPDO initialization stays shared with Motor Control. Only the
+/// application-specific RPDO1 layout and explicit uncompressed selector differ.
+async fn init_one_motor(
+    mgr: &MeowMotorManager,
+    bus: &Arc<dyn CanBus>,
+    sdo_timeout: Option<Duration>,
+    slice: usize,
+    kd_si: f64,
+    shutdown: &AtomicBool,
+) -> anyhow::Result<MotorParameters> {
+    let nid = NODE_IDS[slice];
+    mgr.identify(nid)
         .await
-        .map_err(|e| anyhow::anyhow!("initialize: {e}"))?;
+        .context("identify exact HexMeow 0x1018 identity")?;
+    check_shutdown(shutdown)?;
+    mgr.initialize(
+        nid,
+        PdoProfile::from_event_timer_ms((1000 / CONTROL_HZ) as u16)?,
+    )
+    .await
+    .context("HexMeow initialize")?;
+
+    let info = mgr
+        .list()
+        .into_iter()
+        .find(|info| info.node_id == nid)
+        .context("initialized HexMeow node disappeared")?;
+    let kd_factor = info
+        .mit_kp_kd_factor
+        .context("missing HexMeow 0x4102:07 Kp/Kd factor")?;
+    kd_to_raw(kd_si, kd_factor)?;
+    let calibration = crate::meow_calibration::read(mgr, nid).await;
+    let torque_factor = calibration
+        .applied_factor()
+        .with_context(|| format!("factory torque factor unavailable: {calibration:?}"))?;
+    let brs = match info.can_settings {
+        MeowMotorCanSettingsStatus::Available(settings) => settings.transmit_pdo_brs,
+        _ => bail!("HexMeow CAN settings unavailable"),
+    };
 
     let recipe = RpdoRecipe {
         rpdo_index: 0,
@@ -544,58 +716,101 @@ async fn init_one_motor(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Static MIT params: zero PDES / KP / TFF so torque = KD·(VDES − v).
-    sdo::download_f32(&**bus, nid, OD_MIT, MIT_SUB_PDES, 0.0, sdo_timeout)
+    // A previous compressed-MIT application may have left this selector at 1.
+    sdo::download(&**bus, nid, 0x4103, 1, &[0], sdo_timeout)
         .await
-        .map_err(|e| anyhow::anyhow!("zero PDES: {e}"))?;
-    sdo::download_u16(&**bus, nid, OD_MIT, MIT_SUB_KP as u8, 0, sdo_timeout)
+        .context("select uncompressed MIT")?;
+    mgr.set_max_torque(nid, 0)
         .await
-        .map_err(|e| anyhow::anyhow!("zero KP: {e}"))?;
-    sdo::download_f32(&**bus, nid, OD_MIT, MIT_SUB_TFF, 0.0, sdo_timeout)
-        .await
-        .map_err(|e| anyhow::anyhow!("zero TFF: {e}"))?;
-
-    // kp/kd phys→int divisor. Default to 1.0 if the motor doesn't expose it
-    // (KD can still be tuned by feel); log so it's visible.
-    let factor = match sdo::upload_f32(&**bus, nid, OD_MIT, MIT_SUB_FACTOR, sdo_timeout).await {
-        Ok(f) if f.is_finite() && f.abs() > f32::EPSILON => f,
-        other => {
-            log::warn!("HopeA3: motor 0x{nid:02X} kp/kd factor read = {other:?}; using 1.0");
-            1.0
-        }
-    };
-
-    mgr.set_max_torque(nid, max_torque)
-        .await
-        .map_err(|e| anyhow::anyhow!("set_max_torque: {e}"))?;
-    mgr.set_mode(nid, MotorMode::Mit)
-        .await
-        .map_err(|e| anyhow::anyhow!("set_mode MIT: {e}"))?;
-    Ok(factor)
+        .context("zero initial max torque")?;
+    check_shutdown(shutdown)?;
+    mgr.set_mode_sdo(
+        nid,
+        MeowMotorTarget::Mit(MeowMitTarget {
+            position_rev: 0.0,
+            velocity_rev_per_s: 0.0,
+            torque_nm: 0.0,
+            kp: 0,
+            kd: 0,
+            // The live global 0x4572 limit remains the per-wheel output limit.
+            kp_kd_limit_permille: 1000,
+        }),
+    )
+    .await
+    .context("enable HexMeow MIT with a zero target")?;
+    let live = mgr.status(nid)?;
+    anyhow::ensure!(
+        live.session_epoch == info.session_epoch,
+        "HexMeow session changed during init"
+    );
+    Ok(MotorParameters {
+        kd_factor,
+        peak_torque_nm: info.peak_torque_nm,
+        torque_factor,
+        session_epoch: live.session_epoch,
+        nmt_revision: live.nmt_revision,
+        brs,
+    })
 }
 
-/// Best-effort fault clear on all three motors (CiA402 fault reset, `0x6040 =
-/// 0x80`). Used before init and exposed as a manual "clear errors" action so the
-/// user doesn't have to switch to the Direct Control tool to recover a chassis
-/// that was left in a heartbeat-lost / fault state.
-pub async fn clear_errors(mgr: &Cia402Manager) {
+/// Exact identity precedes the HexMeow 0x4401 clear-error transaction.
+pub async fn clear_errors(mgr: &MeowMotorManager) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
     for &nid in &NODE_IDS {
-        if let Err(e) = mgr.clear_error(nid).await {
-            log::warn!("HopeA3: clear_error 0x{nid:02X}: {e}");
+        let result = async {
+            mgr.identify(nid).await?;
+            mgr.clear_error(nid).await
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!("0x{nid:02X}: {error}"));
         }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "HexMeow clear errors failed: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
+pub(crate) async fn disable_motors(mgr: &MeowMotorManager, nodes: &[u8]) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for &nid in nodes {
+        if let Err(error) = mgr.disable(nid).await {
+            failures.push(format!("0x{nid:02X}: {error}"));
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "HexMeow disable failed: {}",
+        failures.join("; ")
+    );
+    Ok(())
 }
 
 /// RPDO1 mapping entries for the motor occupying `slice` (0..3) of the shared
-/// frame: its own `[0x60FF/32, 0x6072/16, 0x6071/16]` at its offset, and two
+/// frame: its own `[0x4102:02/32, 0x4102:05/16, 0x4572:00/16]`, and two
 /// 32-bit placeholders for every other motor's 8-byte slice.
 fn rpdo_entries_for_slice(slice: usize) -> Vec<TpdoEntry> {
     let mut entries = Vec::with_capacity(3 + 4);
     for j in 0..3 {
         if j == slice {
-            entries.push(TpdoEntry { index: OD_MIT, subindex: MIT_SUB_VDES, bit_len: 32 }); // velocity
-            entries.push(TpdoEntry { index: OD_MIT, subindex: MIT_SUB_KD, bit_len: 16 }); // KD
-            entries.push(TpdoEntry { index: OD_MAX_TORQUE, subindex: 0, bit_len: 16 }); // max torque
+            entries.push(TpdoEntry {
+                index: OD_MIT,
+                subindex: MIT_SUB_VDES,
+                bit_len: 32,
+            }); // velocity
+            entries.push(TpdoEntry {
+                index: OD_MIT,
+                subindex: MIT_SUB_KD,
+                bit_len: 16,
+            }); // KD
+            entries.push(TpdoEntry {
+                index: OD_MAX_TORQUE,
+                subindex: 0,
+                bit_len: 16,
+            }); // max torque
         } else {
             entries.push(PAD_ENTRY);
             entries.push(PAD_ENTRY);
@@ -604,9 +819,80 @@ fn rpdo_entries_for_slice(slice: usize) -> Vec<TpdoEntry> {
     entries
 }
 
+/// Same SI-to-Rev/u16 conversion as Motor Control. Factory torque calibration
+/// does not rescale KP/KD or the raw-domain maximum-torque limit.
+fn kd_to_raw(kd_si: f64, factor: f32) -> anyhow::Result<u16> {
+    anyhow::ensure!(
+        factor.is_finite() && factor > 0.0,
+        "invalid HexMeow 0x4102:07 Kp/Kd factor: {factor}"
+    );
+    anyhow::ensure!(
+        kd_si.is_finite() && kd_si >= 0.0,
+        "KD must be finite and non-negative"
+    );
+    let raw = (kd_si * std::f64::consts::TAU / f64::from(factor)).round();
+    anyhow::ensure!(
+        raw <= f64::from(u16::MAX),
+        "KD exceeds this HexMeow motor's u16 range"
+    );
+    Ok(raw as u16)
+}
+
+fn shared_frame(targets: [f64; 3], kd: [u16; 3], max_torque: [u16; 3], brs: bool) -> CanFrame {
+    let mut data = [0u8; SLICE_LEN * 3];
+    for slice in 0..3 {
+        let off = slice * SLICE_LEN;
+        data[off..off + 4].copy_from_slice(&(targets[slice] as f32).to_le_bytes());
+        data[off + 4..off + 6].copy_from_slice(&kd[slice].to_le_bytes());
+        data[off + 6..off + 8].copy_from_slice(&max_torque[slice].to_le_bytes());
+    }
+    CanFrame::new_fd(SHARED_RPDO_COB_ID, &data, brs).expect("fixed 24-byte HopeA3 CAN-FD frame")
+}
+
+fn feedback_error(live: &MeowMotorLiveState, parameters: MotorParameters) -> Option<String> {
+    if !live.connection.online {
+        return Some("HexMeow offline".into());
+    }
+    if live.session_epoch != parameters.session_epoch
+        || live.nmt_revision != parameters.nmt_revision
+    {
+        return Some("HexMeow session changed; reinitialize motor".into());
+    }
+    if live.lifecycle != MeowMotorLifecycle::Initialized {
+        return Some(format!("HexMeow {:?}; reinitialize motor", live.lifecycle));
+    }
+    let now = Instant::now();
+    if [live.connection.last_tpdo1, live.connection.last_tpdo2]
+        .iter()
+        .any(|last| last.is_none_or(|last| now.saturating_duration_since(last) > FEEDBACK_TIMEOUT))
+    {
+        return Some("HexMeow feedback stale; reinitialize motor".into());
+    }
+    match live.logic {
+        Some(MeowMotorLogic::Enabled(MeowMotorMode::Mit)) => {
+            if live
+                .measurements
+                .velocity_rev_per_s
+                .is_some_and(f64::is_finite)
+            {
+                None
+            } else {
+                Some("Waiting for HexMeow velocity feedback".into())
+            }
+        }
+        Some(MeowMotorLogic::Error {
+            mode_display,
+            detailed_error,
+        }) => Some(format!(
+            "HexMeow mode 0x{mode_display:02X}, error 0x{detailed_error:04X}"
+        )),
+        _ => Some("HexMeow is not in MIT mode; reinitialize motor".into()),
+    }
+}
+
 fn clamp_twist(vx: f64, vy: f64, wz: f64, max_linear: f64, max_angular: f64) -> (f64, f64, f64) {
-    let mag = (vx * vx + vy * vy).sqrt();
-    let (vx, vy) = if max_linear > 0.0 && mag > max_linear {
+    let mag = vx.hypot(vy);
+    let (vx, vy) = if mag > max_linear {
         let s = max_linear / mag;
         (vx * s, vy * s)
     } else {
@@ -617,13 +903,14 @@ fn clamp_twist(vx: f64, vy: f64, wz: f64, max_linear: f64, max_angular: f64) -> 
 }
 
 async fn control_loop(
-    mgr: Arc<Cia402Manager>,
-    bus: Arc<dyn can_transport::CanBus>,
+    mgr: Arc<MeowMotorManager>,
+    bus: Arc<dyn CanBus>,
     kin: Kinematics,
-    kd_factor: Arc<StdMutex<[f32; 3]>>,
+    parameters: Arc<StdMutex<[MotorParameters; 3]>>,
     cmd: Arc<StdMutex<Command>>,
     state: Arc<StdMutex<Hopea3State>>,
     running: Arc<AtomicBool>,
+    reinitializing: Arc<AtomicBool>,
 ) {
     let period = Duration::from_micros(1_000_000 / CONTROL_HZ);
     let dt = 1.0 / CONTROL_HZ as f64;
@@ -632,37 +919,70 @@ async fn control_loop(
 
     // Applied (rate-limited) twist, ramped toward the target each tick.
     let (mut ax, mut ay, mut aw) = (0.0f64, 0.0f64, 0.0f64);
+    let mut send_fault: Option<String> = None;
+    let mut follow_expired = false;
 
     while running.load(Ordering::SeqCst) {
         tick.tick().await;
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
 
         let c = *cmd.lock().unwrap();
-        let factor = *kd_factor.lock().unwrap();
+        let parameters = *parameters.lock().unwrap();
+        let brs = parameters.iter().all(|p| p.brs);
 
         // ── read wheel feedback first (so a fault can gate this tick's targets) ──
         let mut motor_rev_s = [0.0f64; 3];
         let mut motors = Vec::with_capacity(3);
-        let mut any_error = false;
+        let mut fault = send_fault.clone().or_else(|| {
+            reinitializing
+                .load(Ordering::SeqCst)
+                .then(|| "Reinitializing HexMeow motor".into())
+        });
+        follow_expired |= c.deadline.is_some_and(|deadline| Instant::now() > deadline);
+        if follow_expired {
+            fault = Some("Follow controller expired; stop and restart HopeA3".into());
+        }
         for (i, &nid) in NODE_IDS.iter().enumerate() {
-            let ls = mgr.status(nid);
-            let m = &ls.measurements;
-            let vel = m.velocity_rev_per_s;
-            motor_rev_s[i] = WHEEL_SIGN[i] * vel.unwrap_or(0.0) as f64;
-            let (enabled, error) = match ls.logic.as_ref() {
-                Some(Logic::Enabled(_)) => (true, None),
-                Some(Logic::Error { kind, raw_code }) => {
-                    any_error = true;
-                    (false, Some(format!("{kind:?} (0x{raw_code:04X})")))
+            let ls = match mgr.status(nid) {
+                Ok(live) => live,
+                Err(error) => {
+                    let error = format!("HexMeow 0x{nid:02X}: {error}");
+                    fault.get_or_insert(error.clone());
+                    motors.push(Hopea3Motor {
+                        node_id: nid,
+                        error: Some(error),
+                        max_torque_permille: c.max_torque[i],
+                        ..Default::default()
+                    });
+                    continue;
                 }
-                _ => (false, None),
             };
+            let m = &ls.measurements;
+            let error = feedback_error(&ls, parameters[i]);
+            if let Some(error) = &error {
+                fault.get_or_insert_with(|| format!("0x{nid:02X}: {error}"));
+            }
+            let valid = error.is_none();
+            let vel = m.velocity_rev_per_s.filter(|v| valid && v.is_finite());
+            motor_rev_s[i] = vel.unwrap_or(0.0);
             motors.push(Hopea3Motor {
                 node_id: nid,
                 online: ls.connection.online,
-                enabled,
+                enabled: ls.logic == Some(MeowMotorLogic::Enabled(MeowMotorMode::Mit)),
                 target_rev_per_s: 0.0, // filled after kinematics below
-                velocity_rev_per_s: vel,
-                torque_nm: m.torque_nm,
+                velocity_rev_per_s: vel.map(|v| v as f32),
+                torque_nm: if valid {
+                    crate::dto::physical_torque_nm(
+                        m.torque_permille,
+                        parameters[i].peak_torque_nm,
+                        Some(parameters[i].torque_factor),
+                    )
+                    .map(|torque| torque as f32)
+                } else {
+                    None
+                },
                 max_torque_permille: c.max_torque[i],
                 driver_temp_c: m.driver_temp_c,
                 motor_temp_c: m.motor_temp_c,
@@ -671,13 +991,16 @@ async fn control_loop(
         }
 
         // ── chassis acceleration limiting (slew-rate) ──
-        // If ANY motor is faulted, stop the whole chassis: zero the applied
-        // twist so every wheel (including the healthy ones) gets VDES=0. This
-        // also avoids ramping back up the instant the fault clears.
-        if any_error {
+        // Offline/stale/changed-session/disabled motors are just as important
+        // as firmware errors: inhibit every wheel and discard the old command.
+        if fault.is_some() {
             ax = 0.0;
             ay = 0.0;
             aw = 0.0;
+            let mut command = cmd.lock().unwrap();
+            command.vx = 0.0;
+            command.vy = 0.0;
+            command.wz = 0.0;
         } else {
             // Linear: bound the velocity-*vector* step to max_lin_acc·dt, which
             // limits speed and heading change together. Angular: bound |Δωz|.
@@ -711,29 +1034,40 @@ async fn control_loop(
         // ── inverse kinematics → send shared RPDO frame ──
         // Per motor: VDES (f32 Rev/s) + KD (u16) + max torque (u16). KD is given
         // in SI (Nm·s/rad); convert to the motor's wire int: Rev units = ×τ,
-        // then ÷ the per-motor 0x2003:07 factor, clamped 0..=10000.
+        // then ÷ the per-motor 0x4102:07 factor (full u16 range).
         let targets = kin.twist_to_motor_rev_s(ax, ay, aw);
-        let mut data = [0u8; SLICE_LEN * 3];
+        let mut kd = [0u16; 3];
         for slice in 0..3 {
-            let kd_rev = (c.kd_si[slice] * std::f64::consts::TAU) as f32;
-            let kd_int = (kd_rev / factor[slice]).round().clamp(0.0, 10_000.0) as u16;
-            let off = slice * SLICE_LEN;
-            data[off..off + 4].copy_from_slice(&(targets[slice] as f32).to_le_bytes());
-            data[off + 4..off + 6].copy_from_slice(&kd_int.to_le_bytes());
-            data[off + 6..off + 8].copy_from_slice(&c.max_torque[slice].to_le_bytes());
+            if fault.is_none() {
+                kd[slice] = kd_to_raw(c.kd_si[slice], parameters[slice].kd_factor)
+                    .expect("KD validated before init or command update");
+            }
             motors[slice].target_rev_per_s = targets[slice] as f32;
         }
-        match CanFrame::new_fd(SHARED_RPDO_COB_ID, &data, true) {
-            Ok(frame) => {
-                if let Err(e) = bus.send(frame).await {
-                    log::warn!("HopeA3: RPDO send failed: {e}");
-                }
+        let max_torque = if fault.is_none() {
+            c.max_torque
+        } else {
+            [0; 3]
+        };
+        if let Err(error) = bus.send(shared_frame(targets, kd, max_torque, brs)).await {
+            if send_fault.is_none() {
+                log::warn!("HopeA3: RPDO send failed: {error}");
+                send_fault = Some(format!("CAN send failed: {error}; stop and restart HopeA3"));
             }
-            Err(e) => log::error!("HopeA3: build RPDO frame: {e}"),
+            fault = send_fault.clone();
+            (ax, ay, aw) = (0.0, 0.0, 0.0);
         }
 
         // ── forward kinematics from wheel feedback → twist + odom ──
-        let (mvx, mvy, mwz) = kin.motor_rev_s_to_twist(motor_rev_s);
+        // A partial wheel vector cannot produce meaningful chassis odometry.
+        let (mvx, mvy, mwz) = if motors
+            .iter()
+            .all(|motor| motor.velocity_rev_per_s.is_some())
+        {
+            kin.motor_rev_s_to_twist(motor_rev_s)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
         {
             let mut s = state.lock().unwrap();
@@ -753,9 +1087,12 @@ async fn control_loop(
             s.max_angular = c.max_angular;
             s.motors = motors;
             s.running = true;
+            s.fault = fault;
         }
     }
 
+    let brs = parameters.lock().unwrap().iter().all(|p| p.brs);
+    let _ = bus.send(shared_frame([0.0; 3], [0; 3], [0; 3], brs)).await;
     state.lock().unwrap().running = false;
     log::info!("HopeA3: control loop stopped");
 }
@@ -773,7 +1110,71 @@ fn wrap_pi(a: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTACTS_M, HOST_NODE_ID, NODE_IDS, SHARED_RPDO_COB_ID, WHEEL_RADIUS_M};
+    use super::*;
+
+    #[test]
+    fn hexmeow_gain_uses_full_u16_range_and_rejects_unknown_scaling() {
+        let gain = 50_000.0 * f64::from(0.001f32) / std::f64::consts::TAU;
+        assert_eq!(kd_to_raw(gain, 0.001).unwrap(), 50_000);
+        assert!(kd_to_raw(1.0, 0.0).is_err());
+        assert!(kd_to_raw(1.0, f32::NAN).is_err());
+        assert!(kd_to_raw(-1.0, 0.001).is_err());
+        assert!(kd_to_raw(f64::INFINITY, 0.001).is_err());
+        assert!(kd_to_raw(100.0, 0.001).is_err());
+    }
+
+    #[test]
+    fn shared_wire_layout_has_three_independent_hexmeow_lanes() {
+        let frame = shared_frame([1.5, -2.5, 3.0], [1, 32768, 65535], [0, 800, 1000], false);
+        assert_eq!(frame.id().raw(), 0x18A);
+        assert_eq!(frame.data().len(), 24);
+        for slot in 0..3 {
+            let entries = rpdo_entries_for_slice(slot);
+            let mut offset = 0;
+            let mut actual = Vec::new();
+            for entry in entries {
+                if entry.index != 0x3000 {
+                    actual.push((offset, entry.packed()));
+                }
+                offset += entry.bit_len as usize / 8;
+            }
+            assert_eq!(offset, 24);
+            assert_eq!(
+                actual,
+                vec![
+                    (slot * 8, 0x4102_0220),
+                    (slot * 8 + 4, 0x4102_0510),
+                    (slot * 8 + 6, 0x4572_0010),
+                ]
+            );
+        }
+        assert_eq!(&frame.data()[8..16], &[0, 0, 32, 192, 0, 128, 32, 3]);
+        assert_eq!(&frame.data()[16..24], &[0, 0, 64, 64, 255, 255, 232, 3]);
+    }
+
+    #[test]
+    fn feedback_gate_requires_current_session_freshness_and_mit_mode() {
+        let now = Instant::now();
+        let mut live = MeowMotorLiveState::empty(now);
+        live.connection.online = true;
+        live.connection.last_tpdo1 = Some(now);
+        live.connection.last_tpdo2 = Some(now);
+        live.lifecycle = MeowMotorLifecycle::Initialized;
+        live.logic = Some(MeowMotorLogic::Enabled(MeowMotorMode::Mit));
+        live.measurements.velocity_rev_per_s = Some(0.0);
+        let parameters = MotorParameters::default();
+        assert!(feedback_error(&live, parameters).is_none());
+        live.session_epoch += 1;
+        assert!(feedback_error(&live, parameters)
+            .unwrap()
+            .contains("session"));
+        live.session_epoch = 0;
+        live.logic = Some(MeowMotorLogic::Enabled(MeowMotorMode::ProfileVelocity));
+        assert!(feedback_error(&live, parameters).unwrap().contains("MIT"));
+        live.logic = Some(MeowMotorLogic::Enabled(MeowMotorMode::Mit));
+        live.connection.last_tpdo2 = Some(now - Duration::from_secs(1));
+        assert!(feedback_error(&live, parameters).unwrap().contains("stale"));
+    }
 
     #[test]
     fn canopen_allocation_matches_global_contract() {
@@ -801,3 +1202,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hopea3_protocol_tests.rs"]
+mod protocol_tests;

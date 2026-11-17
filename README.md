@@ -13,6 +13,14 @@ USB profile are documented in [HPM V3 updater](docs/hpm-v3-update.md).
 The [unified CAN entry](docs/can-update-entry.md) covers passive identity discovery,
 explicit model selection for recovery, and prohibited Node-IDs 100/101.
 
+The independent **Cord Follow (HopeA3)** app is available under **Raw CAN Bus
+Application**. It combines the MHF5010 pull cord and direction encoder with the
+real three-motor HexMeow HopeA3 base, on separate Classic CAN and CAN-FD channels.
+Homing, follow behavior and explicit manual controls follow `string_chassis`
+main at `20133ac`. See [setup and operation](docs/pull-cord.md).
+First-run settings are embedded from `src-tauri/defaults/pull-cord.json` and
+`src-tauri/defaults/pull-chassis.json`; existing local settings take precedence.
+
 ## Layout
 
 ```
@@ -304,6 +312,9 @@ bus with the right settings:
 
 - **Motor Control** — everything above. Broadcasts our heartbeat (the motor's
   `0x1016` consumer needs it).
+- **HopeA3 (Raw Motor)** — three HexMeow chassis motors at Node-IDs 21/22/23,
+  500 Hz shared CAN-FD MIT velocity control, calibrated torque feedback and
+  confirmed disable on stop. See [HopeA3 protocol and setup](docs/hopea3.md).
 - **Product Authenticity** — a public, always-visible verification and
   first-registration workspace. It passively discovers heartbeat sessions,
   but reads a proprietary proof object only after a complete `0x1018:00..04`
