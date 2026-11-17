@@ -9,7 +9,7 @@ const React = require("react");
 const { act, create } = require("react-test-renderer");
 const defaults = JSON.parse(readFileSync(new URL("../src-tauri/defaults/pull-chassis.json", import.meta.url), "utf8"));
 
-async function mount(t: TestContext) {
+async function mount(t: TestContext, settings = defaults) {
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   let keydown: (event: any) => void = () => {};
@@ -28,9 +28,12 @@ async function mount(t: TestContext) {
   const status: any = { connected: false, iface: null, needs_stop: false, run: null };
   let failStop = false;
   let pendingStart: Promise<never> | null = null;
+  let retractTargetSpeedMps = 2.0;
   const api = {
-    async chassisSettingsGet() { return structuredClone(defaults); },
+    async chassisSettingsGet() { return structuredClone(settings); },
+    async chassisDefaultConfig() { return structuredClone(defaults); },
     async chassisSettingsSave(config: any) { calls.push(["save", config]); },
+    async chassisSetConfig(config: any) { calls.push(["config", config]); status.run.config = structuredClone(config); },
     async chassisConnect(iface: string, rate: number) { calls.push(["connect", iface, rate]); status.connected = true; status.iface = iface; },
     async chassisStart(config: any) {
       calls.push(["start", config]); status.needs_stop = true;
@@ -61,7 +64,7 @@ async function mount(t: TestContext) {
   let renderer: any;
   const render = () => React.createElement(module.exports.PullChassisPanel, {
     status: structuredClone(status), liveInput: { cordLengthM: 0.9, cordSpeedMps: 0, encoderAngleDeg: 60 },
-    pullReady: true, unavailable: false, async refresh() { renderer.update(render()); },
+    retractTargetSpeedMps, pullReady: true, unavailable: false, async refresh() { renderer.update(render()); },
   });
   await act(async () => { renderer = create(render()); });
   t.after(() => {
@@ -73,6 +76,10 @@ async function mount(t: TestContext) {
   const button = (label: string) => renderer.root.findAllByType("Button").find((node: any) => node.props.children === label);
   return {
     calls, errors, status, button,
+    control(type: string, label: string) { return renderer.root.findAllByType(type).find((node: any) => node.props["aria-label"] === label).props; },
+    async retractTarget(value: number) { retractTargetSpeedMps = value; await act(async () => { renderer.update(render()); }); },
+    async refresh() { await act(async () => { renderer.update(render()); }); },
+    phase() { return renderer.root.findAllByType("Description").find((node: any) => node.props.label === "Phase").props.children; },
     failStop() { failStop = true; }, recoverStop() { failStop = false; },
     deferStart(promise: Promise<never>) { pendingStart = promise; },
     async click(label: string) {
@@ -115,6 +122,23 @@ test("chassis drafts and connection never arm; manual motion requires explicit a
   assert.equal(h.status.needs_stop, false);
 });
 
+test("runtime phase shows ahead switch braking and ahead guidance while the configured mode stays behind", async t => {
+  const h = await mount(t);
+  await h.click("Connect chassis");
+  await h.click("Start physical follow");
+  assert.equal(h.status.run.config.mode, "behind");
+  h.status.run.follow_status = { travel_mode: "behind", pace_active: true };
+  await h.refresh();
+  assert.equal(h.phase(), "Pace matching");
+  h.status.run.follow_status = { travel_mode: "ahead", braking: "ahead_switch" };
+  await h.refresh();
+  assert.equal(h.phase(), "Braking for ahead guidance");
+  h.status.run.follow_status = { travel_mode: "ahead", braking: null };
+  await h.refresh();
+  assert.equal(h.phase(), "Ahead guidance");
+  assert.equal(h.status.run.config.mode, "behind");
+});
+
 test("Escape can stop the chassis while initialization is pending", async t => {
   const h = await mount(t);
   await h.click("Connect chassis");
@@ -126,4 +150,53 @@ test("Escape can stop the chassis while initialization is pending", async t => {
   assert.equal(h.calls.at(-1)?.[0], "stop");
   await act(async () => { reject(new Error("start cancelled")); });
   assert.ok(h.errors.some(error => error.includes("start cancelled")));
+});
+
+test("retraction brake follows the cord target by default and custom thresholds require apply/save", async t => {
+  const h = await mount(t);
+  const threshold = () => h.control("InputNumber", "Retraction brake threshold m/s");
+  assert.equal(h.control("Checkbox", "Use retract target speed").checked, true);
+  assert.equal(threshold().disabled, true);
+  assert.equal(threshold().value, 2.0);
+  await h.retractTarget(1.5);
+  assert.equal(threshold().value, 1.5);
+  assert.deepEqual(h.calls, []);
+  h.edit("Checkbox", "Use retract target speed", { target: { checked: false } });
+  assert.equal(threshold().disabled, false);
+  assert.equal(threshold().value, 1.5);
+  h.edit("InputNumber", "Retraction brake threshold m/s", 0.8);
+  await h.retractTarget(2.0);
+  assert.equal(threshold().value, 0.8);
+  await h.click("Save configuration");
+  assert.equal(h.calls.at(-1)?.[1].retract_brake_speed_mps, 0.8);
+  await h.click("Connect chassis");
+  await h.click("Start physical follow");
+  assert.equal(h.status.run.config.retract_brake_speed_mps, 0.8);
+  h.edit("InputNumber", "Retraction brake threshold m/s", 1.1);
+  assert.equal(h.status.run.config.retract_brake_speed_mps, 0.8);
+  await h.click("Apply and save parameters");
+  assert.deepEqual(h.calls.slice(-2).map(call => call[0]), ["config", "save"]);
+  assert.equal(h.status.run.config.retract_brake_speed_mps, 1.1);
+  h.edit("Checkbox", "Use retract target speed", { target: { checked: true } });
+  assert.equal(threshold().value, 2.0);
+  await h.click("Apply and save parameters");
+  assert.equal(h.status.run.config.retract_brake_speed_mps, null);
+  assert.equal(h.calls.at(-1)?.[1].retract_brake_speed_mps, null);
+});
+
+test("legacy settings use the automatic retraction threshold and braking has phase priority", async t => {
+  const legacy = structuredClone(defaults);
+  delete legacy.retract_brake_speed_mps;
+  const h = await mount(t, legacy);
+  assert.equal(h.control("Checkbox", "Use retract target speed").checked, true);
+  assert.equal(h.control("InputNumber", "Retraction brake threshold m/s").value, 2.0);
+  await h.click("Connect chassis");
+  await h.click("Start physical follow");
+  h.status.run.follow_status = { travel_mode: "ahead", braking: "ahead_switch", pace_active: true };
+  h.status.run.retract_braking = true;
+  await h.refresh();
+  assert.equal(h.phase(), "Retraction speed braking");
+  h.status.run.retract_braking = false;
+  await h.refresh();
+  assert.equal(h.phase(), "Braking for ahead guidance");
 });

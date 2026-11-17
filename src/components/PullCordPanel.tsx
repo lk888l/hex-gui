@@ -205,6 +205,7 @@ export function PullCordPanel() {
       })} />
 
     <PullChassisPanel status={status?.chassis} unavailable={!status || !!pollError || stopping}
+      retractTargetSpeedMps={running ? run.config.retract_speed_m_s : draft?.retract_speed_m_s ?? null}
       pullReady={controlActive && run?.phase === "running" && !!run.online && !!status?.encoder?.angle_usable
         && (status.encoder.position_age_ms ?? Infinity) <= 150 && !busy}
       liveInput={{ cordLengthM: run?.length_m ?? null, cordSpeedMps: run?.cord_speed_m_s ?? null,

@@ -60,6 +60,7 @@
   "max_linear_mps": 1.6126842288427603,
   "max_angular_rad_s": 1.5,
   "acceleration_mps2": 0.3,
+  "retract_brake_speed_mps": null,
   "turn_gain": 2.05761316872428,
   "kd_si": [
     1.0,

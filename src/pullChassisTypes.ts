@@ -10,6 +10,8 @@ export interface PullChassisConfig {
   max_linear_mps: number;
   max_angular_rad_s: number;
   acceleration_mps2: number;
+  /** Null uses the live pull-cord run's applied retract target speed. */
+  retract_brake_speed_mps: number | null;
   turn_gain: number;
   kd_si: [number, number, number];
   max_torque_permille: [number, number, number];
@@ -23,6 +25,9 @@ export interface PullChassisRunState {
   input: FollowInput;
   manual_enabled: boolean;
   follow_status: FollowStatus & { travel_mode: "behind" | "ahead" | null };
+  retract_braking: boolean;
+  retract_brake_speed_mps: number | null;
+  retract_brake_deceleration_mps2: number;
   chassis: Hopea3State;
 }
 

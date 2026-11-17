@@ -906,7 +906,7 @@ async fn run_loop(ctx: Loop) {
                 s.limit_permille = 0;
                 s.homing_progress = homing_stall.progress();
                 drop(s);
-                motion.publish(phase, length, Some(cord_speed), cfg.retract_positive);
+                motion.publish(phase, length, Some(cord_speed), cfg.retract_positive, cfg.retract_speed_m_s);
                 let mut d = diagnostics.lock().unwrap();
                 if d.run_id == run_id {
                     d.updated_at = Some(now); d.generation = d.generation.wrapping_add(1);
@@ -1221,6 +1221,7 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(600));
         assert_eq!(first.length_m, Some(0.0));
         assert_eq!(first.speed_m_s, Some(0.0));
+        assert_eq!(first.retract_target_speed_m_s, cfg.retract_speed_m_s);
         assert_eq!(app.snapshot().length_m, Some(0.0));
         assert_eq!(app.snapshot().homing_progress, 1.0);
         assert_eq!(app.snapshot().config.homing_stall_hold_ms, 600);
@@ -1228,11 +1229,13 @@ mod tests {
 
         cfg.a2_speed.as_mut().unwrap().near_raw = 24;
         cfg.a2_speed.as_mut().unwrap().retract_raw = 24;
+        cfg.retract_speed_m_s = 1.5;
         app.set_config(cfg).unwrap();
         assert_eq!(app.snapshot().config.homing_stall_hold_ms, 600);
         assert_eq!(app.snapshot().config.homing_stall_speed_m_s, 0.02);
-        wait_for_motion(&mut rx, |_| {
+        wait_for_motion(&mut rx, |motion| {
             app.snapshot().config.a2_speed.unwrap().near_raw == 24
+                && motion.retract_target_speed_m_s == 1.5
         })
         .await;
         // A one-degree offset is far below the former 3 cm travel gate.

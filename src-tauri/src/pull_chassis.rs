@@ -6,13 +6,17 @@ use std::time::Instant;
 
 use hex_motor::meow_motor::{MeowMotorManager, MeowMotorManagerOptions};
 use mhf_pull_cord::chassis_model::{
-    ChassisConfig, CordExitSide, FollowController, FollowInput, FollowParameters, FollowStatus,
+    ChassisConfig, CordExitSide, FollowInput, FollowParameters, FollowStatus,
     InputSource, WalkMode,
 };
 use mhf_pull_cord::motion::{read_motion, CordMotionReceiver};
 use tokio::task::JoinHandle;
 
 use crate::hopea3::{Hopea3, Hopea3State};
+
+#[path = "pull_chassis_control.rs"]
+mod control;
+use control::ChassisFollowController;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullChassisConfig {
@@ -24,6 +28,9 @@ pub struct PullChassisConfig {
     pub max_linear_mps: f64,
     pub max_angular_rad_s: f64,
     pub acceleration_mps2: f64,
+    /// None follows the pull-cord run's applied retraction target.
+    #[serde(default)]
+    pub retract_brake_speed_mps: Option<f64>,
     /// Body yaw per unit travel speed and sine of cord deflection (1/m).
     pub turn_gain: f64,
     pub kd_si: [f64; 3],
@@ -61,6 +68,12 @@ impl PullChassisConfig {
 
     fn validate(&self) -> Result<(), String> {
         self.model().validate()?;
+        if self
+            .retract_brake_speed_mps
+            .is_some_and(|speed| !speed.is_finite() || speed <= 0.0)
+        {
+            return Err("回收制动速度必须为正数，或使用收线目标速度".into());
+        }
         if !self.max_angular_rad_s.is_finite()
             || !(0.0..=3.0).contains(&self.max_angular_rad_s)
             || !self.turn_gain.is_finite()
@@ -71,6 +84,25 @@ impl PullChassisConfig {
             return Err("invalid HopeA3 steering, KD or torque limits".into());
         }
         Ok(())
+    }
+
+    fn max_deceleration_mps2(&self) -> f64 {
+        let behind = self.follow.behind_speed;
+        [
+            self.follow.pace.deceleration_mps2,
+            behind.deceleration_mps2,
+            behind.stop_deceleration_mps2,
+            behind.switch_deceleration_mps2,
+            behind.adaptive_deceleration_mps2,
+            behind.payout_stop_deceleration_mps2,
+            behind.pull_back_deceleration_mps2,
+        ]
+        .into_iter()
+        .fold(0.0, f64::max)
+    }
+
+    fn retract_brake_limit(&self, applied_retract_target_mps: f64) -> f64 {
+        self.retract_brake_speed_mps.unwrap_or(applied_retract_target_mps)
     }
 
     fn structural_change(&self, next: &Self) -> bool {
@@ -104,6 +136,9 @@ pub struct PullChassisRunState {
     pub input: FollowInput,
     pub manual_enabled: bool,
     pub follow_status: FollowStatus,
+    pub retract_braking: bool,
+    pub retract_brake_speed_mps: Option<f64>,
+    pub retract_brake_deceleration_mps2: f64,
     pub chassis: Hopea3State,
 }
 
@@ -202,7 +237,7 @@ struct LiveInput {
 }
 
 impl LiveInput {
-    async fn sample(&self) -> Result<FollowInput, String> {
+    async fn sample(&self) -> Result<(FollowInput, f64), String> {
         let now = Instant::now();
         let motion = read_motion(&self.motion, now)?;
         if motion.invalidation_epoch != self.epoch {
@@ -223,7 +258,7 @@ impl LiveInput {
         {
             return Err("方向编码器磁铁状态异常或角度反馈过期".into());
         }
-        Ok(FollowInput {
+        let input = FollowInput {
             cord_length_m: motion.length_m,
             cord_speed_mps: motion.speed_m_s,
             pull_back_speed_mps: motion.speed_m_s.map(|speed| {
@@ -237,7 +272,8 @@ impl LiveInput {
             encoder_sample_time_s: encoder
                 .position_age
                 .map(|age| encoder.monitor_age.saturating_sub(age).as_secs_f64()),
-        })
+        };
+        Ok((input, motion.retract_target_speed_m_s))
     }
 }
 
@@ -333,8 +369,7 @@ async fn follow_loop(
     cancel: Arc<AtomicBool>,
     live: Option<LiveInput>,
 ) {
-    let mut controller = FollowController::default();
-    let mut previous = 0.0;
+    let mut controller = ChassisFollowController::default();
     let mut last_tick = Instant::now();
     let started = last_tick;
     let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -352,10 +387,12 @@ async fn follow_loop(
                 return Err("底盘跟随循环超过 150 ms 未更新".into());
             }
             let config = config.lock().unwrap().clone();
-            let (enabled, input) = if let Some(live) = &live {
-                (true, live.sample().await?)
+            let (enabled, input, retract_brake_speed_mps) = if let Some(live) = &live {
+                let (input, retract_target) = live.sample().await?;
+                (true, input, Some(config.retract_brake_limit(retract_target)))
             } else {
-                *manual.lock().unwrap()
+                let (enabled, input) = *manual.lock().unwrap();
+                (enabled, input, None)
             };
             let driver = driver.lock().await;
             let chassis = driver.state();
@@ -373,21 +410,15 @@ async fn follow_loop(
                 continue;
             }
             let command = if enabled {
-                let (command, applied) = controller.step_with_motion(
+                controller.step(
                     input,
-                    previous,
-                    Some(mhf_pull_cord::chassis_model::MeasuredMotion {
-                        linear_mps: chassis.meas_vx,
-                        yaw_rate_rad_s: chassis.meas_wz,
-                    }),
+                    &chassis,
                     dt,
-                    &config.model(),
-                );
-                previous = applied;
-                body_command(applied, command.encoder_error_deg, &config)
+                    &config,
+                    retract_brake_speed_mps,
+                )
             } else {
                 controller.reset();
-                previous = 0.0;
                 (0.0, 0.0, 0.0)
             };
             if cancel.load(Ordering::Acquire) {
@@ -406,6 +437,9 @@ async fn follow_loop(
             state.input = input;
             state.manual_enabled = enabled && config.source == InputSource::Manual;
             state.follow_status = controller.status();
+            state.retract_braking = controller.retract_braking;
+            state.retract_brake_speed_mps = retract_brake_speed_mps;
+            state.retract_brake_deceleration_mps2 = config.max_deceleration_mps2();
             state.chassis = chassis;
         }
         Ok(())
@@ -601,6 +635,9 @@ pub async fn pull_chassis_start(
                 running: false,
                 fault: Some(error.clone()),
                 stop_confirmed: false,
+                retract_braking: false,
+                retract_brake_speed_mps: None,
+                retract_brake_deceleration_mps2: config.max_deceleration_mps2(),
                 config,
                 input: FollowInput::default(),
                 manual_enabled: false,
@@ -612,7 +649,7 @@ pub async fn pull_chassis_start(
     };
     runtime.chassis.pending_start = false;
     let initial = if let Some(live) = &live {
-        live.sample().await
+        live.sample().await.map(|(input, _)| input)
     } else {
         Ok(FollowInput {
             cord_length_m: Some(0.0),
@@ -638,6 +675,9 @@ pub async fn pull_chassis_start(
         input,
         manual_enabled: false,
         follow_status: FollowStatus::default(),
+        retract_braking: false,
+        retract_brake_speed_mps: None,
+        retract_brake_deceleration_mps2: config.max_deceleration_mps2(),
         chassis: driver.state(),
     }));
     if initial_fault.is_some() {
@@ -808,6 +848,54 @@ mod tests {
         assert!(check_distinct_interfaces(Some("gs_usb"), "gs_usb0").is_err());
         assert!(check_distinct_interfaces(Some("gsusb1"), "GS_USB:1").is_err());
         assert!(check_distinct_interfaces(Some("gs_usb0"), "gs_usb1").is_ok());
+    }
+
+    #[test]
+    fn retract_brake_settings_migrate_validate_and_follow_the_applied_target() {
+        let mut legacy = serde_json::to_value(PullChassisConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("retract_brake_speed_mps");
+        let mut config: PullChassisConfig = serde_json::from_value(legacy).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.retract_brake_speed_mps, None);
+        assert_eq!(config.retract_brake_limit(2.0), 2.0);
+        assert_eq!(config.retract_brake_limit(1.5), 1.5);
+        config.retract_brake_speed_mps = Some(0.8);
+        config.validate().unwrap();
+        assert_eq!(config.retract_brake_limit(2.0), 0.8);
+        let restored: PullChassisConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(restored.retract_brake_speed_mps, Some(0.8));
+        assert!(!config.structural_change(&PullChassisConfig::default()));
+        for speed in [0.0, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            config.retract_brake_speed_mps = Some(speed);
+            assert!(config.validate().is_err(), "invalid threshold {speed}");
+        }
+    }
+
+    #[test]
+    fn retract_brake_uses_the_largest_configured_deceleration() {
+        let mut config = PullChassisConfig::default();
+        assert_eq!(config.max_deceleration_mps2(), 3.0);
+        // Even inactive legacy tuning remains part of the app's maximum.
+        config.follow.behind_speed.payout_stop_enabled = false;
+        config.follow.behind_speed.adaptive_enabled = false;
+        config.acceleration_mps2 = 4.0;
+        assert_eq!(config.max_deceleration_mps2(), 3.0);
+        for index in 0..7 {
+            let mut tuning = config.clone();
+            let behind = &mut tuning.follow.behind_speed;
+            let fields = [
+                &mut tuning.follow.pace.deceleration_mps2,
+                &mut behind.deceleration_mps2,
+                &mut behind.stop_deceleration_mps2,
+                &mut behind.switch_deceleration_mps2,
+                &mut behind.adaptive_deceleration_mps2,
+                &mut behind.payout_stop_deceleration_mps2,
+                &mut behind.pull_back_deceleration_mps2,
+            ];
+            *fields.into_iter().nth(index).unwrap() = 3.5;
+            assert_eq!(tuning.max_deceleration_mps2(), 3.5, "field {index}");
+        }
     }
 
     #[test]

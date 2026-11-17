@@ -11,6 +11,15 @@ fn mpu_config() -> ChassisConfig {
     c
 }
 
+fn length_hold_config() -> ChassisConfig {
+    let mut c = mpu_config();
+    // Distance-hold scenarios need room below the now-active runtime switch.
+    // Keep the captured fixture and the launch regression unchanged.
+    c.follow.behind_ahead_switch_cord_length_m = 1.3;
+    c.validate().unwrap();
+    c
+}
+
 fn sample(c: &ChassisConfig, length: f64, relative: f64) -> FollowInput {
     FollowInput {
         cord_length_m: Some(length),
@@ -61,7 +70,7 @@ fn mpu_launch_settings_are_preserved_and_length_hold_has_its_own_reference() {
 
 #[test]
 fn distance_correction_recovers_either_side_of_the_target_and_is_neutral_near_it() {
-    let c = mpu_config();
+    let c = length_hold_config();
     for length in [0.45, 0.60, 0.65, 0.68, 0.71, 0.8, 1.0] {
         let mut controller = FollowController::default();
         controller.step(sample(&c, 0.6, 0.0), 0.3, 0.01, &c);
@@ -94,9 +103,9 @@ fn distance_correction_recovers_either_side_of_the_target_and_is_neutral_near_it
 }
 
 #[test]
-fn running_pace_crosses_old_stop_and_switch_but_keeps_the_new_protective_stop() {
+fn running_pace_crosses_launch_stop_but_keeps_the_protective_stop_below_ahead_switch() {
     for side in [CordExitSide::DrivenAxle, CordExitSide::PassiveAxle] {
-        let mut c = mpu_config();
+        let mut c = length_hold_config();
         c.cord_exit_side = side;
         let mut controller = FollowController::default();
         let mut wheels = 0.3 * side.sign();
@@ -135,8 +144,8 @@ fn running_pace_crosses_old_stop_and_switch_but_keeps_the_new_protective_stop() 
 }
 
 #[test]
-fn gain_and_reference_edits_or_missing_feedback_do_not_reenter_launch_switching() {
-    let mut c = mpu_config();
+fn gain_and_reference_edits_or_missing_feedback_preserve_pace_below_ahead_switch() {
+    let mut c = length_hold_config();
     let mut controller = FollowController::default();
     controller.step(sample(&c, 0.6, 0.0), 0.3, 0.01, &c);
     c.follow.pace.target_length_m = 0.72;
@@ -175,7 +184,7 @@ fn mpu_closed_loop_recovers_length_after_repeated_pace_changes_without_using_up_
     for side in [CordExitSide::DrivenAxle, CordExitSide::PassiveAxle] {
         for lag in [0.0_f64, 0.15, 0.35] {
             for (swing, bias) in [(0.0, 0.0), (0.025, 0.01)] {
-                let mut c = mpu_config();
+                let mut c = length_hold_config();
                 c.cord_exit_side = side;
                 let mut controller = FollowController::default();
                 let mut wheels = 0.0;

@@ -22,6 +22,8 @@ pub struct CordMotion {
     pub length_m: Option<f64>,
     pub speed_m_s: Option<f64>,
     pub retract_positive: bool,
+    /// Applied pull-cord target, published with the same feedback sample.
+    pub retract_target_speed_m_s: f64,
 }
 
 pub type CordMotionReceiver = watch::Receiver<CordMotion>;
@@ -38,6 +40,7 @@ impl MotionPublisher {
             length_m: None,
             speed_m_s: None,
             retract_positive: true,
+            retract_target_speed_m_s: 0.0,
         });
         (Self(tx), rx)
     }
@@ -48,6 +51,7 @@ impl MotionPublisher {
         length_m: Option<f64>,
         speed_m_s: Option<f64>,
         retract_positive: bool,
+        retract_target_speed_m_s: f64,
     ) {
         let permit = if phase != Phase::Running {
             MotionPermit::Unavailable
@@ -64,11 +68,12 @@ impl MotionPublisher {
             length_m,
             speed_m_s,
             retract_positive,
+            retract_target_speed_m_s,
         });
     }
 
     pub fn unavailable(&self) {
-        self.publish(Phase::Idle, None, None, true);
+        self.publish(Phase::Idle, None, None, true, 0.0);
     }
 }
 
@@ -86,6 +91,8 @@ pub fn read_motion(rx: &CordMotionReceiver, now: Instant) -> Result<CordMotion, 
     }
     if motion.length_m.is_none_or(|x| !x.is_finite())
         || motion.speed_m_s.is_none_or(|x| !x.is_finite())
+        || !motion.retract_target_speed_m_s.is_finite()
+        || motion.retract_target_speed_m_s <= 0.0
     {
         return Err("invalid pull-cord motion feedback".into());
     }

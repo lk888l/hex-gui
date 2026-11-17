@@ -44,8 +44,8 @@ export function PaceFollowControls({ value, stopLengthM, onChange }: {
         "The drive axis follows the pace request. Steering follows cord angle around its 180° mounting center with continuous rotation. Its speed limit follows measured travel speed between the two rad/s endpoints in the module panel.")}
     </Typography.Paragraph>
     <Typography.Paragraph type="secondary" className="simulator-card-hint">
-      {tr(`发车后长线保护为 ${stopLengthM.toFixed(2)} m，取“保持线长＋保护余量”和原停止线长的较大值。旧发车门限不会打断绳长保持。停住时不为追求精确线长自行移动。修改后应用参数。`,
-        `Running stop guard: ${stopLengthM.toFixed(2)} m, the larger of follow gap plus margin and the original stop length. Old launch thresholds do not interrupt gap holding. The cart does not move a stationary person to chase an exact gap. Apply edited parameters.`)}
+      {tr(`发车后长线保护为 ${stopLengthM.toFixed(2)} m，取“保持线长＋保护余量”和原停止线长的较大值。运行中达到“切换身前线长”时，先制动至停稳，再按当前线长进入身前引导；该切换优先于步速同步和长线停车。停住时不为追求精确线长自行移动。修改后应用参数。`,
+        `Running stop guard: ${stopLengthM.toFixed(2)} m, the larger of follow gap plus margin and the original stop length. Reaching the Ahead switch length during a run brakes to a confirmed stop, then enters Ahead guidance according to the current cord length. This takes priority over pace matching and long-cord stops. The cart does not move a stationary person to chase an exact gap. Apply edited parameters.`)}
     </Typography.Paragraph>
     <Collapse size="small" items={[{ key: "response", label: tr("跟随响应与保护", "Response and protection"), children: controls(advanced) }]} />
   </Card>;

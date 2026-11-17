@@ -10,9 +10,10 @@ import { BehindSpeedControls } from "./BehindSpeedControls";
 // Retain the reference controller's 200 RPM tuning envelope, with HopeA3 wheels.
 const MAX_FOLLOW_MPS = 200 * Math.PI * 0.154 / 60;
 
-export function PullChassisPanel({ status, liveInput, pullReady, unavailable, refresh }: {
+export function PullChassisPanel({ status, liveInput, retractTargetSpeedMps, pullReady, unavailable, refresh }: {
   status?: PullChassisStatus;
   liveInput: FollowInput;
+  retractTargetSpeedMps: number | null;
   pullReady: boolean;
   unavailable: boolean;
   refresh: () => Promise<void>;
@@ -89,8 +90,12 @@ export function PullChassisPanel({ status, liveInput, pullReady, unavailable, re
   const ready = config?.source === "manual" || pullReady;
   const feedback = run?.chassis;
   const follow = run?.follow_status;
-  const phase = !running ? tr("已停止", "Stopped") : follow?.braking ? tr("长线制动", "Long-cord braking")
+  const phase = !running ? tr("已停止", "Stopped")
+    : run?.retract_braking ? tr("回收超速制动", "Retraction speed braking")
+    : follow?.braking === "ahead_switch" ? tr("切换制动", "Braking for ahead guidance")
+    : follow?.braking ? tr("长线制动", "Long-cord braking")
     : follow?.payout_stop ? tr("猛拉停车", "Payout stop")
+    : follow?.travel_mode === "ahead" ? tr("身前引导", "Ahead guidance")
     : follow?.waiting_for_pull_back ? tr("等待收线重启", "Waiting for retraction")
     : follow?.retract_resume ? tr("收线重启", "Retraction restart")
     : follow?.pace_active ? tr("步速同步", "Pace matching")
@@ -180,6 +185,25 @@ export function PullChassisPanel({ status, liveInput, pullReady, unavailable, re
         {field("directionDeadbandDeg", tr("转向死区 °", "Turning deadband °"), 0, 45, 1)}
         {field("smoothingMs", tr("平滑时间 ms", "Smoothing ms"), 0, 2000, 10)}
       </div>
+      <Card size="small" title={tr("回收超速制动", "Retraction speed braking")} style={{ marginBottom: 12 }}>
+        <Space wrap align="end">
+          <Checkbox aria-label="Use retract target speed" checked={config.retract_brake_speed_mps == null}
+            disabled={busy || (config.retract_brake_speed_mps == null && retractTargetSpeedMps == null)}
+            onChange={event => set("retract_brake_speed_mps", event.target.checked ? null : retractTargetSpeedMps)}>
+            {tr("使用收线目标速度", "Use retract target speed")}
+          </Checkbox>
+          <label className="pull-chassis-field">{tr("回收制动速度 m/s", "Retraction brake threshold m/s")}
+            <InputNumber aria-label="Retraction brake threshold m/s" min={0.01} step={0.05}
+              disabled={busy || config.retract_brake_speed_mps == null}
+              value={config.retract_brake_speed_mps ?? retractTargetSpeedMps}
+              onChange={value => { if (value != null) set("retract_brake_speed_mps", value); }} />
+          </label>
+        </Space>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+          {tr("仅实时设备跟随生效。实测收线速率达到阈值时，以本 app 当前各项减速度的最大值制动，并停止转向。停稳且收线速率降至阈值的 95% 以下后，重新按当前线长和线速跟随。默认跟随拉线模块已应用的收线目标速度；取消勾选可自定义，修改后应用并保存。",
+            "Applies to live device follow. At the measured retraction threshold, brake using the largest configured deceleration and stop turning. Following resumes from current cord input after the chassis stops and retraction falls below 95% of the threshold. By default, track the cord module's applied retract target; uncheck to customize, then apply and save.")}
+        </Typography.Paragraph>
+      </Card>
       {config.mode === "behind" && <Space direction="vertical" style={{ width: "100%" }} size={12}>
         <PaceFollowControls value={config.follow.pace}
           stopLengthM={Math.max(config.follow.behindStopCordLengthM, config.follow.pace.targetLengthM + config.follow.pace.stopMarginM)}
@@ -213,6 +237,8 @@ export function PullChassisPanel({ status, liveInput, pullReady, unavailable, re
         <Descriptions.Item label={tr("指令前进 / 转向", "Forward / yaw command")}>{fmt(feedback?.cmd_vx)} m/s · {fmt(feedback?.cmd_wz)} rad/s</Descriptions.Item>
         <Descriptions.Item label={tr("实测前进 / 转向", "Measured forward / yaw")}>{fmt(feedback?.meas_vx)} m/s · {fmt(feedback?.meas_wz)} rad/s</Descriptions.Item>
         <Descriptions.Item label={tr("运行长线保护", "Running stop length")}>{fmt(follow?.pace_stop_length_m)} m</Descriptions.Item>
+        <Descriptions.Item label={tr("运行回收制动阈值", "Running retraction brake threshold")}>{fmt(run.retract_brake_speed_mps)} m/s</Descriptions.Item>
+        <Descriptions.Item label={tr("回收制动减速度", "Retraction brake deceleration")}>{fmt(run.retract_brake_speed_mps == null ? null : run.retract_brake_deceleration_mps2)} m/s²</Descriptions.Item>
       </Descriptions>
       <BasePoseViewer connected={running} poseX={feedback?.pose_x ?? 0} poseY={feedback?.pose_y ?? 0} theta={feedback?.pose_theta ?? 0}
         vx={feedback?.meas_vx ?? 0} vy={feedback?.meas_vy ?? 0} wz={feedback?.meas_wz ?? 0} />

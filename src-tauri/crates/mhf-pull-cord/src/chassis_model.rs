@@ -133,7 +133,7 @@ pub struct FollowParameters {
     pub behind_target_cord_length_m: f64,
     /// Behind-follow speed reaches zero at this payout.
     pub behind_stop_cord_length_m: f64,
-    /// At or above this payout, a selected Behind mode uses Ahead motion instead.
+    /// At or above this payout, Behind (including running pace) brakes into Ahead motion.
     pub behind_ahead_switch_cord_length_m: f64,
     pub behind_speed: BehindSpeedParameters,
     pub pace: PaceFollowParameters,
@@ -1086,18 +1086,13 @@ impl FollowController {
         let behind_motion = v0 * c.cord_exit_side.sign() > 0.0
             || measured_linear_mps
                 .is_none_or(|v| !v.is_finite() || v * c.cord_exit_side.sign() > 0.02);
-        if pace_tracking {
-            // Old launch stop/switch lines may be right at the desired gap.
-            // A running follower never reverses just because the gap opens.
-            if self.braking.is_none()
-                && length >= p.pace.stop_length(c)
-                && !self.retract_resume
-                && !self.retract_braking
-            {
-                self.braking = Some(BehindBraking::StopLine);
-            }
-            return;
-        }
+        let stop_length = if pace_tracking {
+            p.pace.stop_length(c)
+        } else {
+            p.behind_stop_cord_length_m
+        };
+        // The Ahead threshold remains active after pace launch, even when
+        // the running stop guard is at or beyond it. Finish braking first.
         if length >= p.behind_ahead_switch_cord_length_m
             && (behind_motion
                 || self.braking.is_some()
@@ -1105,7 +1100,7 @@ impl FollowController {
         {
             self.braking = Some(BehindBraking::AheadSwitch);
         } else if self.braking.is_none()
-            && length >= p.behind_stop_cord_length_m
+            && length >= stop_length
             && length < p.behind_ahead_switch_cord_length_m
             && !self.retract_resume
             && !self.retract_braking
@@ -1189,11 +1184,11 @@ impl FollowController {
         } else {
             p.behind_target_cord_length_m
         };
-        let behind_region = pace_tracking || length < p.behind_ahead_switch_cord_length_m;
+        let behind_region = length < p.behind_ahead_switch_cord_length_m;
         self.update_payout_stop(input, v0, stopped, dt, c);
         self.update_braking(length, v0, measured_linear_mps, stopped, c, pace_tracking);
         let payout_stop = self.payout_stop_resume_length_m.is_some();
-        let pace_can_take_over = pace_selected && length < stop_length;
+        let pace_can_take_over = pace_selected && behind_region && length < stop_length;
         let retracting = retract_speed > tuning.speed_deadband_mps.max(0.02);
         if c.mode != WalkMode::Behind
             || length <= target_length
@@ -1256,6 +1251,7 @@ impl FollowController {
             && self.braking.is_none();
         let pace_min_length = self.pace.minimum_length(c);
         let pace_active = pace_selected
+            && behind_region
             && length > pace_min_length
             && length < stop_length
             && p.max_speed_mps > 0.0
@@ -1284,7 +1280,7 @@ impl FollowController {
         } else {
             self.filtered_speed_mps = None;
         }
-        let mut request = if pace_tracking {
+        let mut request = if pace_tracking && behind_region {
             LongitudinalRequest {
                 speed_mps: 0.0,
                 travel_mode: WalkMode::Behind,
@@ -1297,9 +1293,15 @@ impl FollowController {
             request.speed_mps = pace.speed_mps;
             pace
         } else {
-            if pace_tracking && length > pace_min_length && p.max_speed_mps > 0.0 {
+            if pace_tracking
+                && (self.braking.is_some()
+                    || (behind_region && length > pace_min_length && p.max_speed_mps > 0.0))
+            {
                 self.pace.suspend();
             } else {
+                // Ahead takeover discards the old pace estimate. During
+                // braking, retain tracking so cord bounce keeps the run's
+                // stop guard and cannot weaken an already active brake.
                 self.pace.reset();
             }
             Default::default()
@@ -1346,9 +1348,16 @@ impl FollowController {
                     tuning.stop_deceleration_mps2.max(p.pace.deceleration_mps2)
                 }
                 BehindBraking::StopLine => tuning.stop_deceleration_mps2,
-                BehindBraking::AheadSwitch => tuning
-                    .switch_deceleration_mps2
-                    .max(tuning.stop_deceleration_mps2),
+                BehindBraking::AheadSwitch => {
+                    let rate = tuning
+                        .switch_deceleration_mps2
+                        .max(tuning.stop_deceleration_mps2);
+                    if pace_tracking {
+                        rate.max(p.pace.deceleration_mps2)
+                    } else {
+                        rate
+                    }
+                }
             };
             if payout_stop {
                 rate.max(tuning.payout_stop_deceleration_mps2)
@@ -1472,6 +1481,10 @@ mod pace_tests;
 #[cfg(test)]
 #[path = "pace_length_tests.rs"]
 mod pace_length_tests;
+
+#[cfg(test)]
+#[path = "pace_switch_tests.rs"]
+mod pace_switch_tests;
 
 #[cfg(test)]
 #[path = "single_steering_tests.rs"]

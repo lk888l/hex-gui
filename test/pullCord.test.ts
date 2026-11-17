@@ -91,6 +91,7 @@ async function mount(t: TestContext) {
   return {
     calls, errors, button, api,
     get status() { return status; },
+    get chassisProps() { return renderer.root.findByType("Chassis").props; },
     failStop(value: boolean) { failStop = value; },
     deferStart(promise: Promise<never>) { startWait = promise; },
     async click(label: string) {
@@ -135,6 +136,21 @@ test("save, apply and reset keep the draft, saved template and running settings 
   assert.equal(h.value("Speed-loop Kp"), 20);
   assert.equal(h.status.run.config.a2_speed.speed_kp, 25);
   assert.deepEqual(h.calls.map(c => c[0]), ["connect", "start", "save", "apply", "defaults"]);
+});
+
+test("the automatic chassis brake threshold displays the applied cord target while running", async t => {
+  const h = await mount(t);
+  assert.equal(h.chassisProps.retractTargetSpeedMps, defaults.retract_speed_m_s);
+  await h.click("Connect Classic CAN 1 Mbps");
+  await h.click("Start / home");
+  h.edit("Retract target speed", 1.5);
+  assert.equal(h.chassisProps.retractTargetSpeedMps, defaults.retract_speed_m_s);
+  await h.click("Save locally");
+  assert.equal(h.chassisProps.retractTargetSpeedMps, defaults.retract_speed_m_s);
+  await h.click("Apply to run");
+  assert.equal(h.chassisProps.retractTargetSpeedMps, 1.5);
+  await h.click("Reset defaults");
+  assert.equal(h.chassisProps.retractTargetSpeedMps, 1.5);
 });
 
 test("a failed stop remains retryable even after the control task is no longer running", async t => {

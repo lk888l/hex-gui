@@ -7,11 +7,11 @@ the original file hashes. No sibling path or network dependency is required.
 | Local source | Upstream source | Adaptation |
 |---|---|---|
 | `src/pull_cord.rs`, `src/pull_cord/{a1,a2,friction}.rs` | `crates/control-core/src/pull_cord*` | Copied unchanged, including tests and legacy configuration compatibility |
-| `src/lingkong_pull.rs` | `crates/control-runtime/src/lingkong_pull.rs` | Import paths and adapter visibility; historical default helper is test-only |
-| `src/motion.rs` | `crates/control-runtime/src/pull_cord/motion.rs` | Copied unchanged |
+| `src/lingkong_pull.rs` | `crates/control-runtime/src/lingkong_pull.rs` | Import paths and adapter visibility; publishes the applied retract target with motion; historical default helper is test-only |
+| `src/motion.rs` | `crates/control-runtime/src/pull_cord/motion.rs` | Includes the applied retract target for the desktop chassis brake |
 | `src/runtime_support.rs` | Diagnostic struct/default in `crates/control-runtime/src/pull_cord.rs` | Extracted without the historical HEX4310 runtime |
 | `defaults.json` | `crates/control-server/defaults/settings.json`, `pull_cord` field | Same JSON object |
-| `src/chassis_model.rs`, `src/chassis_model/pace.rs`, associated `*_tests.rs` and fixtures | `crates/control-core/src/chassis_model*`, follow tests and `test/fixtures` | Algorithms unchanged; fixture include paths adjusted |
+| `src/chassis_model.rs`, `src/chassis_model/pace.rs`, associated `*_tests.rs` and fixtures | `crates/control-core/src/chassis_model*`, follow tests and `test/fixtures` | Ahead switching also applies during pace tracking; fixture include paths adjusted |
 | `chassis-defaults.json` | `crates/control-server/defaults/settings.json`, `chassis` field | Same JSON object; hardware-specific fields are not executed |
 | `../magnetic-encoder` | `crates/magnetic-encoder` | Copied unchanged |
 
@@ -26,13 +26,30 @@ The desktop uses the existing SocketCAN/gs_usb backend, checks Classic 1 Mbps,
 and does not include the Linux HTTP server or board power switching.
 Motor wire commands, control loop, homing and live torque policy are unchanged.
 
-`src-tauri/src/pull_chassis.rs` runs the same follow state machine at 100 Hz with
+`src-tauri/src/pull_chassis.rs` runs the adapted follow state machine at 100 Hz with
 native cord/encoder samples and measured HopeA3 motion. It adapts steering to
 body yaw with zero strafe, and drives the existing HexMeow HopeA3 controller at
 500 Hz on a separate CAN-FD interface. No DAMIAO hardware driver is imported.
 Live sessions retain the exact cord publication and invalidation epoch, reject
 stale feedback, and require explicit restart after stopping. A native command
 deadline prevents a stalled producer from retaining wheel motion.
+
+`src-tauri/src/pull_chassis_control.rs` adds a desktop-only live retraction-speed
+brake ahead of all shared follow modes. Its adjustable threshold defaults to
+the cord run's applied target, carried in the same motion publication. Braking
+uses the largest configured deceleration, holds until measured translation and
+yaw stop, and releases below 95% of the threshold. Manual bench behavior remains
+the shared state machine's behavior. The optional override is persisted in the
+desktop chassis settings; missing legacy fields select the automatic target.
+
+The desktop follow model applies `behindAheadSwitchCordLengthM` during an
+established pace session as well as before launch. Reaching it takes priority
+over pace matching and the running stop guard, but still requires a zero
+command and a measured stop before Ahead motion. Switch braking retains the
+pace stop rate when stronger, remains latched through cord bounce, and clears
+the previous pace estimate on Ahead takeover. Original fixture values remain
+unchanged; distance-hold tests place the switch beyond their working range,
+and `pace_switch_tests.rs` covers the runtime transition at 1.0 m.
 
 The frontend `PullCordPanel`, `PullCordChart` and `pullCordTypes.ts` derive from
 the same main-branch UI. The HTTP calls become Tauri IPC and the save target is
