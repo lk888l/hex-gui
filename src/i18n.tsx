@@ -434,6 +434,8 @@ const STRINGS = {
   },
   tagEl05Protocol: { en: "RobStride 29-bit · 1 Mbps", zh: "RobStride 29 位 · 1 Mbps" },
   toolStandardMit: { en: "Standard MIT Motor Control", zh: "标准 MIT 电机控制" },
+  toolArmAxis3: { en: "Arm Axis 3 · Zero Gravity", zh: "机械臂第 3 轴 · 零重力测试" },
+  toolArmAxis3Desc: { en: "Single-axis URDF gravity support over Standard MIT, with pose reference and live feedback.", zh: "基于总装 URDF 的单轴重力补偿，使用标准 MIT 控制，支持姿态参考和实时反馈。" },
   toolStandardMitDesc: {
     en: "Independent 11-bit MIT control, live charts, pendulum tests, gravity support and optional EL05 manual settings.",
     zh: "独立的 11 位 MIT 控制，支持实时曲线、摆锤测试、重力补偿及可选的 EL05 手册扩展设置。",

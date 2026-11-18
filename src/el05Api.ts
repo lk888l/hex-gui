@@ -76,6 +76,7 @@ export interface El05State {
 }
 
 export interface El05GravityReference {
+  axis3?: Axis3Calibration | null;
   id: string;
   motor_id: number;
   position_rad: number;
@@ -83,6 +84,7 @@ export interface El05GravityReference {
 }
 
 export interface El05GravityCompensationConfig {
+  axis3?: Axis3GravityConfig | null;
   reference_id: string;
   mass_kg: number;
   length_m: number;
@@ -273,6 +275,29 @@ export const el05Api = {
 export type MotorWorkspaceApi = ReturnType<typeof motorApi>;
 export const standardMitApi = {
   ...motorApi("mit"),
+  axis3Model: (config: Axis3GravityConfig) => invoke<Axis3ModelInfo>("mit_axis3_model", { config }),
+  captureAxis3Reference: (calibration: Axis3Calibration) => invoke<El05GravityReference>("mit_capture_axis3_reference", { calibration }),
   saveParameters: () => invoke<El05Identity>("mit_save_parameters"),
   setReporting: (enabled: boolean) => invoke<void>("mit_set_reporting", { enabled }),
 };
+
+export interface Axis3Calibration {
+  joint_angle_rad: number;
+  encoder_direction: 1 | -1;
+}
+export interface Axis3GravityConfig {
+  gravity_base_m_s2: [number, number, number];
+}
+export interface Axis3ModelInfo {
+  robot_name: string;
+  joint_name: string;
+  moving_links: string[];
+  mass_kg: number;
+  com_joint_m: [number, number, number];
+  axis_joint: [number, number, number];
+  lower_rad: number;
+  upper_rad: number;
+  sin_nm: number;
+  cos_nm: number;
+  peak_nm: number;
+}

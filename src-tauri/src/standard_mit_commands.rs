@@ -210,3 +210,22 @@ pub async fn mit_stop_gravity_compensation(state: State<'_, AppState>) -> CmdRes
         .await
         .map_err(error)
 }
+
+#[tauri::command]
+pub fn mit_axis3_model(
+    config: crate::arm_axis3::Axis3GravityConfig,
+) -> CmdResult<crate::arm_axis3::Axis3ModelInfo> {
+    crate::arm_axis3::model_info(&config).map_err(error)
+}
+
+#[tauri::command]
+pub async fn mit_capture_axis3_reference(
+    state: State<'_, AppState>,
+    calibration: crate::arm_axis3::Axis3Calibration,
+) -> CmdResult<GravityReference> {
+    session(&state)
+        .await?
+        .capture_axis3_reference(calibration)
+        .await
+        .map_err(error)
+}

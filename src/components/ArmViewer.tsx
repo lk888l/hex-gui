@@ -21,6 +21,9 @@ interface Props {
   previewQ?: number[] | null; // 悬浮预设时的目标位姿(幽灵臂)
   armQuat?: [number, number, number, number] | null; // 整臂朝向(x,y,z,w);给了就直接用它转臂(四元数模式),否则从重力方向反推
   urdfXml?: string | null; // 机器人级 URDF(整机 arm+EE 或臂-only);给了就渲它,否则退到捆的 firefly
+  urdfUrl?: string;
+  packages?: Readonly<Record<string, string>>;
+  fitToModel?: boolean;
 }
 
 function createArmPlaceholder(): THREE.Group {
@@ -93,8 +96,10 @@ function loadErrorMessage(error: unknown): string {
   try { return JSON.stringify(error); } catch { return String(error); }
 }
 
-export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }: Props) {
+export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, urdfUrl, packages, fitToModel = false }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
   const robotRef = useRef<URDFRobot | null>(null);
   const ghostRef = useRef<URDFRobot | null>(null);
   const placeholderRef = useRef<THREE.Group | null>(null);
@@ -121,6 +126,7 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x1a1d23);
     const camera = new THREE.PerspectiveCamera(50, W / H, 0.01, 100);
+    cameraRef.current = camera;
     camera.position.set(0.7, -0.9, 0.7);
     camera.up.set(0, 0, 1); // URDF 是 Z-up
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -128,6 +134,7 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
     renderer.setPixelRatio(window.devicePixelRatio);
     mount.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
+    controlsRef.current = controls;
     controls.target.set(0, 0, 0); // 始终绕零点(基座原点)旋转/缩放
     controls.enablePan = false;   // 禁止平移 → 只能绕零点 orbit + zoom
 
@@ -171,6 +178,8 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
       controls.dispose();
+      cameraRef.current = null;
+      controlsRef.current = null;
       disposeArmModels(robotRef.current, ghostRef.current);
       robotRef.current = null;
       ghostRef.current = null;
@@ -198,7 +207,8 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
     const job = beginUrdfLoad({
       source: urdfXml
         ? { kind: "xml", xml: urdfXml, label: "controller://inline-robot.urdf" }
-        : { kind: "url", url: DEFAULT_ARM_URDF_URL },
+        : { kind: "url", url: urdfUrl ?? DEFAULT_ARM_URDF_URL },
+      packages,
     });
     loadJobRef.current = job;
 
@@ -243,6 +253,15 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
       armRoot.add(robot, ghost);
       robotRef.current = robot;
       ghostRef.current = ghost;
+      if (fitToModel && cameraRef.current && controlsRef.current) {
+        const bounds = new THREE.Box3().setFromObject(robot).getBoundingSphere(new THREE.Sphere());
+        const camera = cameraRef.current;
+        const halfFov = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.min(1, camera.aspect));
+        const distance = Math.max(0.1, bounds.radius) / Math.sin(halfFov) * 1.2;
+        camera.position.copy(bounds.center).add(new THREE.Vector3(0.7, -0.9, 0.7).normalize().multiplyScalar(distance));
+        controlsRef.current.target.copy(bounds.center);
+        controlsRef.current.update();
+      }
       autoJointsRef.current = automaticNames;
 
       if (placeholderRef.current) {
@@ -266,7 +285,7 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml }
       job.cancel();
       if (loadJobRef.current === job) loadJobRef.current = null;
     };
-  }, [urdfXml, retryGeneration]);
+  }, [urdfXml, urdfUrl, packages, fitToModel, retryGeneration]);
 
   // 实时关节角
   useEffect(() => {

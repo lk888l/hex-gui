@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="总装URDF">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.0900230484725293 -0.0120821347800044 0.0631139890792473"
+        rpy="0 0 0" />
+      <mass
+        value="2.47741357374595" />
+      <inertia
+        ixx="0.000969293916923037"
+        ixy="-6.64629081925697E-06"
+        ixz="-1.57927047552224E-05"
+        iyy="0.00166706965202514"
+        iyz="4.87888541676276E-07"
+        izz="0.00171379805564106" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="Link1">
+    <inertial>
+      <origin
+        xyz="0.031471447375396 0.0315751076045458 0.0235729357481616"
+        rpy="0 0 0" />
+      <mass
+        value="0.214060387105929" />
+      <inertia
+        ixx="6.01467971637012E-05"
+        ixy="-1.60958177142439E-05"
+        ixz="-6.66971511138885E-07"
+        iyy="6.70533542920959E-05"
+        iyz="-6.49390266138982E-07"
+        izz="8.1082327430326E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Link1"
+    type="revolute">
+    <origin
+      xyz="0.0033191 0.018419 0.13141"
+      rpy="1.5708 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="Link1" />
+    <axis
+      xyz="9.5742E-05 0 1" />
+    <limit
+      lower="0"
+      upper="3.14"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="Link2">
+    <inertial>
+      <origin
+        xyz="-0.00434607783489679 -4.11496580722797E-07 -0.0825242553144981"
+        rpy="0 0 0" />
+      <mass
+        value="0.152730310890769" />
+      <inertia
+        ixx="4.05532733034297E-05"
+        ixy="6.1761133741232E-10"
+        ixz="2.42871619067766E-07"
+        iyy="3.41591523204546E-05"
+        iyz="1.74226940292492E-11"
+        izz="3.44752151238664E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Link2"
+    type="fixed">
+    <origin
+      xyz="0.055002 0.079 0.016495"
+      rpy="-1.5708 0 0" />
+    <parent
+      link="Link1" />
+    <child
+      link="Link2" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="Link3">
+    <inertial>
+      <origin
+        xyz="-0.000261800306299996 0.0103070182527014 0.0374905873156564"
+        rpy="0 0 0" />
+      <mass
+        value="0.592395418259202" />
+      <inertia
+        ixx="0.000284516839857037"
+        ixy="1.41682467959398E-06"
+        ixz="-1.74224387477283E-06"
+        iyy="0.000207735791272296"
+        iyz="1.02148200025712E-05"
+        izz="0.000332314746797863" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link3.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://总装URDF/meshes/Link3.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Link3"
+    type="fixed">
+    <origin
+      xyz="0.027999999871668 0 -0.084"
+      rpy="-1.5707963267949 0 -1.5707005845624" />
+    <parent
+      link="Link2" />
+    <child
+      link="Link3" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+</robot>

@@ -442,6 +442,29 @@ export const TUTORIALS: Record<string, Slide[]> = {
       },
     },
   ],
+  armAxis3: [
+    {
+      title: { en: "1 · Mount and connect", zh: "1 · 固定总成并连接" },
+      body: {
+        en: "This app uses the supplied assembly's sole revolute joint Link1 as arm axis 3. Fixed Link2 and Link3 masses are included; the base is stationary. Use Standard MIT at 1 Mbps with joint-output rad/Nm and EL05-compatible ranges. Select the axis-3 motor ID; the axis number does not imply CAN ID 3. Set gravity in the base frame if +Z is not upward.",
+        zh: "以总装 URDF 唯一的转动关节 Link1 作为机械臂第 3 轴，补偿计入固定连接的 Link2、Link3，底座保持固定。使用 1 Mbps 标准 MIT、关节输出端 rad/Nm 与 EL05 兼容量程。选择第 3 轴对应的电机 ID；第 3 轴不意味着 CAN ID 为 3。若底座 +Z 不朝上，填写实际底座重力向量。",
+      },
+    },
+    {
+      title: { en: "2 · Capture the pose reference", zh: "2 · 记录姿态参考" },
+      body: {
+        en: "Use the offline 3D preview to find the URDF reference pose. Support the assembly, stop the motor and align it to the entered angle (default 0°). Capture the reference while stationary. Check the model follows a gentle manual movement; reverse direction and recapture if necessary. Encoder zeroing is optional and invalidates the reference. After a reconnect, selection change or feedback gap, capture again.",
+        zh: "先用离线三维预览查看 URDF 参考姿态。托住机构、停止电机，并摆到所填写的角度（默认 0°），静止后记录参考。手动轻推确认模型与实物同向，必要时反转方向并重新记录。编码器清零为可选操作，清零后参考失效；重连、切换电机或反馈中断后也需重新记录。",
+      },
+    },
+    {
+      title: { en: "3 · Start zero gravity", zh: "3 · 开启零重力" },
+      body: {
+        en: "Set compensation scale, damping and limits, then start. MIT Kp and Kd stay zero; the host sends URDF gravity support plus velocity damping. The gravity component ramps in. Angle, speed, temperature, feedback and client-heartbeat guards stop output. Stop removes support torque immediately. This test models only the supplied assembly, with no extra payload or moving upstream joints.",
+        zh: "设置补偿比例、阻尼和保护阈值后启动。MIT 的 Kp、Kd 均为 0，主机发送 URDF 重力补偿与速度阻尼，重力分量逐渐加入。角度、速度、温度、反馈和界面心跳保护会触发停机。停止会立即撤去支撑转矩。此测试只计算提供的总成，不包含额外负载或上游关节运动。",
+      },
+    },
+  ],
   standardMit: [
     {
       title: { en: "1 · Connect a standard MIT motor", zh: "1 · 连接标准 MIT 电机" },

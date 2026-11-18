@@ -385,6 +385,32 @@ bus with the right settings:
   parameter-read failures are shown explicitly, since older EL05 firmware may
   not implement every optional parameter in the current manual.
 
+- **Other → Arm Axis 3 · Zero Gravity** — a focused single-axis test based on
+  the Standard MIT connection and control engine. It bundles the operator's
+  `总装URDF` assembly, using its only revolute joint `Link1` as physical axis 3
+  and including the fixed `Link2` / `Link3` masses. No controller or NAS access
+  is needed at runtime. Select the actual motor CAN ID (not necessarily 3).
+  Use the 3D preview to align the supported, stopped assembly with a known URDF
+  pose (default 0°), choose encoder direction and **Capture reference**. The
+  backend binds that measured encoder position and URDF angle to this motor
+  session. Optional **Zero encoder** uses the MIT zero command and confirmed
+  delayed readback; it invalidates the reference and requires recapture.
+  Reconnects, motor selection and feedback gaps also require recapture.
+
+  The app sends `Kp=Kd=0`, with
+  `q = q_ref + direction × (encoder − encoder_ref)` and
+  `torque = direction × scale × G(q) − damping × encoder_velocity`.
+  Gravity support ramps in; torque limiting and URDF angle, velocity,
+  temperature, feedback and client-heartbeat guards run in the backend.
+  Defaults: scale 1, damping 0.1 Nm·s/rad, torque limit 1.5 Nm, speed limit
+  1 rad/s, temperature limit 60°C and ramp 2 s. The original URDF's 0–3.14 rad
+  range is enforced. The base must remain fixed; enter base-frame gravity if
+  it is tilted. Motor position/torque must use joint-output rad/Nm. Additional
+  payload and moving upstream joints are outside this assembly model. Stop,
+  leaving the app and window close use the Standard MIT stop lifecycle.
+  **Support the mechanism before stopping: Stop immediately removes support
+  torque.** See [model provenance and computed parameters](public/axis3/README.md).
+
 - **Other → Standard MIT Motor Control** — a separate app for 11-bit standard-frame
   motors with the EL05-compatible MIT format. It has its own connection, IPC
   commands, operator heartbeat, CAN ownership and experiment history. Native

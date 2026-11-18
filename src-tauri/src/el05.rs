@@ -304,7 +304,7 @@ struct Shared {
     selection_generation: u64,
     mit_requests: BTreeMap<u8, Instant>,
 }
-const MIT_SATURATED_POSITION_MESSAGE: &str = "standard MIT position feedback is saturated at ±12.57 rad; stop the motor, set its mechanical zero, then capture the downward reference again";
+const MIT_SATURATED_POSITION_MESSAGE: &str = "standard MIT position feedback is saturated at ±12.57 rad; stop the motor, set its mechanical zero, then capture the gravity reference again";
 
 impl Shared {
     fn standard_position_saturated(&self) -> bool {
@@ -545,7 +545,7 @@ impl El05Session {
             }
             s.receive_error = None;
             s.gravity.invalidate_reference(
-                "motor selection changed; capture the downward reference again",
+                "motor selection changed; capture the gravity reference again",
             );
             s.client_seen = Instant::now();
         }
@@ -837,7 +837,7 @@ impl El05Session {
             .lock()
             .unwrap()
             .gravity
-            .invalidate_reference("motor ID changed; capture the downward reference again");
+            .invalidate_reference("motor ID changed; capture the gravity reference again");
         let original = self
             .inner
             .query_identity_locked(old_id, host)
@@ -966,7 +966,7 @@ impl El05Session {
             s.view.position_velocity_rad_s = None;
             s.position_window.clear();
             s.gravity.invalidate_reference(
-                "mechanical zero changed; capture the downward reference again",
+                "mechanical zero changed; capture the gravity reference again",
             );
             s.feedback_sequence
         };
@@ -1083,6 +1083,24 @@ impl El05Session {
         self.stop().await
     }
     pub async fn capture_gravity_reference(&self) -> Result<GravityReference> {
+        self.capture_reference(None).await
+    }
+
+    pub async fn capture_axis3_reference(
+        &self,
+        calibration: crate::arm_axis3::Axis3Calibration,
+    ) -> Result<GravityReference> {
+        calibration.validate()?;
+        if self.inner.protocol != El05Protocol::StandardMit {
+            bail!("axis-3 testing requires the Standard MIT transport");
+        }
+        self.capture_reference(Some(calibration)).await
+    }
+
+    async fn capture_reference(
+        &self,
+        axis3: Option<crate::arm_axis3::Axis3Calibration>,
+    ) -> Result<GravityReference> {
         let _start_guard = self.start_gate.lock().await;
         let _guard = self.inner.gate.lock().await;
         let (id, host, _) = self.inner.selected()?;
@@ -1105,7 +1123,10 @@ impl El05Session {
             .ok_or_else(|| anyhow!("select an EL05 motor first"))?;
         let position = s.view.unwrapped_position_rad.unwrap();
         let captured_at_s = s.epoch.elapsed().as_secs_f64();
-        Ok(s.gravity.capture(id, binding, position, captured_at_s))
+        s.gravity.capture(id, binding, position, captured_at_s);
+        let reference = s.gravity.status.reference.as_mut().unwrap();
+        reference.axis3 = axis3;
+        Ok(reference.clone())
     }
 
     pub async fn start_gravity_compensation(
@@ -1427,7 +1448,7 @@ impl El05Session {
         s.target = None;
         s.experiment.finish("session closed");
         s.gravity
-            .invalidate_reference("session closed; capture the downward reference again");
+            .invalidate_reference("session closed; capture the gravity reference again");
         s.armed = false;
         s.view.connected = false;
         s.view.attached = false;
@@ -1738,9 +1759,15 @@ fn validate_torque_accuracy_reference(s: &Shared, config: &ExperimentConfig) -> 
         s.view.motor_id.unwrap_or(0),
         s.gravity_binding().as_deref(),
     ) {
-        bail!("capture the downward reference again for this motor and coordinate session");
+        bail!("capture the gravity reference again for this motor and coordinate session");
     }
-    let zero = s.gravity.status.reference.as_ref().unwrap().position_rad;
+    let reference = s.gravity.status.reference.as_ref().unwrap();
+    if reference.axis3.is_some() {
+        bail!(
+            "torque accuracy requires a pendulum downward reference, not an axis-3 URDF reference"
+        );
+    }
+    let zero = reference.position_rad;
     let position = s
         .view
         .unwrapped_position_rad
@@ -1782,7 +1809,10 @@ fn validate_gravity_reference(s: &Shared, config: &GravityCompensationConfig) ->
         motor_id,
         s.gravity_binding().as_deref(),
     ) {
-        bail!("EL05 downward reference is missing or belongs to an older motor/coordinate session; capture it again");
+        bail!("gravity reference is missing or belongs to an older motor/coordinate session; capture it again");
+    }
+    if config.axis3.is_some() != s.gravity.status.reference.as_ref().unwrap().axis3.is_some() {
+        bail!("reference model mismatch: capture an axis-3 URDF reference for axis-3 control, or a downward reference for pendulum control");
     }
     Ok(())
 }
@@ -1795,7 +1825,7 @@ fn validate_gravity_capture(s: &Shared) -> Result<()> {
         || s.experiment.status.active
         || s.gravity.status.active
     {
-        bail!("stop EL05 before capturing the pendulum downward reference");
+        bail!("stop the motor before capturing the gravity reference");
     }
     if s.standard_position_saturated() {
         bail!("{MIT_SATURATED_POSITION_MESSAGE}");
@@ -1808,7 +1838,7 @@ fn validate_gravity_capture(s: &Shared) -> Result<()> {
         || s.drive_faulted()
         || s.view.unwrapped_position_rad.is_none_or(|q| !q.is_finite())
     {
-        bail!("EL05 downward reference requires fresh feedback, a confirmed mode and no faults");
+        bail!("gravity reference requires fresh feedback, a confirmed mode and no faults");
     }
     if s.view
         .velocity_rad_s
@@ -1817,7 +1847,7 @@ fn validate_gravity_capture(s: &Shared) -> Result<()> {
             .position_velocity_rad_s
             .is_some_and(|v| !v.is_finite() || v.abs() > gravity::CAPTURE_MAX_SPEED)
     {
-        bail!("hold the pendulum still vertically down (speed must be at most 0.1 rad/s), then capture its reference");
+        bail!("hold the mechanism still at the chosen reference pose (speed must be at most 0.1 rad/s), then capture its reference");
     }
     Ok(())
 }
@@ -1830,6 +1860,19 @@ fn gravity_input_problem(
     if let Some(error) = &s.receive_error {
         return Some(error.clone());
     }
+    if config.axis3.is_some() {
+        if let Some(reference) = &s.gravity.status.reference {
+            if let Some(calibration) = &reference.axis3 {
+                let angle = calibration.joint_angle(
+                    s.view.unwrapped_position_rad.unwrap_or(f64::NAN),
+                    reference.position_rad,
+                );
+                if !crate::arm_axis3::angle_in_limits(angle) {
+                    return Some("Axis-3 angle outside URDF limits; motor stopped".into());
+                }
+            }
+        }
+    }
     let problem = if s.standard_position_saturated() {
         Some(MIT_SATURATED_POSITION_MESSAGE)
     } else if s
@@ -1837,7 +1880,7 @@ fn gravity_input_problem(
         .back()
         .is_none_or(|t| t.elapsed() > s.gravity_feedback_timeout())
     {
-        Some("EL05 gravity compensation feedback timed out; capture the downward reference again")
+        Some("EL05 gravity compensation feedback timed out; capture the gravity reference again")
     } else if s.drive_faulted() {
         Some("EL05 gravity compensation stopped on a drive fault")
     } else if s.view.mode != El05Mode::Mit || !s.mode_confirmed {
@@ -1896,7 +1939,7 @@ async fn service_loop(inner: Arc<Inner>) {
                     .is_none_or(|t| t.elapsed() > s.gravity_feedback_timeout())
                 {
                     Some(
-                        "EL05 gravity feedback timed out; capture the downward reference again"
+                        "EL05 gravity feedback timed out; capture the gravity reference again"
                             .to_string(),
                     )
                 } else {
@@ -2126,7 +2169,7 @@ async fn receive_loop(inner: Arc<Inner>, mut rx: Box<dyn CanRx>) {
                         s.receive_error = Some(message.clone());
                     }
                     s.gravity.invalidate_reference(format!(
-                        "{message}; capture the downward reference again"
+                        "{message}; capture the gravity reference again"
                     ));
                 }
             }
@@ -2184,7 +2227,7 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
                 && s.gravity.status.reference.is_some()
             {
                 s.gravity.invalidate_reference(
-                    "EL05 motor UID changed; capture the downward reference again",
+                    "EL05 motor UID changed; capture the gravity reference again",
                 );
                 if s.armed {
                     s.receive_error = Some("EL05 motor UID changed; motor stopped".into());
@@ -2372,9 +2415,8 @@ fn record_motion_feedback(s: &mut Shared, now: Instant, id: u32, data: &[u8]) {
             .is_some_and(|last| now.duration_since(*last) > s.gravity_feedback_timeout())
     {
         let active = s.gravity.status.active;
-        s.gravity.invalidate_reference(
-            "EL05 gravity feedback gap; capture the downward reference again",
-        );
+        s.gravity
+            .invalidate_reference("EL05 gravity feedback gap; capture the gravity reference again");
         if active {
             s.receive_error = Some("EL05 gravity feedback gap; motor stopped".into());
         }
@@ -2995,6 +3037,7 @@ mod tests {
     async fn gravity_config(app: &El05Session) -> GravityCompensationConfig {
         let reference = app.capture_gravity_reference().await.unwrap();
         GravityCompensationConfig {
+            axis3: None,
             reference_id: reference.id,
             mass_kg: 0.5,
             length_m: 0.18,

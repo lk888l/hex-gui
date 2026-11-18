@@ -25,7 +25,7 @@ import { DfuPanel } from "./components/DfuPanel";
 import { AuthenticityPanel } from "./components/AuthenticityPanel";
 import { DamiaoMotorPanel } from "./components/DamiaoMotorPanel";
 import { RollerCanControlPanel } from "./components/RollerCanControlPanel";
-import { El05MotorPanel } from "./components/El05MotorPanel";
+import { El05MotorPanel, MotorCanWorkspace } from "./components/El05MotorPanel";
 import { StandardMitMotorPanel } from "./components/StandardMitMotorPanel";
 import { el05Api, standardMitApi } from "./el05Api";
 import { UnitreeServoPanel } from "./components/UnitreeServoPanel";
@@ -56,6 +56,7 @@ type Tool =
   | "rollercanControl"
   | "el05"
   | "standardMit"
+  | "armAxis3"
   | "unitreeServo";
 
 const DEVICE_POLL_MS = 700;
@@ -169,7 +170,7 @@ export default function App() {
     try {
       if (tool === "el05") {
         await el05Api.disconnect();
-      } else if (tool === "standardMit") {
+      } else if (tool === "standardMit" || tool === "armAxis3") {
         await standardMitApi.disconnect();
       } else if (tool === "unitreeServo") {
         await unitreeApi.disconnect();
@@ -245,6 +246,7 @@ export default function App() {
     rollercanControl: { title: t("toolRollerCanControl"), desc: t("toolRollerCanControlDesc") },
     el05: { title: t("toolEl05"), desc: t("toolEl05Desc") },
     standardMit: { title: t("toolStandardMit"), desc: t("toolStandardMitDesc") },
+    armAxis3: { title: t("toolArmAxis3"), desc: t("toolArmAxis3Desc") },
     unitreeServo: { title: t("toolUnitreeServo"), desc: t("toolUnitreeServoDesc") },
   } satisfies Record<Tool, { title: string; desc: string }>;
   const { title: toolTitle, desc: toolDesc } = toolMeta[tool];
@@ -273,6 +275,7 @@ export default function App() {
     tool !== "rollercanControl" &&
     tool !== "el05" &&
     tool !== "standardMit" &&
+    tool !== "armAxis3" &&
     tool !== "unitreeServo";
   const showConnectBar =
     tool !== "console" &&
@@ -284,6 +287,7 @@ export default function App() {
     tool !== "dfu" &&
     tool !== "el05" &&
     tool !== "standardMit" &&
+    tool !== "armAxis3" &&
     tool !== "unitreeServo";
 
   return (
@@ -377,6 +381,8 @@ export default function App() {
             <El05MotorPanel />
           ) : tool === "standardMit" ? (
             <StandardMitMotorPanel />
+          ) : tool === "armAxis3" ? (
+            <MotorCanWorkspace protocol="StandardMit" api={standardMitApi} axis3 />
           ) : tool === "unitreeServo" ? (
             <UnitreeServoPanel onBusyChange={setUnitreeBusy} />
           ) : tool === "dfu" ? (
@@ -677,6 +683,13 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                     tag={t("tagStandardMitProtocol")}
                     accent="blue"
                     onClick={() => onPick("standardMit")}
+                  />
+                  <ToolCard
+                    title={t("toolArmAxis3")}
+                    desc={t("toolArmAxis3Desc")}
+                    tag={t("tagStandardMitProtocol")}
+                    accent="pink"
+                    onClick={() => onPick("armAxis3")}
                   />
                   <ToolCard
                     title={t("toolRollerCanControl")}

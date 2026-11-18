@@ -16,6 +16,7 @@ mod device_registry;
 mod dfu_gate;
 mod diag;
 mod dto;
+mod arm_axis3;
 mod el05;
 mod el05_commands;
 mod standard_mit_commands;
@@ -304,6 +305,8 @@ pub fn run() {
             standard_mit_commands::mit_capture_gravity_reference,
             standard_mit_commands::mit_start_gravity_compensation,
             standard_mit_commands::mit_stop_gravity_compensation,
+            standard_mit_commands::mit_axis3_model,
+            standard_mit_commands::mit_capture_axis3_reference,
             commands::list_devices,
             authenticity::authenticity_inspect,
             authenticity::authenticity_verify_online,

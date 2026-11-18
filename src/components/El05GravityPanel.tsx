@@ -4,7 +4,7 @@ import { el05Api, type MotorWorkspaceApi, type El05GravityCompensationConfig, ty
 import { pendulumModel } from "../el05Experiment";
 import { gravityReadiness, type GravityBlocker } from "../el05Gravity";
 
-type Settings = Omit<El05GravityCompensationConfig, "reference_id">;
+type Settings = Omit<El05GravityCompensationConfig, "reference_id" | "axis3">;
 const DEFAULT_SETTINGS: Settings = {
   mass_kg: 1,
   length_m: 0.18,

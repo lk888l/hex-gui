@@ -238,6 +238,7 @@ fn experiment_config(kind: ExperimentKind) -> ExperimentConfig {
 async fn gravity_config(app: &El05Session) -> GravityCompensationConfig {
     let reference = app.capture_gravity_reference().await.unwrap();
     GravityCompensationConfig {
+        axis3: None,
         reference_id: reference.id,
         mass_kg: 0.5,
         length_m: 0.18,
@@ -249,6 +250,155 @@ async fn gravity_config(app: &El05Session) -> GravityCompensationConfig {
         max_temperature_c: 60.0,
         ramp_s: 0.1,
     }
+}
+
+async fn axis3_config(app: &El05Session) -> GravityCompensationConfig {
+    let mut config = gravity_config(app).await;
+    let reference = app
+        .capture_axis3_reference(crate::arm_axis3::Axis3Calibration {
+            joint_angle_rad: 1.,
+            encoder_direction: 1,
+        })
+        .await
+        .unwrap();
+    config.reference_id = reference.id;
+    config.axis3 = Some(crate::arm_axis3::Axis3GravityConfig {
+        gravity_base_m_s2: [0., 0., -9.80665],
+    });
+    config.torque_limit_nm = 2.;
+    config
+}
+
+#[tokio::test]
+async fn axis3_reference_binding_rejects_wrong_model_zero_and_selection_changes() {
+    let (_, app) = attached(1).await;
+    let mut pendulum = gravity_config(&app).await;
+    pendulum.axis3 = Some(crate::arm_axis3::Axis3GravityConfig {
+        gravity_base_m_s2: [0., 0., -9.80665],
+    });
+    pendulum.torque_limit_nm = 2.;
+    assert!(app
+        .start_gravity_compensation(pendulum)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("model mismatch"));
+    let config = axis3_config(&app).await;
+    let mut wrong = config.clone();
+    wrong.axis3 = None;
+    assert!(app
+        .start_gravity_compensation(wrong)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("model mismatch"));
+    app.start_gravity_compensation(config.clone())
+        .await
+        .unwrap();
+    assert!(app
+        .capture_axis3_reference(crate::arm_axis3::Axis3Calibration {
+            joint_angle_rad: 0.,
+            encoder_direction: 1
+        })
+        .await
+        .is_err());
+    assert!(app
+        .send_target(
+            El05Target::Mit {
+                position_rad: 0.,
+                velocity_rad_s: 0.,
+                torque_nm: 0.,
+                kp: 0.,
+                kd: 0.
+            },
+            true
+        )
+        .await
+        .is_err());
+    app.stop().await.unwrap();
+    app.set_zero().await.unwrap();
+    assert!(app.snapshot().gravity_compensation.reference.is_none());
+    assert!(app.start_gravity_compensation(config).await.is_err());
+    let config = axis3_config(&app).await;
+    app.attach(1).await.unwrap();
+    assert!(app.start_gravity_compensation(config).await.is_err());
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn axis3_stops_on_joint_limit_fault_temperature_feedback_loss_and_heartbeat() {
+    for condition in ["angle", "fault", "temperature", "feedback", "heartbeat"] {
+        let (bus, app) = attached(1).await;
+        let config = axis3_config(&app).await;
+        app.start_gravity_compensation(config).await.unwrap();
+        assert!(bus.physical_enabled.load(Ordering::Acquire));
+        match condition {
+            "angle" => {
+                // Move the coordinate outside the model range while keeping fresh
+                // feedback, isolating the angle guard from the velocity guard.
+                app.inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .gravity
+                    .status
+                    .reference
+                    .as_mut()
+                    .unwrap()
+                    .position_rad += 2.;
+            }
+            "fault" => {
+                bus.flags.store(0x20, Ordering::Release);
+                bus.feedback();
+            }
+            "temperature" => {
+                bus.temperature_decic.store(900, Ordering::Release);
+                bus.feedback();
+            }
+            "feedback" => {
+                bus.motion_replies.store(false, Ordering::Release);
+            }
+            "heartbeat" => {
+                app.inner.state.lock().unwrap().client_seen =
+                    Instant::now() - CLIENT_TIMEOUT - Duration::from_secs(1);
+            }
+            _ => unreachable!(),
+        }
+        wait_until(&app, |s| {
+            !s.gravity_compensation.active && !s.enabled && !s.streaming
+        })
+        .await;
+        assert!(!bus.physical_enabled.load(Ordering::Acquire), "{condition}");
+        let state = app.snapshot();
+        assert_eq!(state.gravity_compensation.command_torque_nm, 0.);
+        if condition == "angle" {
+            assert!(state
+                .gravity_compensation
+                .reason
+                .unwrap()
+                .contains("URDF limits"));
+        }
+        if condition == "feedback" {
+            assert!(state.gravity_compensation.reference.is_none());
+        }
+        app.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn axis3_start_queued_before_stop_cannot_reenable_the_motor() {
+    let (bus, app) = attached(1).await;
+    let config = axis3_config(&app).await;
+    let gate = app.start_gate.lock().await;
+    let start_app = app.clone();
+    let start = tokio::spawn(async move { start_app.start_gravity_compensation(config).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    app.stop().await.unwrap();
+    drop(gate);
+    assert!(start.await.unwrap().is_err());
+    assert!(!bus.physical_enabled.load(Ordering::Acquire));
+    assert!(!app.snapshot().gravity_compensation.active);
+    app.shutdown().await.unwrap();
 }
 
 async fn accuracy_config(app: &El05Session) -> ExperimentConfig {
