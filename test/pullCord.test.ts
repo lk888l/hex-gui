@@ -103,6 +103,7 @@ async function mount(t: TestContext) {
       act(() => renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label).props.onChange(value));
     },
     value(label: string) { return renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label).props.value; },
+    max(label: string) { return renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label).props.max; },
     async poll() { await act(async () => { await tick?.(); }); },
   };
 }
@@ -120,6 +121,17 @@ test("opening and saving the pull-cord app never connects or enables a motor", a
   assert.ok(!h.calls.some(c => c[0] === "start"));
   await h.click("Start / home");
   assert.deepEqual(h.calls.at(-1), ["start", 1, defaults]);
+});
+
+test("homing and retraction speed inputs allow 1000 rpm for the configured drum", async t => {
+  const h = await mount(t);
+  for (const [radius, limit] of [[0.026, 2.7227136331111543], [0.005, 0.5235987755982989]]) {
+    h.edit("Drum radius", radius);
+    for (const label of ["Homing target speed", "Retract target speed"]) {
+      assert.ok(Math.abs(h.max(label) - limit) < 1e-12, `${label} at radius ${radius}`);
+    }
+  }
+  assert.deepEqual(h.calls, []);
 });
 
 test("save, apply and reset keep the draft, saved template and running settings separate", async t => {

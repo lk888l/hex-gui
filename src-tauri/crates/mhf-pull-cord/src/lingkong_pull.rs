@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use can_transport::{CanBus, CanFilter, CanFrame, CanIoError, CanRx, FrameKind};
 use crate::pull_cord::{
-    A1CurrentConfig, A2SpeedConfig, Phase, PullCordConfig, PullCordState,
+    A1CurrentConfig, A2SpeedConfig, Phase, PullCordConfig, PullCordState, A2_PROTOCOL_MAX_RPM,
 };
 use magnetic_encoder::EncoderMonitor;
 use tokio::task::JoinHandle;
@@ -115,15 +115,15 @@ impl HomingStall {
 
 pub(crate) fn validate_mhf_config(config: &PullCordConfig) -> Result<(), String> {
     config.validate()?;
-    let nameplate_speed_m_s = 870.0 / 60.0 * config.metres_per_rev();
-    if config.homing_speed_m_s > nameplate_speed_m_s {
+    let maximum_speed_m_s = A2_PROTOCOL_MAX_RPM / 60.0 * config.metres_per_rev();
+    if config.homing_speed_m_s > maximum_speed_m_s {
         return Err(format!(
-            "MHF5010 homing speed target must not exceed the 870 rpm nameplate ({nameplate_speed_m_s:.3} m/s at this drum radius)"
+            "MHF5010 homing speed target must not exceed the {A2_PROTOCOL_MAX_RPM} rpm protocol limit ({maximum_speed_m_s:.3} m/s at this drum radius)"
         ));
     }
-    if config.retract_speed_m_s > nameplate_speed_m_s {
+    if config.retract_speed_m_s > maximum_speed_m_s {
         return Err(format!(
-            "MHF5010 retract speed target must not exceed the 870 rpm nameplate ({nameplate_speed_m_s:.3} m/s at this drum radius)"
+            "MHF5010 retract speed target must not exceed the {A2_PROTOCOL_MAX_RPM} rpm protocol limit ({maximum_speed_m_s:.3} m/s at this drum radius)"
         ));
     }
     Ok(())
@@ -1523,6 +1523,16 @@ mod tests {
             global_torque_command(950),
             [0xC1, 0x1e, 0, 0, 0xb6, 3, 0, 0]
         );
+
+        cfg.drum_radius_m = 0.026;
+        cfg.retract_speed_m_s = 1000.0 / 60.0 * cfg.metres_per_rev();
+        validate_mhf_config(&cfg).unwrap();
+        assert_eq!(speed_raw(cfg.retract_speed_m_s, &cfg), 600_000);
+        assert_eq!(speed_raw(-cfg.retract_speed_m_s, &cfg), -600_000);
+        assert_eq!(
+            ram_settings(&cfg)[1],
+            [0xC1, 0x20, 0, 0, 0xc0, 0x27, 9, 0]
+        );
     }
 
     #[test]
@@ -1537,9 +1547,11 @@ mod tests {
     }
 
     #[test]
-    fn both_speed_targets_obey_the_nameplate_bound() {
+    fn both_speed_targets_obey_the_1000_rpm_protocol_bound() {
         let mut cfg = default_config();
-        let max = 870.0 / 60.0 * cfg.metres_per_rev();
+        cfg.drum_radius_m = 0.026;
+        let max = 1000.0 / 60.0 * cfg.metres_per_rev();
+        cfg.homing_speed_m_s = max;
         cfg.retract_speed_m_s = max;
         assert!(validate_mhf_config(&cfg).is_ok());
         cfg.retract_speed_m_s = max + 0.01;

@@ -6,7 +6,7 @@ mod a1;
 mod a2;
 mod friction;
 pub use a1::{A1CurrentConfig, A1_PROTOCOL_MAX_RAW};
-pub use a2::{A2SpeedConfig, A2_PROTOCOL_MAX_RAW};
+pub use a2::{A2SpeedConfig, A2_PROTOCOL_MAX_RAW, A2_PROTOCOL_MAX_RPM};
 pub use friction::{
     FrictionCalibration, FrictionCompensationConfig, FrictionMode, FrictionOutput, FrictionRuntime,
     FrictionSource,
@@ -215,14 +215,14 @@ impl PullCordConfig {
         }
         if let Some(a2) = self.a2_speed {
             a2.validate()?;
-            let maximum_speed_m_s = 870.0 / 60.0 * self.metres_per_rev();
+            let maximum_speed_m_s = A2_PROTOCOL_MAX_RPM / 60.0 * self.metres_per_rev();
             for (name, speed) in [
                 ("homing_speed_m_s", self.homing_speed_m_s),
                 ("retract_speed_m_s", self.retract_speed_m_s),
             ] {
                 if speed > maximum_speed_m_s {
                     return Err(format!(
-                        "{name} must not exceed the MHF5010 870 rpm rating ({maximum_speed_m_s:.3} m/s at this drum radius)"
+                        "{name} must not exceed the MHF5010 {A2_PROTOCOL_MAX_RPM} rpm protocol limit ({maximum_speed_m_s:.3} m/s at this drum radius)"
                     ));
                 }
             }

@@ -4,6 +4,8 @@ use super::{zone_profile, A1CurrentConfig, PullCordConfig, Zone};
 use serde::{Deserialize, Serialize};
 
 pub const A2_PROTOCOL_MAX_RAW: u16 = 2000;
+/// CAN V2.36 p. 15: Speed Limit (0x20) allows 600000 × 0.01 °/s = 1000 rpm.
+pub const A2_PROTOCOL_MAX_RPM: f64 = 1000.0;
 const MOTION_THRESHOLD_M_S: f64 = 0.005;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -49,7 +51,7 @@ impl Default for A2SpeedConfig {
 
 impl A2SpeedConfig {
     /// Legacy A1 running did not use the saved retraction speed. On its first
-    /// A2 migration, bound valid speed targets to this drum's motor rating.
+    /// A2 migration, bound valid speed targets to this drum's protocol limit.
     /// Explicit A2 tuning and invalid legacy values remain validation errors.
     pub fn normalize_legacy_speeds(config: &mut PullCordConfig) {
         if config.a2_speed.is_some()
@@ -58,12 +60,12 @@ impl A2SpeedConfig {
         {
             return;
         }
-        let maximum_speed_m_s = 870.0 / 60.0 * config.metres_per_rev();
+        let maximum_speed_m_s = A2_PROTOCOL_MAX_RPM / 60.0 * config.metres_per_rev();
         if !maximum_speed_m_s.is_finite() || maximum_speed_m_s <= 0.0 {
             return;
         }
         // Leave floating-point rounding room so a persisted boundary value
-        // cannot deserialize just above the rating on the next service start.
+        // cannot deserialize just above the limit on the next service start.
         let maximum_speed_m_s = maximum_speed_m_s.next_down().next_down();
         if maximum_speed_m_s <= 0.0 {
             return;
@@ -320,24 +322,27 @@ mod tests {
     }
 
     #[test]
-    fn both_a2_speed_targets_obey_the_motor_rating_for_the_configured_drum() {
-        let mut config = config();
-        let rated_m_s = 870.0 / 60.0 * config.metres_per_rev();
-        config.homing_speed_m_s = rated_m_s;
-        config.retract_speed_m_s = rated_m_s;
-        config.validate().unwrap();
-        config.homing_speed_m_s += 0.001;
-        assert!(config.validate().unwrap_err().contains("homing_speed_m_s"));
-        config.homing_speed_m_s = rated_m_s;
-        config.retract_speed_m_s += 0.001;
-        assert!(config.validate().unwrap_err().contains("retract_speed_m_s"));
+    fn both_a2_speed_targets_obey_1000_rpm_for_the_configured_drum() {
+        for radius in [0.005, 0.026, 0.0425] {
+            let mut config = config();
+            config.drum_radius_m = radius;
+            let maximum_speed_m_s = 1000.0 / 60.0 * config.metres_per_rev();
+            config.homing_speed_m_s = maximum_speed_m_s;
+            config.retract_speed_m_s = maximum_speed_m_s;
+            config.validate().unwrap();
+            config.homing_speed_m_s += 0.001;
+            assert!(config.validate().unwrap_err().contains("homing_speed_m_s"));
+            config.homing_speed_m_s = maximum_speed_m_s;
+            config.retract_speed_m_s += 0.001;
+            assert!(config.validate().unwrap_err().contains("retract_speed_m_s"));
+        }
     }
 
     #[test]
     fn only_valid_legacy_speed_values_are_clipped_during_first_a2_migration() {
         let mut legacy = PullCordConfig::default();
         legacy.drum_radius_m = 0.005;
-        let maximum_speed_m_s = 870.0 / 60.0 * legacy.metres_per_rev();
+        let maximum_speed_m_s = 1000.0 / 60.0 * legacy.metres_per_rev();
         legacy.homing_speed_m_s = 1.0;
         legacy.retract_speed_m_s = 2.6;
         A2SpeedConfig::normalize_legacy_speeds(&mut legacy);

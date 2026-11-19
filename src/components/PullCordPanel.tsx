@@ -111,7 +111,8 @@ export function PullCordPanel() {
   const clippedTargets = a2 && Math.max(a2.homing_raw,
     a2.retract_raw + Math.max(0, a2.alert_raw - a2.near_raw)) > a2.max_raw;
   const invalidLimits = !!a2 && (a2.payout_raw > a2.near_raw || a2.near_raw > a2.retract_raw);
-  const maxSpeed = draft ? 870 / 60 * 2 * Math.PI * draft.drum_radius_m : 3.87;
+  // CAN V2.36 Speed Limit: 600000 × 0.01 °/s = 1000 rpm.
+  const maxSpeed = draft ? 1000 / 60 * (2 * Math.PI * draft.drum_radius_m) : 0;
 
   return <Space direction="vertical" size={12} className="pull-cord-panel">
     {pollError && <Alert type="error" showIcon message={tr("状态读取失败", "Status unavailable")} description={pollError} />}
