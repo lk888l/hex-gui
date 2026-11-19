@@ -2,6 +2,8 @@
 //! el05_settings can0 1 --read
 //! el05_settings can0 1 --roundtrip-id 2 (temporarily changes ID, then restores it)
 
+#[path = "../src/arm_axis3.rs"]
+mod arm_axis3;
 #[path = "../src/backend.rs"]
 mod backend;
 #[path = "../src/can_lease.rs"]

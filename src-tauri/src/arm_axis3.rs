@@ -9,6 +9,8 @@ pub const URDF: &str = include_str!("../../public/axis3/assembly.urdf");
 type V3 = [f64; 3];
 type M3 = [[f64; 3]; 3];
 const IDENTITY: M3 = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+// Nominal fingertip on the Link3 tool centerline, measured from the bundled STL.
+const GRIPPER_TIP_Z_M: f64 = 0.142;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Axis3Calibration {
@@ -41,6 +43,24 @@ impl Axis3Calibration {
 pub struct Axis3GravityConfig {
     /// Gravity expressed in the assembly's base_link frame, not the world.
     pub gravity_base_m_s2: V3,
+    #[serde(default)]
+    pub payload_mass_kg: f64,
+    /// Vertical drop from the suspension point to the center of the hanging weight.
+    #[serde(default)]
+    pub hang_length_m: f64,
+    /// Distance from the fingertip to the suspension point along Link3 +Z.
+    #[serde(default)]
+    pub hook_offset_m: f64,
+}
+impl Default for Axis3GravityConfig {
+    fn default() -> Self {
+        Self {
+            gravity_base_m_s2: [0., 0., -9.80665],
+            payload_mass_kg: 0.,
+            hang_length_m: 0.,
+            hook_offset_m: 0.,
+        }
+    }
 }
 impl Axis3GravityConfig {
     pub fn validate(&self) -> Result<()> {
@@ -49,19 +69,33 @@ impl Axis3GravityConfig {
             g.iter().all(|v| v.is_finite()) && (dot(g, g).sqrt() - 9.80665).abs() < 0.02,
             "axis-3 base gravity must have magnitude 9.80665 m/s² (±0.02)"
         );
+        ensure!(
+            (0.0..=20.0).contains(&self.payload_mass_kg),
+            "axis-3 payload mass must be within 0–20 kg"
+        );
+        ensure!(
+            (0.0..=2.0).contains(&self.hang_length_m),
+            "axis-3 suspension length must be within 0–2 m"
+        );
+        ensure!(
+            (-2.0..=2.0).contains(&self.hook_offset_m),
+            "axis-3 hook offset must be within ±2 m"
+        );
         model()?;
         Ok(())
     }
     pub fn coefficients(&self) -> Result<[f64; 2]> {
         let m = model()?;
+        // A freely suspended weight pulls down at the hook. Its displacement
+        // below the hook is parallel to gravity and contributes zero torque.
+        let moment = add(
+            m.moment,
+            scale(m.hook(self.hook_offset_m), self.payload_mass_kg),
+        );
         Ok([
-            m.torque(std::f64::consts::FRAC_PI_2, self.gravity_base_m_s2),
-            m.torque(0., self.gravity_base_m_s2),
+            m.torque(std::f64::consts::FRAC_PI_2, self.gravity_base_m_s2, moment),
+            m.torque(0., self.gravity_base_m_s2, moment),
         ])
-    }
-    pub fn peak_nm(&self) -> Result<f64> {
-        let [a, b] = self.coefficients()?;
-        Ok(a.hypot(b))
     }
 }
 
@@ -71,7 +105,10 @@ pub struct Axis3ModelInfo {
     pub joint_name: String,
     pub moving_links: Vec<String>,
     pub mass_kg: f64,
+    /// Combined center of mass at URDF zero, expressed in the moving joint frame.
     pub com_joint_m: V3,
+    pub gripper_tip_joint_m: V3,
+    pub hook_joint_m: V3,
     pub axis_joint: V3,
     pub lower_rad: f64,
     pub upper_rad: f64,
@@ -84,12 +121,21 @@ pub fn model_info(config: &Axis3GravityConfig) -> Result<Axis3ModelInfo> {
     config.validate()?;
     let m = model()?;
     let [sin_nm, cos_nm] = config.coefficients()?;
+    let mass_kg = m.mass + config.payload_mass_kg;
+    let hook = m.hook(config.hook_offset_m);
+    let g = mv(transpose(m.joint_rotation), config.gravity_base_m_s2);
+    let payload_com = add(hook, scale(g, config.hang_length_m / dot(g, g).sqrt()));
     Ok(Axis3ModelInfo {
         robot_name: m.robot_name.clone(),
         joint_name: m.joint_name.clone(),
         moving_links: m.moving_links.clone(),
-        mass_kg: m.mass,
-        com_joint_m: scale(m.moment, 1. / m.mass),
+        mass_kg,
+        com_joint_m: scale(
+            add(m.moment, scale(payload_com, config.payload_mass_kg)),
+            1. / mass_kg,
+        ),
+        gripper_tip_joint_m: m.gripper_tip,
+        hook_joint_m: hook,
         axis_joint: m.axis,
         lower_rad: m.lower,
         upper_rad: m.upper,
@@ -109,6 +155,8 @@ struct Model {
     moving_links: Vec<String>,
     mass: f64,
     moment: V3,
+    gripper_tip: V3,
+    gripper_direction: V3,
     axis: V3,
     joint_rotation: M3,
     lower: f64,
@@ -155,6 +203,8 @@ impl Model {
             moving_links: vec![],
             mass: 0.,
             moment: [0.; 3],
+            gripper_tip: [0.; 3],
+            gripper_direction: [0.; 3],
             axis: scale(axis, 1. / norm),
             joint_rotation: rotation(j.origin.rpy.0),
             lower: j.limit.lower,
@@ -182,6 +232,10 @@ impl Model {
             model.mass += mass;
             model.moment = add(model.moment, scale(add(pos, mv(rot, com)), mass));
             model.moving_links.push(name.to_owned());
+            if name == "Link3" {
+                model.gripper_direction = mv(rot, [0., 0., 1.]);
+                model.gripper_tip = add(pos, scale(model.gripper_direction, GRIPPER_TIP_Z_M));
+            }
             for child in robot.joints.iter().filter(|c| c.parent.link == name) {
                 if child.joint_type != urdf_rs::JointType::Fixed {
                     bail!("moving downstream joint {}", child.name);
@@ -211,11 +265,18 @@ impl Model {
                 && robot.links.iter().any(|l| l.name == j.parent.link),
             "disconnected axis-3 URDF links"
         );
+        ensure!(
+            seen.contains("Link3"),
+            "axis-3 assembly is missing the Link3 gripper"
+        );
         Ok(model)
     }
-    fn torque(&self, q: f64, gravity_base: V3) -> f64 {
+    fn hook(&self, offset_m: f64) -> V3 {
+        add(self.gripper_tip, scale(self.gripper_direction, offset_m))
+    }
+    fn torque(&self, q: f64, gravity_base: V3, moment: V3) -> f64 {
         let g = mv(transpose(self.joint_rotation), gravity_base);
-        -dot(self.axis, cross(rotate(self.axis, q, self.moment), g))
+        -dot(self.axis, cross(rotate(self.axis, q, moment), g))
     }
 }
 fn add(a: V3, b: V3) -> V3 {
@@ -290,11 +351,80 @@ mod tests {
             let potential = |q| -dot(gravity, mv(m.joint_rotation, rotate(m.axis, q, m.moment)));
             for q in [0., 0.3, 1.2, 2., 3.14] {
                 let derivative = (potential(q + 1e-6) - potential(q - 1e-6)) / 2e-6;
-                assert!((derivative - m.torque(q, gravity)).abs() < 1e-8);
-                let reconstructed = m.torque(std::f64::consts::FRAC_PI_2, gravity) * q.sin()
-                    + m.torque(0., gravity) * q.cos();
+                assert!((derivative - m.torque(q, gravity, m.moment)).abs() < 1e-8);
+                let reconstructed = m.torque(std::f64::consts::FRAC_PI_2, gravity, m.moment)
+                    * q.sin()
+                    + m.torque(0., gravity, m.moment) * q.cos();
                 assert!((reconstructed - derivative).abs() < 1e-8);
             }
+        }
+    }
+    #[test]
+    fn hanging_load_torque_matches_the_energy_of_a_weight_below_the_moving_hook() {
+        let m = model().unwrap();
+        for gravity in [[0., 0., -9.80665], [0., -9.80665 * 0.6, -9.80665 * 0.8]] {
+            let unloaded = Axis3GravityConfig {
+                gravity_base_m_s2: gravity,
+                ..Default::default()
+            };
+            let bare = model_info(&unloaded).unwrap();
+            let config = Axis3GravityConfig {
+                payload_mass_kg: 0.5,
+                hang_length_m: 0.3,
+                hook_offset_m: 0.05,
+                ..unloaded
+            };
+            let loaded = model_info(&config).unwrap();
+            assert!((loaded.mass_kg - bare.mass_kg - 0.5).abs() < 1e-12);
+            // Both fixed joint transforms put the nominal tip about 225 mm out from J3.
+            let expected_hook = [0.275002, -0.005, 0.016477];
+            for (actual, expected) in loaded.hook_joint_m.iter().zip(expected_hook) {
+                assert!((actual - expected).abs() < 2e-6);
+            }
+            let drop_base = scale(gravity, config.hang_length_m / 9.80665);
+            let potential = |q| {
+                let hook_base = mv(m.joint_rotation, rotate(m.axis, q, loaded.hook_joint_m));
+                let arm_moment = mv(m.joint_rotation, rotate(m.axis, q, m.moment));
+                -dot(gravity, arm_moment)
+                    - config.payload_mass_kg * dot(gravity, add(hook_base, drop_base))
+            };
+            for q in [0., 0.7, 1.57, 3.14] {
+                let derivative = (potential(q + 1e-6) - potential(q - 1e-6)) / 2e-6;
+                assert!(
+                    (derivative - loaded.sin_nm * q.sin() - loaded.cos_nm * q.cos()).abs() < 1e-8
+                );
+            }
+            let at_hook = model_info(&Axis3GravityConfig {
+                hang_length_m: 0.,
+                ..config.clone()
+            })
+            .unwrap();
+            assert_eq!(
+                (at_hook.sin_nm, at_hook.cos_nm),
+                (loaded.sin_nm, loaded.cos_nm)
+            );
+            let com_shift = mv(
+                m.joint_rotation,
+                add(loaded.com_joint_m, scale(at_hook.com_joint_m, -1.)),
+            );
+            for (shift, drop) in com_shift.into_iter().zip(drop_base) {
+                assert!((shift - drop * config.payload_mass_kg / loaded.mass_kg).abs() < 1e-12);
+            }
+            let at_tip = model_info(&Axis3GravityConfig {
+                hook_offset_m: 0.,
+                ..config.clone()
+            })
+            .unwrap();
+            assert!(loaded.peak_nm > at_tip.peak_nm && at_tip.peak_nm > bare.peak_nm);
+            let removed = model_info(&Axis3GravityConfig {
+                payload_mass_kg: 0.,
+                ..config
+            })
+            .unwrap();
+            assert_eq!(
+                (removed.mass_kg, removed.com_joint_m, removed.peak_nm),
+                (bare.mass_kg, bare.com_joint_m, bare.peak_nm)
+            );
         }
     }
     #[test]
@@ -317,9 +447,26 @@ mod tests {
         }
         for g in [[0.; 3], [f64::NAN, 0., 0.], [0., 0., -100.]] {
             assert!(Axis3GravityConfig {
-                gravity_base_m_s2: g
+                gravity_base_m_s2: g,
+                ..Default::default()
             }
             .validate()
+            .is_err());
+        }
+        for (mass, length, offset) in [
+            (-0.1, 0., 0.),
+            (0., -0.1, 0.),
+            (f64::NAN, 0., 0.),
+            (1., f64::INFINITY, 0.),
+            (1., 0., f64::NAN),
+            (1., 0., 2.1),
+        ] {
+            assert!(model_info(&Axis3GravityConfig {
+                payload_mass_kg: mass,
+                hang_length_m: length,
+                hook_offset_m: offset,
+                ..Default::default()
+            })
             .is_err());
         }
         assert!(Model::parse(&URDF.replace("type=\"fixed\"", "type=\"continuous\"")).is_err());

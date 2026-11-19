@@ -15,6 +15,14 @@ function stoppedMitState(): NonNullable<Parameters<typeof gravityReadiness>[0]> 
 }
 const ready = { busy: false, validModel: true, insufficientTorque: false };
 
+test("RS05 wrapped angle endpoints are valid and drive warnings block J3 capture", () => {
+  const state = { ...stoppedMitState(), protocol: "Rs05CanFd" as const, position_rad: 12.57, unwrapped_position_rad: 12.57 };
+  assert.equal(gravityReadiness(state, ready).canCapture, true);
+  const warning = gravityReadiness({ ...state, warning_code: 1 }, ready);
+  assert.equal(warning.captureBlocker, "fault");
+  assert.equal(warning.startBlocker, "fault");
+});
+
 test("fresh standard MIT position is visible and capturable before any reference or UID exists", () => {
   const state = stoppedMitState(), result = gravityReadiness(state, ready);
   assert.equal(result.position, state.unwrapped_position_rad);

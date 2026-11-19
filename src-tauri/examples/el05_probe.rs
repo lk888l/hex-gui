@@ -3,6 +3,8 @@
 //! Emits one JSON object per interface. SocketCAN timing is system-managed;
 //! this program never changes interface configuration or selects a motor.
 
+#[path = "../src/arm_axis3.rs"]
+mod arm_axis3;
 #[path = "../src/backend.rs"]
 mod backend;
 #[path = "../src/can_lease.rs"]

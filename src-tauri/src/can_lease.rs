@@ -19,6 +19,7 @@ pub enum CanOwner {
     Analyzer,
     El05,
     StandardMit,
+    Axis3Rs05,
     DfuDiscovery,
     DfuUpdate,
 }
@@ -30,6 +31,7 @@ impl fmt::Display for CanOwner {
             Self::Analyzer => "CAN Analyzer",
             Self::El05 => "EL05 Motor Control",
             Self::StandardMit => "Standard MIT Motor Control",
+            Self::Axis3Rs05 => "Arm Axis 3 · RS05 CAN FD",
             Self::DfuDiscovery => "CAN firmware discovery",
             Self::DfuUpdate => "CAN firmware update",
         })

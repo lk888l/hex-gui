@@ -1,4 +1,4 @@
-//! Independent IPC and lifecycle for standard-frame MIT motor control.
+//! IPC for the Standard MIT and Arm Axis 3 workspaces, including RS05 CAN FD.
 use std::sync::{atomic::Ordering, Arc};
 use tauri::State;
 
@@ -36,13 +36,18 @@ pub async fn mit_connect(
     iface: String,
     host_id: u8,
     manual_extensions: bool,
+    protocol: Option<El05Protocol>,
 ) -> CmdResult<El05State> {
+    let protocol = protocol.unwrap_or(El05Protocol::StandardMit);
+    if protocol == El05Protocol::Native {
+        return Err("Select Standard MIT or RS05 CAN FD for this workspace".into());
+    }
     connect_workspace(
         &state,
         &can_gate,
         iface,
         host_id,
-        El05Protocol::StandardMit,
+        protocol,
         manual_extensions,
     )
     .await

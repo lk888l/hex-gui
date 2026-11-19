@@ -25,22 +25,35 @@ pub struct GravityCompensationConfig {
     pub compensation_scale: f64,
     pub damping_nm_s_rad: f64,
     pub torque_limit_nm: f64,
+    /// Pendulum only. An omitted limit fails pendulum validation and is ignored for J3.
+    #[serde(default)]
     pub max_velocity_rad_s: f64,
     pub max_temperature_c: f64,
     pub ramp_s: f64,
 }
 
 impl GravityCompensationConfig {
-    pub fn gravity_peak_nm(&self) -> f64 {
-        if let Some(axis3) = &self.axis3 {
-            return axis3.peak_nm().unwrap_or(f64::NAN) * self.compensation_scale;
-        }
-        (self.mass_kg + 0.5 * self.arm_mass_kg) * 9.80665 * self.length_m * self.compensation_scale
+    fn coefficients_nm(&self) -> Result<[f64; 2]> {
+        let coefficients = match &self.axis3 {
+            Some(axis3) => axis3.coefficients()?,
+            None => [
+                (self.mass_kg + 0.5 * self.arm_mass_kg) * 9.80665 * self.length_m,
+                0.,
+            ],
+        };
+        Ok(coefficients.map(|v| v * self.compensation_scale))
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, torque_max_nm: f64) -> Result<()> {
         if let Some(axis3) = &self.axis3 {
             axis3.validate()?;
+        } else {
+            check_range(
+                self.max_velocity_rad_s,
+                0.1,
+                20.0,
+                "gravity compensation speed limit (rad/s)",
+            )?;
         }
         for (value, min, max, label) in [
             (
@@ -76,14 +89,8 @@ impl GravityCompensationConfig {
             (
                 self.torque_limit_nm,
                 0.01,
-                6.0,
+                torque_max_nm,
                 "gravity compensation torque limit (Nm)",
-            ),
-            (
-                self.max_velocity_rad_s,
-                0.1,
-                20.0,
-                "gravity compensation speed limit (rad/s)",
             ),
             (
                 self.max_temperature_c,
@@ -106,8 +113,10 @@ impl GravityCompensationConfig {
         if self.axis3.is_none() && self.mass_kg + self.arm_mass_kg <= 0.0 {
             bail!("gravity compensation requires a positive pendulum end or arm mass");
         }
-        if self.gravity_peak_nm() > self.torque_limit_nm + 1e-9 {
-            bail!("gravity compensation peak {:.3} Nm exceeds the {:.3} Nm torque limit; reduce the load/scale or increase the limit", self.gravity_peak_nm(), self.torque_limit_nm);
+        let [a, b] = self.coefficients_nm()?;
+        let peak = a.hypot(b);
+        if peak > self.torque_limit_nm + 1e-9 {
+            bail!("gravity compensation peak {peak:.3} Nm exceeds the {:.3} Nm torque limit; reduce the load/scale or increase the limit", self.torque_limit_nm);
         }
         Ok(())
     }
@@ -143,6 +152,8 @@ pub struct GravityCompensationStatus {
 pub(super) struct GravityCompensation {
     pub status: GravityCompensationStatus,
     started: Option<Instant>,
+    /// Fixed for the duration of a run, including its payload and compensation scale.
+    coefficients_nm: [f64; 2],
     /// Kept server-side so an old/UI-supplied angle cannot authorize motion.
     reference_binding: Option<String>,
 }
@@ -199,7 +210,8 @@ impl GravityCompensation {
         self.status.reason = Some(reason);
     }
 
-    pub fn begin(&mut self, config: GravityCompensationConfig) {
+    pub fn begin(&mut self, config: GravityCompensationConfig) -> Result<()> {
+        self.coefficients_nm = config.coefficients_nm()?;
         self.started = Some(Instant::now());
         self.status.active = true;
         self.status.elapsed_s = 0.0;
@@ -210,6 +222,7 @@ impl GravityCompensation {
         self.status.command_torque_nm = 0.0;
         self.status.limited = false;
         self.status.reason = None;
+        Ok(())
     }
 
     pub fn finish(&mut self, reason: impl Into<String>) {
@@ -234,20 +247,16 @@ impl GravityCompensation {
             .as_ref()
             .expect("active gravity reference");
         let elapsed_s = self.elapsed_s();
-        let (angle, support) =
-            if let (Some(config_axis3), Some(calibration)) = (&config.axis3, &reference.axis3) {
-                let q = calibration.joint_angle(position_rad, reference.position_rad);
-                let [sin_nm, cos_nm] = config_axis3.coefficients().expect("validated axis-3 model");
-                (
-                    q,
-                    f64::from(calibration.encoder_direction)
-                        * config.compensation_scale
-                        * (sin_nm * q.sin() + cos_nm * q.cos()),
-                )
-            } else {
-                let q = position_rad - reference.position_rad;
-                (q, config.gravity_peak_nm() * q.sin())
-            };
+        let (angle, direction) = match &reference.axis3 {
+            Some(calibration) => (
+                calibration.joint_angle(position_rad, reference.position_rad),
+                f64::from(calibration.encoder_direction),
+            ),
+            None => (position_rad - reference.position_rad, 1.),
+        };
+        let (sin_q, cos_q) = angle.sin_cos();
+        let [a, b] = self.coefficients_nm;
+        let support = direction * (a * sin_q + b * cos_q);
         // Ramp in gravity feedforward from zero. Damping acts immediately and
         // always opposes motion in the increasing-encoder coordinate system.
         let gravity = support * (elapsed_s / config.ramp_s).clamp(0.0, 1.0);
@@ -291,7 +300,7 @@ mod tests {
     fn running() -> GravityCompensation {
         let mut gravity = GravityCompensation::default();
         gravity.capture(1, "uid".into(), 4.0, 0.0);
-        gravity.begin(config());
+        gravity.begin(config()).unwrap();
         gravity.started = Some(Instant::now() - Duration::from_secs(2));
         gravity
     }
@@ -299,12 +308,17 @@ mod tests {
     fn axis3_uses_urdf_pose_and_maps_torque_direction_without_reversing_damping() {
         for direction in [-1, 1] {
             let mut gravity = running();
-            let c = gravity.status.config.as_mut().unwrap();
+            let mut c = config();
             c.axis3 = Some(Axis3GravityConfig {
-                gravity_base_m_s2: [0., 0., -9.80665],
+                payload_mass_kg: 0.5,
+                hang_length_m: 0.2,
+                hook_offset_m: 0.03,
+                ..Default::default()
             });
             c.torque_limit_nm = 6.;
-            c.validate().unwrap();
+            c.validate(6.0).unwrap();
+            gravity.begin(c).unwrap();
+            gravity.started = Some(Instant::now() - Duration::from_secs(2));
             gravity.status.reference.as_mut().unwrap().axis3 = Some(Axis3Calibration {
                 joint_angle_rad: 0.7,
                 encoder_direction: direction,
@@ -343,21 +357,44 @@ mod tests {
     #[test]
     fn axis3_peak_guard_comes_from_urdf_and_legacy_json_remains_compatible() {
         let mut c = config();
-        c.axis3 = Some(Axis3GravityConfig {
-            gravity_base_m_s2: [0., 0., -9.80665],
-        });
+        c.axis3 = Some(
+            serde_json::from_value(serde_json::json!({"gravity_base_m_s2": [0., 0., -9.80665]}))
+                .unwrap(),
+        );
         c.mass_kg = 0.;
         c.arm_mass_kg = 0.;
-        c.torque_limit_nm = 6.;
-        c.validate().unwrap();
-        assert!(c.gravity_peak_nm() > 0.1);
-        c.torque_limit_nm = 0.01;
-        assert!(c.validate().unwrap_err().to_string().contains("exceeds"));
+        c.torque_limit_nm = 1.5;
+        c.validate(6.0).unwrap();
+        let [a, b] = c.coefficients_nm().unwrap();
+        assert!((a.hypot(b) - 0.842374343359).abs() < 1e-9);
+        c.axis3.as_mut().unwrap().payload_mass_kg = 0.5;
+        assert!(c.validate(6.0).unwrap_err().to_string().contains("exceeds"));
+        c.compensation_scale = 0.5;
+        let mut axis3_json = serde_json::to_value(&c).unwrap();
+        axis3_json
+            .as_object_mut()
+            .unwrap()
+            .remove("max_velocity_rad_s");
+        serde_json::from_value::<GravityCompensationConfig>(axis3_json)
+            .unwrap()
+            .validate(6.0)
+            .unwrap();
         let mut json = serde_json::to_value(config()).unwrap();
         json.as_object_mut().unwrap().remove("axis3");
         let legacy: GravityCompensationConfig = serde_json::from_value(json).unwrap();
         assert!(legacy.axis3.is_none());
-        legacy.validate().unwrap();
+        legacy.validate(6.0).unwrap();
+        let mut missing_limit = serde_json::to_value(legacy).unwrap();
+        missing_limit
+            .as_object_mut()
+            .unwrap()
+            .remove("max_velocity_rad_s");
+        assert!(
+            serde_json::from_value::<GravityCompensationConfig>(missing_limit)
+                .unwrap()
+                .validate(6.0)
+                .is_err()
+        );
     }
     #[test]
     fn pendulum_torque_tracks_downward_reference_and_damping_opposes_motion() {
@@ -392,11 +429,11 @@ mod tests {
     #[test]
     fn unsafe_configuration_and_stale_or_different_motor_reference_are_rejected() {
         let mut c = config();
-        assert!(c.validate().is_ok());
+        assert!(c.validate(6.0).is_ok());
         c.mass_kg = 2.0;
-        assert!(c.validate().is_err());
+        assert!(c.validate(6.0).is_err());
         c.mass_kg = f64::NAN;
-        assert!(c.validate().is_err());
+        assert!(c.validate(6.0).is_err());
         let mut gravity = running();
         let id = gravity.status.reference.as_ref().unwrap().id.clone();
         assert!(gravity.reference_matches(&id, 1, Some("uid")));

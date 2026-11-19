@@ -687,7 +687,7 @@ function ToolPicker({ onPick }: { onPick: (t: Tool) => void }) {
                   <ToolCard
                     title={t("toolArmAxis3")}
                     desc={t("toolArmAxis3Desc")}
-                    tag={t("tagStandardMitProtocol")}
+                    tag={t("tagAxis3Protocol")}
                     accent="pink"
                     onClick={() => onPick("armAxis3")}
                   />

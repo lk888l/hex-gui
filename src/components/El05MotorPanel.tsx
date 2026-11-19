@@ -83,7 +83,7 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
   const zh = lang === "zh";
   const tr = (cn: string, en: string) => zh ? cn : en;
   const [iface, setIface] = useState(defaultInterface);
-  const [extensions, setExtensions] = useState(false);
+  const [driveProfile, setDriveProfile] = useState<"basic" | "el05" | "rs05">("basic");
   const [hostId, setHostId] = useState("0xFD");
   const [manualId, setManualId] = useState("0x01");
   const [newMotorId, setNewMotorId] = useState("");
@@ -117,12 +117,15 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
   const actionInFlight = useRef(false);
   const connectionEpoch = useRef(0);
   const connected = !!state?.connected;
-  const standardMit = protocol === "StandardMit";
-  const manualExtensions = standardMit && (connected ? !!state.manual_extensions : extensions);
+  const rs05 = axis3 && (connected ? state.protocol === "Rs05CanFd" : driveProfile === "rs05");
+  const standardMit = protocol === "StandardMit" && !rs05;
+  const manualExtensions = standardMit && (connected ? !!state.manual_extensions : driveProfile === "el05");
+  const profileLabel = axis3 ? tr("电机协议", "Motor protocol") : tr("电机指令配置", "Motor command profile");
+  const modelName = rs05 ? "RobStride RS05" : "RobStride EL05";
   const hasDictionary = !standardMit || manualExtensions;
   const selected = connected && state?.attached && state.motor_id != null;
   const mode = state?.mode ?? "Mit";
-  const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0 || (standardMit && state.warning_code !== 0));
+  const faulted = !!state && (state.fault_bits !== 0 || state.fault_code !== 0 || ((standardMit || rs05) && state.warning_code !== 0));
   const enabled = !!state?.enabled;
   const gravityActive = !!state?.gravity_compensation?.active;
   const controlLocked = busy || gravityActive || benchWorking || stopping;
@@ -224,17 +227,17 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
   };
 
   const connect = () => void run(async () => {
-    const id = parseId(hostId, 0xff);
+    const id = standardMit ? 0xfd : parseId(hostId, 0xff);
     if (!iface.trim()) throw new Error(tr("请输入 CAN 接口", "Enter a CAN interface"));
     connectionEpoch.current++;
-    await api.connect(iface.trim(), id, manualExtensions);
+    await api.connect(iface.trim(), id, manualExtensions, rs05 ? "Rs05CanFd" : undefined);
   }, tr("电机 CAN 已连接", "Motor CAN connected"));
 
   const disconnect = () => void run(async () => {
     connectionEpoch.current++;
     await api.disconnect();
     acceptState(null);
-  }, tr("电机已停止，CAN 已断开", "Motor stopped and CAN disconnected"));
+  }, selected ? tr("电机已停止，CAN 已断开", "Motor stopped and CAN disconnected") : tr("CAN 已断开", "CAN disconnected"));
 
   const stop = async () => {
     setStopping(true);
@@ -371,32 +374,34 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
     <div className="el05-panel">
       <Card size="small">
         <div className="el05-connection">
-          {standardMit && <Field label={tr("电机指令配置", "Motor command profile")}><Select aria-label={tr("电机指令配置", "Motor command profile")} value={manualExtensions ? "el05" : "basic"} disabled={connected || busy} style={{ width: 240 }} onChange={value => setExtensions(value === "el05")} options={[
+          {(standardMit || axis3) && <Field label={profileLabel}><Select aria-label={profileLabel} value={rs05 ? "rs05" : manualExtensions ? "el05" : "basic"} disabled={connected || busy || stopping} style={{ width: 250 }} onChange={setDriveProfile} options={[
             { value: "basic", label: tr("基础 MIT 兼容", "Basic MIT compatible") },
             { value: "el05", label: tr("EL05 手册扩展 (260922)", "EL05 manual extensions (260922)") },
+            ...(axis3 ? [{ value: "rs05", label: "RS05 CAN FD · MIT (260826)" }] : []),
           ]} /></Field>}
           <Field label={tr("CAN 接口", "CAN interface")}><Input value={iface} disabled={connected || busy} onChange={(event) => setIface(event.target.value)} style={{ width: 150 }} placeholder={defaultInterface()} /></Field>
           {!standardMit && <Field label={tr("主机 CAN ID", "Host CAN ID")}><Input value={hostId} disabled={connected || busy} onChange={(event) => setHostId(event.target.value)} style={{ width: 110 }} /></Field>}
           {connected ? <Button danger loading={busy} onClick={disconnect}>{tr("停止并断开", "Stop & disconnect")}</Button> : <Button type="primary" loading={busy} onClick={connect}>{tr("连接", "Connect")}</Button>}
           <Space wrap>
             <Tag color={connected ? "green" : "default"}>{connected ? tr("已连接", "Connected") : tr("未连接", "Disconnected")}</Tag>
-            <Tag>Classic CAN · 1 Mbps</Tag>
+            <Tag>{rs05 ? "CAN FD · 1 / 5 Mbps · BRS" : "Classic CAN · 1 Mbps"}</Tag>
             <Typography.Text type="secondary">{standardMit ? tr("标准帧 MIT · 回复 ID 自动识别", "Standard MIT · reply ID detected automatically") : tr("RobStride 私有协议 · 29 位扩展帧", "RobStride native protocol · 29-bit extended frames")}</Typography.Text>
           </Space>
         </div>
         {axis3 && <Typography.Paragraph type="secondary" style={{ margin: "12px 0 0" }}>{tr("请直接输入第 3 轴的实际 CAN ID；轴号不代表电机 ID。仅对所选电机进行零重力测试。", "Enter the actual CAN ID of axis 3; the axis number does not imply the motor ID. This test controls the selected motor only.")}</Typography.Paragraph>}
+        {rs05 && <Typography.Paragraph type="secondary" style={{ margin: "8px 0 0" }}>{tr("gs_usb 自动配置为仲裁段 1 Mbps、数据段 5 Mbps。使用 SocketCAN 时，请先在系统中启用 CAN FD 并配置速率。", "gs_usb uses 1 Mbps arbitration and 5 Mbps data. For SocketCAN, enable CAN FD and configure the bitrates in the operating system before connecting.")}</Typography.Paragraph>}
         {standardMit && !axis3 && <Typography.Paragraph type="secondary" style={{ margin: "12px 0 0" }}>{tr("连接后扫描或输入电机 ID；回复 ID 自动识别。扫描会向 0–255 地址发送停止命令。基础配置提供 MIT 控制与测试；确认电机支持 EL05 手册后，可选扩展配置使用位置、速度和设备参数。", "Connect, then scan or enter a motor ID; the reply ID is detected automatically. Scanning sends Stop to IDs 0–255. The basic profile provides MIT control and tests. Choose the extended profile for position, velocity and settings when your drive supports the EL05 manual.")}</Typography.Paragraph>}
         {pollError && <Alert style={{ marginTop: 12 }} type="error" showIcon message={pollError} />}
       </Card>
 
       <div className="el05-workspace">
         <aside className="el05-sidebar">
-          <Card size="small" title={standardMit ? tr("标准 MIT 电机", "Standard MIT motors") : tr("EL05 电机", "EL05 motors")} extra={!axis3 && <Button size="small" disabled={!connected || controlLocked || (standardMit && (enabled || state?.experiment.active))} loading={busy} onClick={() => void run(() => api.scan())}>{tr("扫描", "Scan")}</Button>}>
+          <Card size="small" title={rs05 ? "RobStride RS05" : standardMit ? tr("标准 MIT 电机", "Standard MIT motors") : tr("EL05 电机", "EL05 motors")} extra={!axis3 && <Button size="small" disabled={!connected || controlLocked || (standardMit && (enabled || state?.experiment.active))} loading={busy} onClick={() => void run(() => api.scan())}>{tr("扫描", "Scan")}</Button>}>
             {(state?.devices.length ?? 0) === 0 ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={connected ? axis3 ? tr("输入第 3 轴的电机 ID", "Enter the axis-3 motor ID") : tr("点击扫描发现电机", "Scan to discover motors") : tr("先连接 CAN", "Connect CAN first")} />
             ) : state?.devices.map((device) => (
               <button key={device.motor_id} className={`el05-device${device.selected ? " el05-device--selected" : ""}`} type="button" disabled={controlLocked} onClick={() => selectMotor(device.motor_id)}>
-                <span className="el05-device__title"><strong>{standardMit ? tr("MIT 兼容电机", "MIT compatible motor") : "RobStride EL05"}</strong><code>{hexId(device.motor_id)}</code></span>
+                <span className="el05-device__title"><strong>{standardMit ? tr("MIT 兼容电机", "MIT compatible motor") : modelName}</strong><code>{hexId(device.motor_id)}</code></span>
                 <span><Tag color={device.online ? "green" : "default"}>{device.online ? tr("在线", "Online") : tr("已发现", "Discovered")}</Tag>{device.selected && <Tag color="blue">{tr("已选择", "Selected")}</Tag>}</span>
                 {device.uid && <Typography.Text type="secondary" className="el05-device__uid">UID {device.uid}</Typography.Text>}
               </button>
@@ -404,7 +409,7 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
             <Typography.Text type="secondary">{tr("或指定电机 ID（十进制 / 0x）", "Or enter a motor ID (decimal / 0x)")}</Typography.Text>
             <div className="el05-manual">
               <Input aria-label={tr("电机 ID", "Motor ID")} value={manualId} disabled={!connected || controlLocked} onChange={(event) => setManualId(event.target.value)} />
-              <Button disabled={!connected || controlLocked} onClick={() => void run(() => selectMotorOperation(parseId(manualId, 0xff)))}>{tr("选择", "Select")}</Button>
+              <Button disabled={!connected || controlLocked} onClick={() => void run(() => selectMotorOperation(parseId(manualId, rs05 ? 0x7f : 0xff)))}>{tr("选择", "Select")}</Button>
             </div>
             <Typography.Text className="el05-description" type="secondary">{tr("切换电机前会停止当前电机。", "Changing selection stops the current motor.")}</Typography.Text>
           </Card>
@@ -415,15 +420,15 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
             <Card size="small">
               <div className="el05-summary">
                 <div>
-                  <Space wrap><Typography.Title level={4} style={{ margin: 0 }}>{standardMit ? tr("标准 MIT 电机", "Standard MIT motor") : "RobStride EL05"}</Typography.Title>{state?.motor_id != null && <Typography.Text code>{hexId(state.motor_id)}</Typography.Text>}<Tag color={faulted ? "red" : enabled ? "green" : state?.online ? "blue" : "default"}>{statusLabel}</Tag>{selected && <Tag>{MODE_LABELS[mode][zh ? 0 : 1]}</Tag>}</Space>
-                  <Typography.Text className="el05-description" type="secondary">{standardMit ? tr("EL05 兼容量程：位置 ±12.57 rad · 速度 ±50 rad/s · 转矩 ±6 Nm", "EL05-compatible ranges: position ±12.57 rad · velocity ±50 rad/s · torque ±6 Nm") : <>48 V · {tr("额定 1.8 Nm · 峰值 6 Nm · 峰值相电流 11 A", "Rated 1.8 Nm · Peak 6 Nm · Peak phase current 11 A")}</>}</Typography.Text>
+                  <Space wrap><Typography.Title level={4} style={{ margin: 0 }}>{standardMit ? tr("标准 MIT 电机", "Standard MIT motor") : modelName}</Typography.Title>{state?.motor_id != null && <Typography.Text code>{hexId(state.motor_id)}</Typography.Text>}<Tag color={faulted ? "red" : enabled ? "green" : state?.online ? "blue" : "default"}>{statusLabel}</Tag>{selected && <Tag>{MODE_LABELS[mode][zh ? 0 : 1]}</Tag>}</Space>
+                  <Typography.Text className="el05-description" type="secondary">{rs05 ? tr("运控量程 ±12.57 rad · ±50 rad/s · ±5.5 Nm，额定转矩 1.6 Nm", "Motion ranges ±12.57 rad · ±50 rad/s · ±5.5 Nm, rated torque 1.6 Nm") : standardMit ? tr("EL05 兼容量程：位置 ±12.57 rad · 速度 ±50 rad/s · 转矩 ±6 Nm", "EL05-compatible ranges: position ±12.57 rad · velocity ±50 rad/s · torque ±6 Nm") : <>48 V · {tr("额定 1.8 Nm · 峰值 6 Nm · 峰值相电流 11 A", "Rated 1.8 Nm · Peak 6 Nm · Peak phase current 11 A")}</>}</Typography.Text>
                 </div>
                 <Space wrap><Space size={5}><Typography.Text type="secondary">{tr("界面刷新", "UI refresh")}</Typography.Text><Segmented size="small" value={refreshHz} onChange={(value) => setRefreshHz(Number(value))} options={[{ label: "20 Hz", value: 20 }, { label: "50 Hz", value: 50 }]} /></Space><Button danger disabled={!selected} loading={stopping} onClick={() => void stop()}>{tr("停止电机", "Stop motor")}</Button></Space>
               </div>
             </Card>
 
             {!selected && <Alert type="info" showIcon message={axis3 ? tr("连接总线后，输入第 3 轴电机的 CAN ID 并选择。", "Connect the bus, then enter and select the axis-3 motor CAN ID.") : tr("连接总线后扫描并选择电机，或手动输入电机 ID。", "Connect the bus, then scan and select a motor, or enter its ID manually.")} />}
-            {selected && !state?.online && <Alert type="warning" showIcon message={tr("尚无有效反馈，请检查电源、1 Mbps 总线速率、接线及电机当前协议。", "No fresh feedback. Check power, 1 Mbps bus timing, wiring and the motor's current protocol.")} />}
+            {selected && !state?.online && <Alert type="warning" showIcon message={rs05 ? tr("尚无 RS05 反馈，请核对电机和主机 ID、电源、接线及 CAN FD 速率。", "No RS05 feedback. Check motor and host IDs, power, wiring and CAN FD bitrates.") : tr("尚无有效反馈，请检查电源、1 Mbps 总线速率、接线及电机当前协议。", "No fresh feedback. Check power, 1 Mbps bus timing, wiring and the motor's current protocol.")} />}
             {state?.last_error && <Alert type="error" showIcon message={state.last_error} />}
             {faulted && <Alert type="error" showIcon message={tr("电机故障 / 预警", "Motor fault / warning")} description={<Space wrap>{!standardMit && faultLabels(state!.fault_bits, zh).map((label) => <Tag color="red" key={label}>{label}</Tag>)}<Typography.Text code>{`Fault ${hexId(state!.fault_code, 8)}`}</Typography.Text>{state!.faults.length > 0 && <Typography.Text>{state!.faults.join(" · ")}</Typography.Text>}</Space>} />}
             {!axis3 && gravityActive && workspaceTab !== "gravity" && <Alert type="info" showIcon
@@ -431,7 +436,7 @@ export function MotorCanWorkspace({ protocol, api, axis3 = false }: { protocol: 
               action={<Button size="small" onClick={() => setWorkspaceTab("gravity")}>{tr("查看补偿", "View compensation")}</Button>} />}
             {benchWorking && <Alert type="info" showIcon message={tr("正在处理摆锤测试，请稍候；可随时停止电机。", "Processing the pendulum experiment. You can stop the motor at any time.")} />}
 
-            {axis3 ? <Axis3GravityPanel state={state} zh={zh} busy={busy} stopping={stopping} run={run} stop={stop} setZero={setZero} /> : <>
+            {axis3 ? <Axis3GravityPanel state={state} torqueMaxNm={rs05 ? 5.5 : 6} zh={zh} busy={busy} stopping={stopping} run={run} stop={stop} setZero={setZero} /> : <>
             <Segmented className="el05-workspace-tabs" block value={workspaceTab} onChange={value => setWorkspaceTab(value as typeof workspaceTab)} options={[
               { label: tr("摆锤性能测试", "Pendulum tests"), value: "bench" },
               { label: tr("零重力保持", "Zero-gravity hold"), value: "gravity" },

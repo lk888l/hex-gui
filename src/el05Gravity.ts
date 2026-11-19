@@ -23,7 +23,7 @@ export function gravityReadiness(state: GravityState | null, options: {
       && Math.abs(state.position_velocity_rad_s) <= 0.1));
   const common: GravityBlocker | null = !state?.connected ? "connect" : !state.attached || state.motor_id == null ? "select"
     : !fresh ? "feedback" : !hasPosition ? "position" : positionSaturated ? "position_saturated"
-    : state.fault_bits !== 0 || state.fault_code !== 0 || (state.protocol === "StandardMit" && state.warning_code !== 0) ? "fault"
+    : state.fault_bits !== 0 || state.fault_code !== 0 || (state.protocol !== "Native" && state.warning_code !== 0) ? "fault"
     : options.busy ? "busy" : state.experiment.active ? "experiment" : state.gravity_compensation.active ? "active"
     : state.enabled ? "enabled" : null;
   const captureBlocker: GravityBlocker | null = common ?? (!atRest ? "moving" : null);

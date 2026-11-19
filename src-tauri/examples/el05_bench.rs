@@ -2,6 +2,8 @@
 //! el05_bench can3 1 --motion <output-directory>
 //! Writes raw receive-frame JSON and speed consistency results, then restores
 //! volatile settings and the original mode. Does not change the mechanical zero.
+#[path = "../src/arm_axis3.rs"]
+mod arm_axis3;
 #[path = "../src/backend.rs"]
 mod backend;
 #[path = "../src/can_lease.rs"]

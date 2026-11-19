@@ -6,6 +6,8 @@
 //! The gravity check uses a tiny simulated load; it is not loaded compensation
 //! metrology. Does not set a mechanical zero, change IDs or write parameters.
 
+#[path = "../src/arm_axis3.rs"]
+mod arm_axis3;
 #[path = "../src/backend.rs"]
 mod backend;
 #[path = "../src/can_lease.rs"]
@@ -382,6 +384,7 @@ async fn exercise(
     // Small simulated mass exercises the live algorithm on an unloaded shaft.
     // Functional lifecycle is verified; actual loaded holding accuracy is not.
     let gravity = GravityCompensationConfig {
+        axis3: None,
         reference_id: reference.id.clone(),
         mass_kg: if gravity_only {
             0.5

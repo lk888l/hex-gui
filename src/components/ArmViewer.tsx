@@ -24,6 +24,12 @@ interface Props {
   urdfUrl?: string;
   packages?: Readonly<Record<string, string>>;
   fitToModel?: boolean;
+  suspendedLoad?: {
+    jointName: string;
+    tipJointM: [number, number, number];
+    hookJointM: [number, number, number];
+    hangLengthM: number;
+  };
 }
 
 function createArmPlaceholder(): THREE.Group {
@@ -96,7 +102,7 @@ function loadErrorMessage(error: unknown): string {
   try { return JSON.stringify(error); } catch { return String(error); }
 }
 
-export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, urdfUrl, packages, fitToModel = false }: Props) {
+export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, urdfUrl, packages, fitToModel = false, suspendedLoad }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -105,6 +111,7 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, 
   const placeholderRef = useRef<THREE.Group | null>(null);
   const arrowRef = useRef<THREE.ArrowHelper | null>(null);
   const armRootRef = useRef<THREE.Group | null>(null); // 整臂根:改重力向量时旋转它(臂倾斜、重力始终朝下=人眼所见)
+  const updateLoadRef = useRef<(() => void) | null>(null);
   const autoJointsRef = useRef<string[]>([]);
   const loadGenerationRef = useRef(0);
   const loadJobRef = useRef<UrdfLoadJob | null>(null);
@@ -164,7 +171,12 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, 
     placeholderRef.current = placeholder;
 
     let raf = 0;
-    const animate = () => { controls.update(); renderer.render(scene, camera); raf = requestAnimationFrame(animate); };
+    const animate = () => {
+      updateLoadRef.current?.();
+      controls.update();
+      renderer.render(scene, camera);
+      raf = requestAnimationFrame(animate);
+    };
     animate();
     const onResize = () => {
       const w = mount.clientWidth || 600;
@@ -253,15 +265,6 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, 
       armRoot.add(robot, ghost);
       robotRef.current = robot;
       ghostRef.current = ghost;
-      if (fitToModel && cameraRef.current && controlsRef.current) {
-        const bounds = new THREE.Box3().setFromObject(robot).getBoundingSphere(new THREE.Sphere());
-        const camera = cameraRef.current;
-        const halfFov = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.min(1, camera.aspect));
-        const distance = Math.max(0.1, bounds.radius) / Math.sin(halfFov) * 1.2;
-        camera.position.copy(bounds.center).add(new THREE.Vector3(0.7, -0.9, 0.7).normalize().multiplyScalar(distance));
-        controlsRef.current.target.copy(bounds.center);
-        controlsRef.current.update();
-      }
       autoJointsRef.current = automaticNames;
 
       if (placeholderRef.current) {
@@ -285,7 +288,7 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, 
       job.cancel();
       if (loadJobRef.current === job) loadJobRef.current = null;
     };
-  }, [urdfXml, urdfUrl, packages, fitToModel, retryGeneration]);
+  }, [urdfXml, urdfUrl, packages, retryGeneration]);
 
   // 实时关节角
   useEffect(() => {
@@ -325,6 +328,61 @@ export function ArmViewer({ q, gravity, jointNames, previewQ, armQuat, urdfXml, 
       }
     }
   }, [gravity, armQuat]);
+
+  useEffect(() => {
+    const robot = robotRef.current;
+    const scene = armRootRef.current?.parent;
+    if (!robot || !scene || loading) return;
+
+    const frameModel = (load?: THREE.Group) => {
+      const camera = cameraRef.current;
+      const controls = controlsRef.current;
+      if (!fitToModel || !camera || !controls) return;
+      robot.updateWorldMatrix(true, true);
+      const box = new THREE.Box3().setFromObject(robot);
+      if (load) box.expandByObject(load);
+      const { center, radius } = box.getBoundingSphere(new THREE.Sphere());
+      const viewDirection = camera.position.clone().sub(controls.target).normalize();
+      const halfFov = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.min(1, camera.aspect));
+      camera.position.copy(center).addScaledVector(viewDirection, Math.max(0.1, radius) / Math.sin(halfFov) * 1.2);
+      controls.target.copy(center);
+      controls.update();
+    };
+
+    const joint = suspendedLoad && robot.joints[suspendedLoad.jointName];
+    if (!suspendedLoad || !joint) {
+      frameModel();
+      return;
+    }
+    const tip = new THREE.Vector3(...suspendedLoad.tipJointM);
+    const hook = new THREE.Vector3(...suspendedLoad.hookJointM);
+    const drop = new THREE.Vector3(0, 0, -suspendedLoad.hangLengthM);
+    const material = new THREE.LineBasicMaterial({ color: 0xffbd52 });
+    const extension = new THREE.Line(new THREE.BufferGeometry().setFromPoints([tip, hook]), material);
+    joint.add(extension);
+
+    // The hook moves with the joint. The cord and the center marker always hang vertically in world space.
+    const load = new THREE.Group();
+    const cord = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), drop]), material);
+    const weight = new THREE.Mesh(new THREE.SphereGeometry(0.008, 16, 12), new THREE.MeshPhongMaterial({ color: 0xffbd52 }));
+    weight.position.copy(drop);
+    load.add(cord, weight);
+    scene.add(load);
+    const followHook = () => { joint.localToWorld(load.position.copy(hook)); };
+    followHook();
+    updateLoadRef.current = followHook;
+    frameModel(load);
+    return () => {
+      updateLoadRef.current = null;
+      extension.removeFromParent();
+      load.removeFromParent();
+      extension.geometry.dispose();
+      cord.geometry.dispose();
+      material.dispose();
+      weight.geometry.dispose();
+      weight.material.dispose();
+    };
+  }, [suspendedLoad, loading, fitToModel]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: 440, borderRadius: 8, overflow: "hidden" }}>

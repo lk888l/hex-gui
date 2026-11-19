@@ -105,7 +105,7 @@ pub(crate) fn workspace_slot(
 ) -> &tokio::sync::Mutex<Option<Arc<El05Session>>> {
     match protocol {
         El05Protocol::Native => &state.el05,
-        El05Protocol::StandardMit => &state.standard_mit,
+        El05Protocol::StandardMit | El05Protocol::Rs05CanFd => &state.standard_mit,
     }
 }
 
@@ -132,10 +132,19 @@ pub(crate) async fn connect_workspace(
     let permit = can_gate.try_acquire(match protocol {
         El05Protocol::Native => CanOwner::El05,
         El05Protocol::StandardMit => CanOwner::StandardMit,
+        El05Protocol::Rs05CanFd => CanOwner::Axis3Rs05,
     })?;
-    let bus = crate::backend::open_classic_1m_bus(&iface, permit)
-        .await
-        .map_err(error)?;
+    let bus = match protocol {
+        El05Protocol::Rs05CanFd => {
+            crate::backend::open_bus(&iface, crate::el05::RS05_DATA_BITRATE, false, permit)
+                .await
+                .map_err(error)?
+                .0
+        }
+        _ => crate::backend::open_classic_1m_bus(&iface, permit)
+            .await
+            .map_err(error)?,
+    };
     let bus = crate::backend::protect_feature_bus(bus);
     let app = El05Session::start_with_options(bus, host_id, protocol, manual_extensions)
         .await

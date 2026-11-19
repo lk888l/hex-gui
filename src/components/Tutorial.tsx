@@ -446,8 +446,8 @@ export const TUTORIALS: Record<string, Slide[]> = {
     {
       title: { en: "1 · Mount and connect", zh: "1 · 固定总成并连接" },
       body: {
-        en: "This app uses the supplied assembly's sole revolute joint Link1 as arm axis 3. Fixed Link2 and Link3 masses are included; the base is stationary. Use Standard MIT at 1 Mbps with joint-output rad/Nm and EL05-compatible ranges. Select the axis-3 motor ID; the axis number does not imply CAN ID 3. Set gravity in the base frame if +Z is not upward.",
-        zh: "以总装 URDF 唯一的转动关节 Link1 作为机械臂第 3 轴，补偿计入固定连接的 Link2、Link3，底座保持固定。使用 1 Mbps 标准 MIT、关节输出端 rad/Nm 与 EL05 兼容量程。选择第 3 轴对应的电机 ID；第 3 轴不意味着 CAN ID 为 3。若底座 +Z 不朝上，填写实际底座重力向量。",
+        en: "Fix the base. Link1 represents axis 3 and carries the fixed Link2 and Link3 masses. Before connecting, choose Basic MIT or EL05 manual extensions for 1 Mbps Classic CAN, or RS05 CAN FD for 29-bit motion control at 1 Mbps arbitration and 5 Mbps data. Enter the actual J3 motor ID. Use joint-output rad/Nm and set gravity in the base frame for a tilted mount.",
+        zh: "固定底座。Link1 是第 3 轴，补偿计入随动的 Link2、Link3。连接前选择电机协议。基础 MIT 和 EL05 手册扩展使用 1 Mbps Classic CAN。RS05 CAN FD 使用 29 位运控帧，接口按仲裁段 1 Mbps、数据段 5 Mbps 配置。填写 J3 电机的实际 CAN ID，角度和转矩以关节输出端 rad/Nm 为准。斜装时填写底座坐标系中的重力向量。",
       },
     },
     {
@@ -460,8 +460,8 @@ export const TUTORIALS: Record<string, Slide[]> = {
     {
       title: { en: "3 · Start zero gravity", zh: "3 · 开启零重力" },
       body: {
-        en: "Set compensation scale, damping and limits, then start. MIT Kp and Kd stay zero; the host sends URDF gravity support plus velocity damping. The gravity component ramps in. Angle, speed, temperature, feedback and client-heartbeat guards stop output. Stop removes support torque immediately. This test models only the supplied assembly, with no extra payload or moving upstream joints.",
-        zh: "设置补偿比例、阻尼和保护阈值后启动。MIT 的 Kp、Kd 均为 0，主机发送 URDF 重力补偿与速度阻尼，重力分量逐渐加入。角度、速度、温度、反馈和界面心跳保护会触发停机。停止会立即撤去支撑转矩。此测试只计算提供的总成，不包含额外负载或上游关节运动。",
+        en: "Enter the weight in kg and the vertical drop from the hook to its center in mm. For a fingertip attachment, leave the hook offset at zero. Moving the hook changes the gravity torque. Check the loaded peak against the torque limit and start. Support ramps in with Kp and Kd at zero, and speed feedback provides damping. Joint angle, drive faults, temperature, feedback loss or loss of the UI heartbeat can stop the drive. Support the arm before pressing Stop.",
+        zh: "填写砝码质量（kg）和吊点到砝码中心的垂距（mm）。绳子系在指尖时，吊点偏移填 0；移动吊点会改变重力矩。确认带载补偿峰值在转矩上限内后启动。Kp、Kd 均为 0，重力补偿逐渐加入，速度反馈用于阻尼。关节越界、驱动故障、超温、反馈中断或界面心跳丢失会触发停机。点击停止前先托住机械臂。",
       },
     },
   ],

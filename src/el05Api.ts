@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type El05Mode = "Mit" | "PositionPp" | "Velocity" | "Current" | "PositionCsp";
-export type El05Protocol = "Native" | "StandardMit";
+export type El05Protocol = "Native" | "StandardMit" | "Rs05CanFd";
 export type El05Target =
   | { kind: "Mit"; position_rad: number; velocity_rad_s: number; torque_nm: number; kp: number; kd: number }
   | { kind: "PositionPp"; position_rad: number; velocity_rad_s: number; acceleration_rad_s2: number; deceleration_rad_s2?: number; current_limit_a: number }
@@ -96,6 +96,10 @@ export interface El05GravityCompensationConfig {
   max_temperature_c: number;
   ramp_s: number;
 }
+
+// The pendulum requires a speed limit. J3 starts without one.
+type GravityStartConfig = El05GravityCompensationConfig
+  | (Omit<El05GravityCompensationConfig, "max_velocity_rad_s"> & { axis3: Axis3GravityConfig });
 
 export interface El05GravityCompensationStatus {
   active: boolean;
@@ -246,7 +250,8 @@ export interface El05ParameterValue {
 // namespace, connection, operator heartbeat and shutdown path.
 function motorApi(prefix: "el05" | "mit") {
   return {
-    connect: (iface: string, hostId: number, manualExtensions = false) => invoke<El05State>(`${prefix}_connect`, { iface, hostId, manualExtensions }),
+    connect: (iface: string, hostId: number, manualExtensions = false, protocol?: "StandardMit" | "Rs05CanFd") =>
+      invoke<El05State>(`${prefix}_connect`, { iface, hostId, manualExtensions, protocol }),
     disconnect: () => invoke<void>(`${prefix}_disconnect`),
     getState: () => invoke<El05State | null>(`${prefix}_get_state`),
     scan: () => invoke<El05Device[]>(`${prefix}_scan`),
@@ -263,7 +268,7 @@ function motorApi(prefix: "el05" | "mit") {
     startExperiment: (config: El05ExperimentConfig) => invoke<void>(`${prefix}_start_experiment`, { config }),
     experimentData: (afterSequence?: number) => invoke<El05ExperimentData>(`${prefix}_experiment_data`, { afterSequence }),
     captureGravityReference: () => invoke<El05GravityReference>(`${prefix}_capture_gravity_reference`),
-    startGravityCompensation: (config: El05GravityCompensationConfig) => invoke<void>(`${prefix}_start_gravity_compensation`, { config }),
+    startGravityCompensation: (config: GravityStartConfig) => invoke<void>(`${prefix}_start_gravity_compensation`, { config }),
     stopGravityCompensation: () => invoke<void>(`${prefix}_stop_gravity_compensation`),
   };
 }
@@ -287,6 +292,9 @@ export interface Axis3Calibration {
 }
 export interface Axis3GravityConfig {
   gravity_base_m_s2: [number, number, number];
+  payload_mass_kg: number;
+  hang_length_m: number;
+  hook_offset_m: number;
 }
 export interface Axis3ModelInfo {
   robot_name: string;
@@ -294,6 +302,8 @@ export interface Axis3ModelInfo {
   moving_links: string[];
   mass_kg: number;
   com_joint_m: [number, number, number];
+  gripper_tip_joint_m: [number, number, number];
+  hook_joint_m: [number, number, number];
   axis_joint: [number, number, number];
   lower_rad: number;
   upper_rad: number;

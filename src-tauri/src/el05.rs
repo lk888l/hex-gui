@@ -1,6 +1,5 @@
-//! RobStride EL05 native and standard-frame MIT control (manual 260922).
-//! Both wire protocols share telemetry, experiments, gravity compensation and
-//! the host control lifecycle. Manual extensions are opt-in for compatible drives.
+//! RobStride EL05 (manual 260922) and RS05 CAN FD (manual 260826) motor control.
+//! The J3 gravity model and host control lifecycle operate in joint-output rad/Nm.
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -40,6 +39,7 @@ const STEP: Duration = Duration::from_millis(20);
 const MIT_STEP: Duration = Duration::from_millis(2);
 const MIT_CONTROL_FEEDBACK_TIMEOUT: Duration = Duration::from_millis(30);
 const MOTOR_TIMEOUT: u32 = 20_000; // 50 us ticks: one second.
+pub(crate) const RS05_DATA_BITRATE: u32 = 5_000_000;
 const POLL: [u16; 5] = [0x7019, 0x701A, 0x701B, 0x701C, 0x7005];
 // Use type-2/type-24 packed velocity directly, following the user's current
 // direction measurements. Targets and dictionary mechVel remain separate.
@@ -50,6 +50,24 @@ pub enum El05Protocol {
     #[default]
     Native,
     StandardMit,
+    Rs05CanFd,
+}
+
+impl El05Protocol {
+    fn uses_native_frames(self) -> bool {
+        matches!(self, Self::Native | Self::Rs05CanFd)
+    }
+
+    fn uses_fast_control(self) -> bool {
+        matches!(self, Self::StandardMit | Self::Rs05CanFd)
+    }
+
+    fn torque_max_nm(self) -> f64 {
+        match self {
+            Self::Rs05CanFd => 5.5,
+            Self::Native | Self::StandardMit => 6.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -209,7 +227,7 @@ impl El05State {
             protocol,
             manual_extensions: false,
             reply_id: None,
-            status_reliable: protocol == El05Protocol::Native,
+            status_reliable: protocol.uses_native_frames(),
             connected,
             attached: false,
             host_id,
@@ -315,7 +333,7 @@ impl Shared {
                 .is_some_and(|p| p.abs() >= 12.57 - 1e-9)
     }
     fn control_feedback_timeout(&self) -> Duration {
-        if self.view.protocol == El05Protocol::StandardMit && self.armed {
+        if self.view.protocol.uses_fast_control() && self.armed {
             MIT_CONTROL_FEEDBACK_TIMEOUT
         } else {
             FEEDBACK_TIMEOUT
@@ -328,11 +346,11 @@ impl Shared {
     fn drive_faulted(&self) -> bool {
         self.view.fault_bits != 0
             || self.view.fault_code != 0
-            || (self.view.protocol == El05Protocol::StandardMit && self.view.warning_code != 0)
+            || (self.view.protocol != El05Protocol::Native && self.view.warning_code != 0)
     }
     fn gravity_binding(&self) -> Option<String> {
         match self.view.protocol {
-            El05Protocol::Native => self
+            El05Protocol::Native | El05Protocol::Rs05CanFd => self
                 .view
                 .identity
                 .as_ref()
@@ -375,12 +393,18 @@ impl El05Session {
         protocol: El05Protocol,
         manual_extensions: bool,
     ) -> Result<Arc<Self>> {
-        if protocol == El05Protocol::Native && host_id == 0xFE {
-            bail!("EL05 host ID 254 is reserved for discovery replies");
+        if protocol.uses_native_frames() && host_id == 0xFE {
+            bail!("RobStride host ID 254 is reserved for discovery replies");
+        }
+        if protocol == El05Protocol::Rs05CanFd {
+            let link = bus.link_config().await.ok().flatten();
+            if !bus.capabilities().fd || link.and_then(|c| c.fd_enabled) == Some(false) {
+                bail!("RS05 requires an FD-enabled CAN interface (1 Mbps nominal, 5 Mbps data)");
+            }
         }
         let rx = bus
             .subscribe(match protocol {
-                El05Protocol::Native => CanFilter::pass_all_extended(),
+                El05Protocol::Native | El05Protocol::Rs05CanFd => CanFilter::pass_all_extended(),
                 El05Protocol::StandardMit => CanFilter::pass_all_standard(),
             })
             .await
@@ -406,7 +430,8 @@ impl El05Session {
                 pending: None,
                 pending_identity: None,
                 pending_version: None,
-                scan_next: Some(0),
+                // J3 addresses the RS05 that the operator selects explicitly.
+                scan_next: (protocol != El05Protocol::Rs05CanFd).then_some(0),
                 epoch: Instant::now(),
                 current_seen: None,
                 dictionary_velocity_seen: None,
@@ -517,8 +542,11 @@ impl El05Session {
         let _guard = self.inner.gate.lock().await;
         self.inner.check_running()?;
         let host_id = self.inner.state.lock().unwrap().view.host_id;
-        if self.inner.protocol == El05Protocol::Native {
+        if self.inner.protocol.uses_native_frames() {
             validate_motor_id(motor_id, host_id)?;
+        }
+        if self.inner.protocol == El05Protocol::Rs05CanFd && motor_id > 0x7f {
+            bail!("RS05 motor CAN ID must be within 0–127");
         }
         if self.inner.state.lock().unwrap().view.motor_id.is_some() {
             self.inner.stop_locked(false).await?;
@@ -549,7 +577,23 @@ impl El05Session {
             );
             s.client_seen = Instant::now();
         }
-        self.inner.stop_locked(false).await?;
+        if let Err(error) = self.inner.stop_locked(false).await {
+            // The previous selection already acknowledged Stop. If the new
+            // address never answered, no target or Enable was sent to it.
+            // Leave the operator free to correct the ID or reconnect with a
+            // different wire protocol. A responding drive keeps its stop latch.
+            let mut s = self.inner.state.lock().unwrap();
+            if s.view.protocol != El05Protocol::Native && s.feedback_times.is_empty() {
+                s.view.motor_id = None;
+                s.view.attached = false;
+                s.safety_hold = false;
+                s.scan_next = None;
+                let reason = format!("No feedback from motor {motor_id}. Check the motor ID, protocol and bus timing: {error}");
+                s.view.last_error = Some(reason.clone());
+                bail!("{reason}");
+            }
+            return Err(error);
+        }
         if self.inner.protocol == El05Protocol::StandardMit {
             if self.inner.manual_extensions {
                 return self.set_mode_locked(El05Mode::Mit).await;
@@ -565,6 +609,9 @@ impl El05Session {
             let mut s = self.inner.state.lock().unwrap();
             s.view.mode = mode;
             s.mode_confirmed = true;
+        }
+        if self.inner.protocol == El05Protocol::Rs05CanFd && mode != El05Mode::Mit {
+            self.set_mode_locked(El05Mode::Mit).await?;
         }
         self.inner.reporting_locked(true).await?;
         Ok(self.snapshot())
@@ -697,7 +744,7 @@ impl El05Session {
                 current_limit_a: 1.0,
             },
         };
-        if self.inner.protocol == El05Protocol::Native {
+        if self.inner.protocol.uses_native_frames() {
             self.inner
                 .write_verified_locked(0x7028, f64::from(MOTOR_TIMEOUT))
                 .await?;
@@ -710,7 +757,10 @@ impl El05Session {
         let sequence = self.inner.state.lock().unwrap().feedback_sequence;
         let enabled = async {
             let command = match self.inner.protocol {
-                El05Protocol::Native => frame(3, u16::from(host), id, [0; 8])?,
+                El05Protocol::Native | El05Protocol::Rs05CanFd => self
+                    .inner
+                    .protocol
+                    .native_frame(3, u16::from(host), id, [0; 8])?,
                 El05Protocol::StandardMit => mit::enable_frame(id)?,
             };
             self.inner.send(command).await?;
@@ -784,7 +834,12 @@ impl El05Session {
         }
         let (id, host, _) = self.inner.selected()?;
         self.inner
-            .identity_request_locked(id, frame(0, u16::from(host), id, [0; 8])?)
+            .identity_request_locked(
+                id,
+                self.inner
+                    .protocol
+                    .native_frame(0, u16::from(host), id, [0; 8])?,
+            )
             .await?
             .ok_or_else(|| anyhow!("EL05 ID/UID query timed out for motor {id}"))
     }
@@ -802,7 +857,12 @@ impl El05Session {
         }
         let result = async {
             self.inner
-                .send(frame(4, u16::from(host), id, [0, 0xC4, 0, 0, 0, 0, 0, 0])?)
+                .send(self.inner.protocol.native_frame(
+                    4,
+                    u16::from(host),
+                    id,
+                    [0, 0xC4, 0, 0, 0, 0, 0, 0],
+                )?)
                 .await?;
             match tokio::time::timeout(READ_TIMEOUT, rx).await {
                 Ok(Ok(value)) => Ok(value),
@@ -863,7 +923,7 @@ impl El05Session {
             .inner
             .identity_request_locked(
                 new_id,
-                frame(
+                self.inner.protocol.native_frame(
                     7,
                     (u16::from(new_id) << 8) | u16::from(host),
                     old_id,
@@ -947,7 +1007,9 @@ impl El05Session {
         let _guard = self.inner.gate.lock().await;
         let (id, host, mode) = self.inner.selected()?;
         let can_zero = match self.inner.protocol {
-            El05Protocol::Native => matches!(mode, El05Mode::Mit | El05Mode::PositionCsp),
+            El05Protocol::Native | El05Protocol::Rs05CanFd => {
+                matches!(mode, El05Mode::Mit | El05Mode::PositionCsp)
+            }
             El05Protocol::StandardMit => matches!(mode, El05Mode::Mit | El05Mode::Velocity),
         };
         if !can_zero {
@@ -1026,10 +1088,25 @@ impl El05Session {
         } else {
             async {
                 self.inner
-                    .send(frame(6, u16::from(host), id, [1, 0, 0, 0, 0, 0, 0, 0])?)
+                    .send(self.inner.protocol.native_frame(
+                        6,
+                        u16::from(host),
+                        id,
+                        [1, 0, 0, 0, 0, 0, 0, 0],
+                    )?)
                     .await?;
                 self.inner.wait_status(sequence, 0, true).await?;
-                self.inner.read_locked(0x7019).await?;
+                let position = self.inner.read_locked(0x7019).await?.value;
+                if self.inner.protocol == El05Protocol::Rs05CanFd {
+                    if position.abs() > 0.01 {
+                        bail!("RS05 zero readback is {position:.6} rad, expected near zero");
+                    }
+                    let mut s = self.inner.state.lock().unwrap();
+                    s.view.unwrapped_position_rad = Some(position);
+                    s.view.position_velocity_rad_s = None;
+                    s.position_window.clear();
+                    s.position_window.push_back((Instant::now(), position));
+                }
                 Ok::<_, anyhow::Error>(())
             }
             .await
@@ -1064,7 +1141,7 @@ impl El05Session {
             bail!("enable EL05 before sending a target");
         }
         // Validate the complete sequence before sending its first limit write.
-        validate_target(target)?;
+        validate_target(self.inner.protocol, target)?;
         if let Err(error) = self.inner.target_locked(target, true).await {
             let _ = self.inner.stop_locked(false).await;
             return Err(error);
@@ -1091,8 +1168,8 @@ impl El05Session {
         calibration: crate::arm_axis3::Axis3Calibration,
     ) -> Result<GravityReference> {
         calibration.validate()?;
-        if self.inner.protocol != El05Protocol::StandardMit {
-            bail!("axis-3 testing requires the Standard MIT transport");
+        if self.inner.protocol == El05Protocol::Native {
+            bail!("axis-3 testing requires Standard MIT or RS05 CAN FD");
         }
         self.capture_reference(Some(calibration)).await
     }
@@ -1108,12 +1185,12 @@ impl El05Session {
             let s = self.inner.state.lock().unwrap();
             validate_gravity_capture(&s)?;
         }
-        if self.inner.protocol == El05Protocol::Native {
+        if self.inner.protocol.uses_native_frames() {
             self.inner
                 .query_identity_locked(id, host)
                 .await?
                 .ok_or_else(|| {
-                    anyhow!("EL05 UID must be verified before capturing the gravity reference")
+                    anyhow!("motor UID must be verified before capturing the gravity reference")
                 })?;
         }
         let mut s = self.inner.state.lock().unwrap();
@@ -1133,7 +1210,7 @@ impl El05Session {
         &self,
         config: GravityCompensationConfig,
     ) -> Result<()> {
-        config.validate()?;
+        config.validate(self.inner.protocol.torque_max_nm())?;
         let stop_request_revision = self.inner.state.lock().unwrap().stop_request_revision;
         let _start_guard = self.start_gate.lock().await;
         self.inner.check_stop_request(Some(stop_request_revision))?;
@@ -1187,7 +1264,7 @@ impl El05Session {
             }
             let position = s.view.unwrapped_position_rad.unwrap();
             let velocity = s.view.velocity_rad_s.unwrap();
-            s.gravity.begin(config);
+            s.gravity.begin(config)?;
             s.target = Some(s.gravity.runtime_target(position, velocity));
             s.client_seen = Instant::now();
             Ok(())
@@ -1248,7 +1325,7 @@ impl El05Session {
             let mut parameters = Vec::new();
             for index in [0x700B, 0x7026, 0x7028]
                 .into_iter()
-                .filter(|_| self.inner.protocol == El05Protocol::Native)
+                .filter(|_| self.inner.protocol.uses_native_frames())
             {
                 let _guard = self.inner.gate.lock().await;
                 self.inner.check_stop_request(Some(stop_request_revision))?;
@@ -1402,7 +1479,7 @@ impl El05Session {
             self.inner.require_manual_extensions()?;
         }
         if index == 0x7005 {
-            let payload = encode_parameter(index, value)?;
+            let payload = encode_parameter(self.inner.protocol, index, value)?;
             let mode = if self.inner.protocol == El05Protocol::StandardMit {
                 mit_mode_from_raw(payload[0])
             } else {
@@ -1464,7 +1541,7 @@ impl Drop for El05Session {
 impl Inner {
     fn require_native(&self, operation: &str) -> Result<()> {
         self.check_running()?;
-        if self.protocol != El05Protocol::Native {
+        if !self.protocol.uses_native_frames() {
             bail!("{operation} is unavailable in standard MIT compatibility mode");
         }
         Ok(())
@@ -1527,7 +1604,7 @@ impl Inner {
                     // Native clear-fault acknowledges through type-2 before
                     // clear_fault() discards the previous type-21 fault code.
                     let clean = match self.protocol {
-                        El05Protocol::Native => s.view.fault_bits == 0,
+                        El05Protocol::Native | El05Protocol::Rs05CanFd => s.view.fault_bits == 0,
                         El05Protocol::StandardMit => !s.drive_faulted(),
                     };
                     if !require_no_fault || clean {
@@ -1545,7 +1622,7 @@ impl Inner {
                 if self.protocol == El05Protocol::StandardMit {
                     bail!("standard MIT command did not receive fresh feedback before timeout");
                 }
-                bail!("EL05 did not confirm state {expected} before timeout");
+                bail!("Motor did not confirm state {expected} before timeout");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1577,7 +1654,7 @@ impl Inner {
             result
         } else {
             async {
-                self.send(frame(
+                self.send(self.protocol.native_frame(
                     4,
                     u16::from(host),
                     id,
@@ -1614,7 +1691,7 @@ impl Inner {
             }
             return Ok(());
         }
-        self.send(frame(
+        self.send(self.protocol.native_frame(
             24,
             u16::from(host),
             id,
@@ -1633,7 +1710,9 @@ impl Inner {
         let (tx, rx) = oneshot::channel();
         self.state.lock().unwrap().pending = Some((id, index, tx));
         let request = match self.protocol {
-            El05Protocol::Native => read_frame(id, host, index)?,
+            El05Protocol::Native | El05Protocol::Rs05CanFd => {
+                self.protocol.read_frame(id, host, index)?
+            }
             El05Protocol::StandardMit => mit::parameter_frame(id, index, None)?,
         };
         let result = self.send(request).await;
@@ -1651,8 +1730,11 @@ impl Inner {
     }
     async fn query_identity_locked(&self, id: u8, host: u8) -> Result<Option<El05Identity>> {
         self.require_native("UID query")?;
-        self.identity_request_locked(id, frame(0, u16::from(host), id, [0; 8])?)
-            .await
+        self.identity_request_locked(
+            id,
+            self.protocol.native_frame(0, u16::from(host), id, [0; 8])?,
+        )
+        .await
     }
     async fn identity_request_locked(
         &self,
@@ -1681,7 +1763,9 @@ impl Inner {
     async fn write_locked(&self, index: u16, value: f64) -> Result<()> {
         let (id, host, _) = self.selected()?;
         let request = match self.protocol {
-            El05Protocol::Native => write_frame(id, host, index, value)?,
+            El05Protocol::Native | El05Protocol::Rs05CanFd => {
+                self.protocol.write_frame(id, host, index, value)?
+            }
             El05Protocol::StandardMit => {
                 self.require_manual_extensions()?;
                 mit::parameter_frame(id, index, Some(value))?
@@ -1690,10 +1774,10 @@ impl Inner {
         self.send(request).await
     }
     async fn write_verified_locked(&self, index: u16, value: f64) -> Result<()> {
-        let expected = encode_parameter(index, value)?;
+        let expected = encode_parameter(self.protocol, index, value)?;
         self.write_locked(index, value).await?;
         let actual = self.read_locked(index).await?;
-        if encode_parameter(index, actual.value)? != expected {
+        if encode_parameter(self.protocol, index, actual.value)? != expected {
             bail!("EL05 parameter 0x{index:04X} write verification failed: requested {value}, read back {}", actual.value);
         }
         Ok(())
@@ -1713,7 +1797,9 @@ impl Inner {
             }
         }
         let frames = match self.protocol {
-            El05Protocol::Native => target_frames(id, host, target, limits)?,
+            El05Protocol::Native | El05Protocol::Rs05CanFd => {
+                target_frames(self.protocol, id, host, target, limits)?
+            }
             El05Protocol::StandardMit => {
                 if !self.manual_extensions {
                     vec![mit::target_frame(id, target)?]
@@ -1889,15 +1975,16 @@ fn gravity_input_problem(
         Some("EL05 gravity compensation stopped because the drive left enabled state")
     } else if s.view.unwrapped_position_rad.is_none_or(|q| !q.is_finite())
         || s.view.velocity_rad_s.is_none_or(|v| !v.is_finite())
-    {
-        Some("EL05 gravity compensation requires finite position and velocity feedback")
-    } else if s
-        .view
-        .velocity_rad_s
-        .is_some_and(|v| v.abs() >= config.max_velocity_rad_s)
         || s.view
             .position_velocity_rad_s
-            .is_some_and(|v| !v.is_finite() || v.abs() >= config.max_velocity_rad_s)
+            .is_some_and(|v| !v.is_finite())
+    {
+        Some("EL05 gravity compensation requires finite position and velocity feedback")
+    } else if config.axis3.is_none()
+        && [s.view.velocity_rad_s, s.view.position_velocity_rad_s]
+            .into_iter()
+            .flatten()
+            .any(|v| v.abs() >= config.max_velocity_rad_s)
     {
         Some("EL05 gravity compensation speed limit exceeded; motor stopped")
     } else if s
@@ -1913,11 +2000,12 @@ fn gravity_input_problem(
 }
 
 async fn service_loop(inner: Arc<Inner>) {
-    let step = if inner.protocol == El05Protocol::StandardMit {
+    let step = if inner.protocol.uses_fast_control() {
         MIT_STEP
     } else {
         STEP
     };
+    let dictionary_ticks = (Duration::from_millis(100).as_millis() / step.as_millis()) as usize;
     let mut ticker = tokio::time::interval(step);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ticks: usize = 0;
@@ -2105,17 +2193,18 @@ async fn service_loop(inner: Arc<Inner>) {
                 }
             }
         }
-        if inner.protocol == El05Protocol::Native && ticks % 5 == 0 {
+        if inner.protocol.uses_native_frames() && ticks % dictionary_ticks == 0 {
             if let Ok((id, host, _)) = inner.selected() {
                 // During experiments favor fresh Iq samples for static torque
                 // regression, while still rotating the other dictionary reads.
                 let active = inner.state.lock().unwrap().experiment.status.active;
-                let index = if active && ticks % 25 != 0 {
+                let poll = ticks / dictionary_ticks;
+                let index = if active && poll % 5 != 0 {
                     0x701A
                 } else {
-                    POLL[(ticks / if active { 25 } else { 5 }) % POLL.len()]
+                    POLL[(if active { poll / 5 } else { poll }) % POLL.len()]
                 };
-                if let Ok(frame) = read_frame(id, host, index) {
+                if let Ok(frame) = inner.protocol.read_frame(id, host, index) {
                     if let Err(error) = inner.send(frame).await {
                         inner.state.lock().unwrap().view.last_error = Some(error.to_string());
                     }
@@ -2138,7 +2227,9 @@ async fn service_loop(inner: Arc<Inner>) {
             // Scan every eight-bit address, including ID zero. A UID reply is
             // distinguished from local echoes by its nonzero UID payload.
             let probe_frame = match inner.protocol {
-                El05Protocol::Native => frame(0, u16::from(host), id, [0; 8]),
+                El05Protocol::Native | El05Protocol::Rs05CanFd => {
+                    inner.protocol.native_frame(0, u16::from(host), id, [0; 8])
+                }
                 El05Protocol::StandardMit => mit::stop_frame(id),
             };
             if let Ok(frame) = probe_frame {
@@ -2185,11 +2276,12 @@ async fn receive_loop(inner: Arc<Inner>, mut rx: Box<dyn CanRx>) {
 }
 
 fn observe_frame(inner: &Inner, frame: CanFrame) {
-    if inner.protocol == El05Protocol::StandardMit {
-        observe_standard_frame(inner, frame);
-        return;
-    }
-    if frame.kind() != FrameKind::Data || frame.is_fd() || frame.data().len() != 8 {
+    let valid_kind = match inner.protocol {
+        El05Protocol::StandardMit => return observe_standard_frame(inner, frame),
+        El05Protocol::Native => frame.kind() == FrameKind::Data,
+        El05Protocol::Rs05CanFd => frame.is_fd(),
+    };
+    if !valid_kind || frame.data().len() != 8 {
         return;
     }
     let CanId::Extended(id) = frame.id() else {
@@ -2287,7 +2379,8 @@ fn observe_frame(inner: &Inner, frame: CanFrame) {
             s.view.position_rad = Some(unpack(data[0], data[1], -12.57, 12.57));
             s.view.velocity_rad_s =
                 Some(f64::from(FEEDBACK_VELOCITY_SIGN) * unpack(data[2], data[3], -50.0, 50.0));
-            s.view.torque_nm = Some(unpack(data[4], data[5], -6.0, 6.0));
+            let t_max = inner.protocol.torque_max_nm();
+            s.view.torque_nm = Some(unpack(data[4], data[5], -t_max, t_max));
             s.view.temperature_c = Some(f64::from(u16::from_be_bytes([data[6], data[7]])) / 10.0);
             record_motion_feedback(&mut s, now, id, data);
         }
@@ -2400,14 +2493,20 @@ fn observe_standard_frame(inner: &Inner, frame: CanFrame) {
 fn record_motion_feedback(s: &mut Shared, now: Instant, id: u32, data: &[u8]) {
     // A delayed reply must not erase evidence of a gap before the service
     // worker checks it. Never continue fast host damping on old velocity.
-    if s.view.protocol == El05Protocol::StandardMit
+    if s.view.protocol.uses_fast_control()
         && s.armed
         && s.feedback_times
             .back()
             .is_some_and(|last| now.duration_since(*last) > MIT_CONTROL_FEEDBACK_TIMEOUT)
     {
-        s.receive_error =
-            Some("standard MIT control feedback gap exceeded 30 ms; motor stopped".into());
+        let drive = if s.view.protocol == El05Protocol::Rs05CanFd {
+            "RS05"
+        } else {
+            "standard MIT"
+        };
+        s.receive_error = Some(format!(
+            "{drive} control feedback gap exceeded 30 ms; motor stopped"
+        ));
     }
     if s.gravity.status.reference.is_some()
         && s.feedback_times
@@ -2502,21 +2601,36 @@ fn validate_motor_id(id: u8, host: u8) -> Result<()> {
     }
     Ok(())
 }
-fn frame(ty: u8, data: u16, destination: u8, payload: [u8; 8]) -> Result<CanFrame> {
-    let id = (u32::from(ty) << 24) | (u32::from(data) << 8) | u32::from(destination);
-    CanFrame::new_data(CanId::Extended(id), &payload).map_err(|e| anyhow!("build EL05 frame: {e}"))
-}
-fn read_frame(id: u8, host: u8, index: u16) -> Result<CanFrame> {
-    let mut data = [0; 8];
-    data[..2].copy_from_slice(&index.to_le_bytes());
-    frame(17, u16::from(host), id, data)
-}
-fn write_frame(id: u8, host: u8, index: u16, value: f64) -> Result<CanFrame> {
-    let raw = encode_parameter(index, value)?;
-    let mut data = [0; 8];
-    data[..2].copy_from_slice(&index.to_le_bytes());
-    data[4..].copy_from_slice(&raw);
-    frame(18, u16::from(host), id, data)
+impl El05Protocol {
+    fn native_frame(
+        self,
+        ty: u8,
+        data: u16,
+        destination: u8,
+        payload: [u8; 8],
+    ) -> Result<CanFrame> {
+        let id = CanId::Extended(
+            (u32::from(ty) << 24) | (u32::from(data) << 8) | u32::from(destination),
+        );
+        match self {
+            Self::Native => CanFrame::new_data(id, &payload),
+            Self::Rs05CanFd => CanFrame::new_fd(id, &payload, true),
+            Self::StandardMit => bail!("standard MIT uses 11-bit frames"),
+        }
+        .map_err(|e| anyhow!("build RobStride frame: {e}"))
+    }
+    fn read_frame(self, id: u8, host: u8, index: u16) -> Result<CanFrame> {
+        let mut data = [0; 8];
+        data[..2].copy_from_slice(&index.to_le_bytes());
+        self.native_frame(17, u16::from(host), id, data)
+    }
+    fn write_frame(self, id: u8, host: u8, index: u16, value: f64) -> Result<CanFrame> {
+        let raw = encode_parameter(self, index, value)?;
+        let mut data = [0; 8];
+        data[..2].copy_from_slice(&index.to_le_bytes());
+        data[4..].copy_from_slice(&raw);
+        self.native_frame(18, u16::from(host), id, data)
+    }
 }
 fn check_range(value: f64, min: f64, max: f64, label: &str) -> Result<()> {
     if !value.is_finite() || !(min..=max).contains(&value) {
@@ -2544,7 +2658,7 @@ fn parameter_kind(index: u16) -> Result<El05ParameterKind> {
         _ => bail!("EL05 parameter 0x{index:04X} is not in the manual's supported dictionary"),
     }
 }
-fn encode_parameter(index: u16, value: f64) -> Result<[u8; 4]> {
+fn encode_parameter(protocol: El05Protocol, index: u16, value: f64) -> Result<[u8; 4]> {
     let kind = parameter_kind(index)?;
     if (0x7019..=0x701C).contains(&index) {
         bail!("EL05 parameter 0x{index:04X} is read-only");
@@ -2552,9 +2666,11 @@ fn encode_parameter(index: u16, value: f64) -> Result<[u8; 4]> {
     let (min, max) = match index {
         0x7005 => (0.0, 5.0),
         0x7006 => (-11.0, 11.0),
+        0x700A if protocol == El05Protocol::Rs05CanFd => (-33.0, 33.0),
         0x700A => (-50.0, 50.0),
-        0x700B => (0.0, 6.0),
+        0x700B => (0.0, protocol.torque_max_nm()),
         0x7014 | 0x7021 => (0.0, 1.0),
+        0x7017 if protocol == El05Protocol::Rs05CanFd => (0.0, 33.0),
         0x7017 | 0x7024 => (0.0, 50.0),
         0x7018 => (0.0, 11.0),
         0x7016 | 0x702B => (-(f32::MAX as f64), f32::MAX as f64),
@@ -2595,9 +2711,9 @@ fn decode_parameter(index: u16, data: &[u8]) -> Result<El05ParameterValue> {
     }
     Ok(El05ParameterValue { index, value, kind })
 }
-fn validate_target(target: El05Target) -> Result<()> {
+fn validate_target(protocol: El05Protocol, target: El05Target) -> Result<()> {
     for (index, value) in target_parameters(target, true) {
-        encode_parameter(index, value)?;
+        encode_parameter(protocol, index, value)?;
     }
     match target {
         El05Target::Mit {
@@ -2610,7 +2726,12 @@ fn validate_target(target: El05Target) -> Result<()> {
             for (value, min, max, label) in [
                 (position_rad, -12.57, 12.57, "position (rad)"),
                 (velocity_rad_s, -50.0, 50.0, "velocity (rad/s)"),
-                (torque_nm, -6.0, 6.0, "torque (Nm)"),
+                (
+                    torque_nm,
+                    -protocol.torque_max_nm(),
+                    protocol.torque_max_nm(),
+                    "torque (Nm)",
+                ),
                 (kp, 0.0, 500.0, "Kp"),
                 (kd, 0.0, 5.0, "Kd"),
             ] {
@@ -2694,8 +2815,14 @@ fn target_parameters(target: El05Target, limits: bool) -> Vec<(u16, f64)> {
     }
     out
 }
-fn target_frames(id: u8, host: u8, target: El05Target, limits: bool) -> Result<Vec<CanFrame>> {
-    validate_target(target)?;
+fn target_frames(
+    protocol: El05Protocol,
+    id: u8,
+    host: u8,
+    target: El05Target,
+    limits: bool,
+) -> Result<Vec<CanFrame>> {
+    validate_target(protocol, target)?;
     if let El05Target::Mit {
         position_rad,
         velocity_rad_s,
@@ -2713,11 +2840,17 @@ fn target_frames(id: u8, host: u8, target: El05Target, limits: bool) -> Result<V
         ]) {
             chunk.copy_from_slice(&pack(value, min, max).to_be_bytes());
         }
-        return Ok(vec![frame(1, pack(torque_nm, -6.0, 6.0), id, data)?]);
+        let t_max = protocol.torque_max_nm();
+        return Ok(vec![protocol.native_frame(
+            1,
+            pack(torque_nm, -t_max, t_max),
+            id,
+            data,
+        )?]);
     }
     target_parameters(target, limits)
         .into_iter()
-        .map(|(index, value)| write_frame(id, host, index, value))
+        .map(|(index, value)| protocol.write_frame(id, host, index, value))
         .collect()
 }
 fn pack(value: f64, min: f64, max: f64) -> u16 {
@@ -2770,7 +2903,12 @@ mod tests {
     use std::sync::atomic::AtomicU8;
     use tokio::sync::broadcast;
 
+    fn frame(ty: u8, data: u16, destination: u8, payload: [u8; 8]) -> Result<CanFrame> {
+        El05Protocol::Native.native_frame(ty, data, destination, payload)
+    }
+
     struct MockBus {
+        protocol: El05Protocol,
         tx: broadcast::Sender<CanFrame>,
         sent: StdMutex<Vec<CanFrame>>,
         values: StdMutex<BTreeMap<u16, [u8; 4]>>,
@@ -2792,8 +2930,12 @@ mod tests {
     }
     impl MockBus {
         fn new() -> Arc<Self> {
+            Self::with_protocol(El05Protocol::Native)
+        }
+        fn with_protocol(protocol: El05Protocol) -> Arc<Self> {
             let (tx, _) = broadcast::channel(256);
             Arc::new(Self {
+                protocol,
                 tx,
                 sent: StdMutex::new(Vec::new()),
                 values: StdMutex::new(BTreeMap::from([
@@ -2839,13 +2981,14 @@ mod tests {
             bytes[4..6].copy_from_slice(&pack(0.0, -6.0, 6.0).to_be_bytes());
             bytes[6..].copy_from_slice(&250u16.to_be_bytes());
             let _ = self.tx.send(
-                frame(
-                    2,
-                    (state << 14) | u16::from(self.motor_id.load(Ordering::Acquire)),
-                    253,
-                    bytes,
-                )
-                .unwrap(),
+                self.protocol
+                    .native_frame(
+                        2,
+                        (state << 14) | u16::from(self.motor_id.load(Ordering::Acquire)),
+                        253,
+                        bytes,
+                    )
+                    .unwrap(),
             );
         }
         fn identity(&self) {
@@ -2858,7 +3001,11 @@ mod tests {
             } else {
                 [1, 2, 3, 4, 5, 6, 7, 8]
             };
-            let _ = self.tx.send(frame(0, u16::from(id), 254, uid).unwrap());
+            let _ = self.tx.send(
+                self.protocol
+                    .native_frame(0, u16::from(id), 254, uid)
+                    .unwrap(),
+            );
         }
     }
     struct MockRx(broadcast::Receiver<CanFrame>);
@@ -2882,12 +3029,20 @@ mod tests {
     impl CanBus for MockBus {
         async fn send(&self, request: CanFrame) -> std::result::Result<(), CanIoError> {
             self.sent.lock().unwrap().push(request.clone());
+            let expected = match self.protocol {
+                El05Protocol::Rs05CanFd => FrameKind::Fd { brs: true },
+                _ => FrameKind::Data,
+            };
+            assert_eq!(request.kind(), expected);
+            assert!(request.id().is_extended());
             let id = request.id().raw();
             let ty = (id >> 24) & 0x1F;
             if ty == 0 && id as u8 == self.occupied_id.load(Ordering::Acquire) {
-                let _ = self
-                    .tx
-                    .send(frame(0, u16::from(id as u8), 254, [9; 8]).unwrap());
+                let _ = self.tx.send(
+                    self.protocol
+                        .native_frame(0, u16::from(id as u8), 254, [9; 8])
+                        .unwrap(),
+                );
             }
             let motor_id = self.motor_id.load(Ordering::Acquire);
             if id as u8 != motor_id {
@@ -2906,7 +3061,13 @@ mod tests {
                 4 if data[1] == 0xC4 => {
                     if !self.suppress_version_reply.load(Ordering::Acquire) {
                         let _ = self.tx.send(
-                            frame(2, u16::from(motor_id), 253, [0, 0xC4, 0x56, 10, 5, 0, 1, 7])
+                            self.protocol
+                                .native_frame(
+                                    2,
+                                    u16::from(motor_id),
+                                    253,
+                                    [0, 0xC4, 0x56, 10, 5, 0, 1, 7],
+                                )
                                 .unwrap(),
                         );
                     }
@@ -2947,9 +3108,11 @@ mod tests {
                     let mut payload = [0; 8];
                     payload[..2].copy_from_slice(&index.to_le_bytes());
                     payload[4..].copy_from_slice(&value);
-                    let _ = self
-                        .tx
-                        .send(frame(17, u16::from(motor_id), 253, payload).unwrap());
+                    let _ = self.tx.send(
+                        self.protocol
+                            .native_frame(17, u16::from(motor_id), 253, payload)
+                            .unwrap(),
+                    );
                 }
                 18 => {
                     if !self.reject_writes.load(Ordering::Acquire) {
@@ -2994,7 +3157,7 @@ mod tests {
         }
         fn capabilities(&self) -> CanCapabilities {
             CanCapabilities {
-                fd: false,
+                fd: self.protocol == El05Protocol::Rs05CanFd,
                 max_dlen: 8,
             }
         }
@@ -3004,6 +3167,206 @@ mod tests {
         let app = El05Session::start(bus.clone(), 253).await.unwrap();
         app.attach(1).await.unwrap();
         (bus, app)
+    }
+
+    #[test]
+    fn rs05_motion_vectors_use_extended_fd_brs_and_signed_5_5_nm() {
+        // RS05 manual §4.1: torque occupies ID bits 23..8, the other four
+        // fields each occupy two big-endian payload bytes.
+        let command = |torque_nm| El05Target::Mit {
+            position_rad: 12.57,
+            velocity_rad_s: -50.,
+            kp: 250.,
+            kd: 5.,
+            torque_nm,
+        };
+        for (torque, id) in [
+            (-5.5, 0x0100007f),
+            (0., 0x017fff7f),
+            (2.75, 0x01bfff7f),
+            (5.5, 0x01ffff7f),
+        ] {
+            let tx =
+                target_frames(El05Protocol::Rs05CanFd, 0x7f, 0xfd, command(torque), false).unwrap();
+            assert_eq!(tx.len(), 1);
+            assert_eq!(tx[0].kind(), FrameKind::Fd { brs: true });
+            assert_eq!(tx[0].id(), CanId::Extended(id));
+            assert_eq!(tx[0].data(), [0xff, 0xff, 0, 0, 0x7f, 0xff, 0xff, 0xff]);
+        }
+        for invalid in [-5.501, 5.501, f64::NAN] {
+            assert!(
+                target_frames(El05Protocol::Rs05CanFd, 0x7f, 0xfd, command(invalid), false)
+                    .is_err()
+            );
+        }
+        let legacy = target_frames(El05Protocol::Native, 0x7f, 0xfd, command(6.), false).unwrap();
+        assert_eq!(legacy[0].kind(), FrameKind::Data);
+        assert_eq!(legacy[0].id(), CanId::Extended(0x01ffff7f));
+    }
+
+    #[tokio::test]
+    async fn rs05_receives_addressed_fd_feedback_only() {
+        let protocol = El05Protocol::Rs05CanFd;
+        assert!(
+            El05Session::start_with_protocol(MockBus::new(), 0xfd, protocol)
+                .await
+                .is_err()
+        );
+        let app =
+            El05Session::start_with_protocol(MockBus::with_protocol(protocol), 0xfd, protocol)
+                .await
+                .unwrap();
+        let _gate = app.inner.gate.lock().await;
+        app.inner.state.lock().unwrap().view.motor_id = Some(0x7f);
+        let id = CanId::Extended(0x0284_7ffd); // Running, overtemperature, motor 7F to host FD.
+        let data = [0xff, 0xff, 0, 0, 0xff, 0xff, 1, 0x36];
+        for unrelated in [
+            CanFrame::new_data(id, &data).unwrap(),
+            CanFrame::new_fd(CanId::Standard(0x7f), &data, true).unwrap(),
+            CanFrame::new_fd(CanId::Extended(0x0284_7efd), &data, true).unwrap(),
+            CanFrame::new_fd(CanId::Extended(0x0284_7ffc), &data, true).unwrap(),
+            CanFrame::new_fd(id, &[0; 12], true).unwrap(),
+        ] {
+            observe_frame(&app.inner, unrelated);
+        }
+        assert_eq!(app.snapshot().feedback_sequence, 0);
+        observe_frame(&app.inner, CanFrame::new_fd(id, &data, true).unwrap());
+        let s = app.snapshot();
+        assert_eq!(
+            (s.position_rad, s.velocity_rad_s, s.torque_nm),
+            (Some(12.57), Some(-50.), Some(5.5))
+        );
+        assert_eq!(
+            (s.status_code, s.fault_bits, s.temperature_c),
+            (2, 4, Some(31.))
+        );
+        assert!(s.status_reliable && s.enabled);
+        observe_frame(
+            &app.inner,
+            CanFrame::new_fd(CanId::Extended(0x1800_7ffd), &[0; 8], true).unwrap(),
+        );
+        let s = app.snapshot();
+        assert_eq!(
+            (s.feedback_sequence, s.enabled, s.torque_nm),
+            (2, false, Some(-5.5))
+        );
+    }
+
+    #[tokio::test]
+    async fn rs05_unanswered_selection_can_disconnect_or_retry() {
+        let protocol = El05Protocol::Rs05CanFd;
+        let bus = MockBus::with_protocol(protocol);
+        let app = El05Session::start_with_protocol(bus.clone(), 0xfd, protocol)
+            .await
+            .unwrap();
+        assert!(app.attach(128).await.is_err());
+        assert!(bus.sent.lock().unwrap().is_empty());
+        assert!(app
+            .attach(5)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("No feedback"));
+        assert!(!app.snapshot().attached);
+        assert!(app.attach(1).await.unwrap().online);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rs05_loaded_j3_checks_reference_and_torque_then_stops_on_feedback_loss() {
+        let protocol = El05Protocol::Rs05CanFd;
+        let bus = MockBus::with_protocol(protocol);
+        bus.values.lock().unwrap().insert(0x7005, [2, 0, 0, 0]); // Initially in velocity mode.
+        let app = El05Session::start_with_protocol(bus.clone(), 0xfd, protocol)
+            .await
+            .unwrap();
+        let selected = app.attach(1).await.unwrap();
+        assert_eq!(selected.protocol, protocol);
+        assert_eq!(selected.mode, El05Mode::Mit);
+        assert!(selected.reporting && !selected.enabled);
+        let capture = || {
+            app.capture_axis3_reference(crate::arm_axis3::Axis3Calibration {
+                joint_angle_rad: 0.3,
+                encoder_direction: 1,
+            })
+        };
+        let first = capture().await.unwrap();
+        assert_eq!(app.snapshot().identity.unwrap().uid, "0102030405060708");
+        app.set_zero().await.unwrap();
+        assert!(app.snapshot().gravity_compensation.reference.is_none());
+        assert_eq!(app.snapshot().mechanical_position_rad, Some(0.));
+        let mut config = GravityCompensationConfig {
+            axis3: Some(crate::arm_axis3::Axis3GravityConfig {
+                payload_mass_kg: 0.25,
+                hook_offset_m: 0.02,
+                hang_length_m: 0.2,
+                ..Default::default()
+            }),
+            reference_id: first.id,
+            mass_kg: 0.,
+            length_m: 0.18,
+            arm_mass_kg: 0.,
+            compensation_scale: 1.,
+            damping_nm_s_rad: 0.1,
+            torque_limit_nm: 5.5,
+            max_velocity_rad_s: 0.,
+            max_temperature_c: 60.,
+            ramp_s: 0.1,
+        };
+        assert!(app
+            .start_gravity_compensation(config.clone())
+            .await
+            .is_err());
+        config.reference_id = capture().await.unwrap().id;
+        config.torque_limit_nm = 5.501;
+        assert!(app
+            .start_gravity_compensation(config.clone())
+            .await
+            .is_err());
+        assert!(!bus
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.id().raw() >> 24 == 3));
+        config.torque_limit_nm = 5.5;
+        app.start_gravity_compensation(config).await.unwrap();
+        assert_eq!(bus.values.lock().unwrap()[&0x7028], 20_000u32.to_le_bytes());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.sent.lock().unwrap().iter().any(|f| {
+                    let id = f.id().raw();
+                    id >> 24 == 1
+                        && (id >> 8) & 0xffff > 0x8000
+                        && f.data() == [0x7f, 0xff, 0x7f, 0xff, 0, 0, 0, 0]
+                }) {
+                    break;
+                }
+                tokio::time::sleep(MIT_STEP).await;
+            }
+        })
+        .await
+        .unwrap();
+        bus.suppress_motion_feedback.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bus.enabled.load(Ordering::Acquire) {
+                tokio::time::sleep(MIT_STEP).await;
+            }
+        })
+        .await
+        .unwrap();
+        let s = app.snapshot();
+        assert!(!s.streaming && !s.gravity_compensation.active);
+        assert!(s.gravity_compensation.reference.is_none());
+        app.shutdown().await.unwrap();
+        let requests = bus.sent.lock().unwrap();
+        assert!(requests
+            .iter()
+            .all(|f| f.kind() == FrameKind::Fd { brs: true } && f.id().raw() as u8 == 1));
+        assert!(requests
+            .iter()
+            .any(|f| f.id() == CanId::Extended(0x0400_fd01)));
+        assert_eq!(requests.last().unwrap().data(), [1, 2, 3, 4, 5, 6, 0, 0]);
     }
 
     #[tokio::test]
@@ -3433,7 +3796,7 @@ mod tests {
             .capture(1, "test-uid".into(), downward_position, 0.0)
             .id;
         let damping = config.damping_nm_s_rad;
-        gravity.begin(config);
+        gravity.begin(config).unwrap();
         let guard = app.inner.gate.lock().await;
         {
             let mut s = app.inner.state.lock().unwrap();
@@ -3813,7 +4176,10 @@ mod tests {
     #[test]
     fn private_protocol_uses_extended_ids_and_distinct_endianness() {
         // Actual firmware initially reads 0; allow verified restoration.
-        assert_eq!(encode_parameter(0x7026, 0.0).unwrap(), [0; 4]);
+        assert_eq!(
+            encode_parameter(El05Protocol::Native, 0x7026, 0.0).unwrap(),
+            [0; 4]
+        );
         let target = El05Target::Mit {
             position_rad: 12.57,
             velocity_rad_s: -50.0,
@@ -3821,32 +4187,44 @@ mod tests {
             kp: 500.0,
             kd: 5.0,
         };
-        let frames = target_frames(1, 253, target, true).unwrap();
+        let frames = target_frames(El05Protocol::Native, 1, 253, target, true).unwrap();
         assert_eq!(frames[0].id(), CanId::Extended(0x01FFFF01));
         assert_eq!(frames[0].data(), &[255, 255, 0, 0, 255, 255, 255, 255]);
-        let write = write_frame(0x7F, 0xFD, 0x701E, 30.0).unwrap();
+        let write = El05Protocol::Native
+            .write_frame(0x7F, 0xFD, 0x701E, 30.0)
+            .unwrap();
         assert_eq!(write.id(), CanId::Extended(0x1200FD7F));
         assert_eq!(write.data(), &[0x1E, 0x70, 0, 0, 0, 0, 0xF0, 0x41]);
         assert_eq!(
-            read_frame(0x7F, 0xFD, 0x701E).unwrap().id(),
+            El05Protocol::Native
+                .read_frame(0x7F, 0xFD, 0x701E)
+                .unwrap()
+                .id(),
             CanId::Extended(0x1100FD7F)
         );
     }
     #[test]
     fn target_validation_rejects_nonfinite_out_of_range_and_invalid_modes() {
         for value in [f64::NAN, f64::INFINITY, -11.001, 11.001] {
-            assert!(validate_target(El05Target::Current { current_a: value }).is_err());
+            assert!(validate_target(
+                El05Protocol::Native,
+                El05Target::Current { current_a: value }
+            )
+            .is_err());
         }
-        assert!(encode_parameter(0x7005, 4.0).is_err());
-        assert!(encode_parameter(0x7028, 1.5).is_err());
-        assert!(encode_parameter(0x7019, 0.0).is_err());
-        assert!(validate_target(El05Target::Mit {
-            position_rad: 0.0,
-            velocity_rad_s: 0.0,
-            torque_nm: 0.0,
-            kp: 0.0,
-            kd: 5.1
-        })
+        assert!(encode_parameter(El05Protocol::Native, 0x7005, 4.0).is_err());
+        assert!(encode_parameter(El05Protocol::Native, 0x7028, 1.5).is_err());
+        assert!(encode_parameter(El05Protocol::Native, 0x7019, 0.0).is_err());
+        assert!(validate_target(
+            El05Protocol::Native,
+            El05Target::Mit {
+                position_rad: 0.0,
+                velocity_rad_s: 0.0,
+                torque_nm: 0.0,
+                kp: 0.0,
+                kd: 5.1
+            }
+        )
         .is_err());
     }
     #[test]
@@ -3878,7 +4256,7 @@ mod tests {
             &[0x7018, 0x7024, 0x7025, 0x7016],
         ];
         for (target, expected) in targets.into_iter().zip(expected) {
-            let frames = target_frames(1, 253, target, true).unwrap();
+            let frames = target_frames(El05Protocol::Native, 1, 253, target, true).unwrap();
             let indices: Vec<_> = frames
                 .iter()
                 .map(|f| u16::from_le_bytes([f.data()[0], f.data()[1]]))

@@ -20,6 +20,7 @@ struct MitOnlyBus {
     flags: AtomicU8,
     motor_id: AtomicU8,
     position: StdMutex<f64>,
+    velocity_raw: AtomicU16,
     zero_due: StdMutex<Option<Instant>>,
     zero_applies: AtomicBool,
     follow_position: AtomicBool,
@@ -39,6 +40,7 @@ impl MitOnlyBus {
             flags: AtomicU8::new(0),
             motor_id: AtomicU8::new(1),
             position: StdMutex::new(-2.9333),
+            velocity_raw: AtomicU16::new(2048),
             zero_due: StdMutex::new(None),
             zero_applies: AtomicBool::new(true),
             follow_position: AtomicBool::new(false),
@@ -47,8 +49,9 @@ impl MitOnlyBus {
     }
 
     fn telemetry(&self) -> CanFrame {
-        // Independent wire fixture: p16, v12=2048, tau12=2048, 30.7 C.
+        // Independent wire fixture: p16, v12, tau12=2048, 30.7 C by default.
         let p = (((*self.position.lock().unwrap() + 12.57) / 25.14) * 65535.0).round() as u16;
+        let velocity = self.velocity_raw.load(Ordering::Acquire);
         let temperature = self.temperature_decic.load(Ordering::Acquire);
         CanFrame::new_data(
             CanId::Standard(self.reply_id.load(Ordering::Acquire)),
@@ -56,8 +59,8 @@ impl MitOnlyBus {
                 self.motor_id.load(Ordering::Acquire),
                 (p >> 8) as u8,
                 p as u8,
-                0x80,
-                0x08,
+                (velocity >> 4) as u8,
+                ((velocity as u8) << 4) | 0x08,
                 0,
                 self.flags.load(Ordering::Acquire) | ((temperature >> 8) as u8 & 0x0f),
                 temperature as u8,
@@ -262,9 +265,7 @@ async fn axis3_config(app: &El05Session) -> GravityCompensationConfig {
         .await
         .unwrap();
     config.reference_id = reference.id;
-    config.axis3 = Some(crate::arm_axis3::Axis3GravityConfig {
-        gravity_base_m_s2: [0., 0., -9.80665],
-    });
+    config.axis3 = Some(crate::arm_axis3::Axis3GravityConfig::default());
     config.torque_limit_nm = 2.;
     config
 }
@@ -273,9 +274,7 @@ async fn axis3_config(app: &El05Session) -> GravityCompensationConfig {
 async fn axis3_reference_binding_rejects_wrong_model_zero_and_selection_changes() {
     let (_, app) = attached(1).await;
     let mut pendulum = gravity_config(&app).await;
-    pendulum.axis3 = Some(crate::arm_axis3::Axis3GravityConfig {
-        gravity_base_m_s2: [0., 0., -9.80665],
-    });
+    pendulum.axis3 = Some(crate::arm_axis3::Axis3GravityConfig::default());
     pendulum.torque_limit_nm = 2.;
     assert!(app
         .start_gravity_compensation(pendulum)
@@ -326,6 +325,51 @@ async fn axis3_reference_binding_rejects_wrong_model_zero_and_selection_changes(
 }
 
 #[tokio::test]
+async fn loaded_axis3_keeps_sending_damped_torque_above_the_old_speed_limit() {
+    let (bus, app) = attached(1).await;
+    let mut config = axis3_config(&app).await;
+    config.axis3.as_mut().unwrap().payload_mass_kg = 0.25;
+    // A legacy client can still supply its former threshold.
+    config.max_velocity_rad_s = 1.;
+    app.start_gravity_compensation(config.clone())
+        .await
+        .unwrap();
+    for raw in [1024, 3071] {
+        bus.velocity_raw.store(raw, Ordering::Release);
+        bus.feedback();
+        let sign = if raw < 2048 { -1. } else { 1. };
+        wait_until(&app, |s| {
+            let status = &s.gravity_compensation;
+            s.enabled
+                && s.streaming
+                && status.active
+                && status.elapsed_s >= config.ramp_s
+                && s.velocity_rad_s.is_some_and(|v| sign * v > 20.)
+                && sign * status.damping_torque_nm < -2.
+                && status.gravity_torque_nm > 0.
+                && status.command_torque_nm.abs() <= config.torque_limit_nm
+        })
+        .await;
+        assert!(bus.physical_enabled.load(Ordering::Acquire));
+    }
+    {
+        let _gate = app.inner.gate.lock().await;
+        let mut s = app.inner.state.lock().unwrap();
+        s.view.velocity_rad_s = Some(0.);
+        s.view.position_velocity_rad_s = Some(-25.);
+        assert!(gravity_input_problem(&s, &config, true).is_none());
+        s.view.position_velocity_rad_s = Some(f64::NAN);
+        assert!(gravity_input_problem(&s, &config, true)
+            .unwrap()
+            .contains("finite"));
+        s.view.position_velocity_rad_s = Some(0.);
+    }
+    app.stop().await.unwrap();
+    assert!(!bus.physical_enabled.load(Ordering::Acquire));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn axis3_stops_on_joint_limit_fault_temperature_feedback_loss_and_heartbeat() {
     for condition in ["angle", "fault", "temperature", "feedback", "heartbeat"] {
         let (bus, app) = attached(1).await;
@@ -335,7 +379,7 @@ async fn axis3_stops_on_joint_limit_fault_temperature_feedback_loss_and_heartbea
         match condition {
             "angle" => {
                 // Move the coordinate outside the model range while keeping fresh
-                // feedback, isolating the angle guard from the velocity guard.
+                // feedback to exercise the angle guard.
                 app.inner
                     .state
                     .lock()

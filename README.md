@@ -385,29 +385,48 @@ bus with the right settings:
   parameter-read failures are shown explicitly, since older EL05 firmware may
   not implement every optional parameter in the current manual.
 
-- **Other → Arm Axis 3 · Zero Gravity** — a focused single-axis test based on
-  the Standard MIT connection and control engine. It bundles the operator's
+- **Other → Arm Axis 3 · Zero Gravity** runs a single-axis test with either
+  Standard MIT or RobStride RS05 CAN FD. It bundles the operator's
   `总装URDF` assembly, using its only revolute joint `Link1` as physical axis 3
   and including the fixed `Link2` / `Link3` masses. No controller or NAS access
-  is needed at runtime. Select the actual motor CAN ID (not necessarily 3).
+  is needed at runtime. Choose the motor protocol before connecting.
+  **Basic MIT** (default) and **EL05 manual extensions** use 11-bit Classic CAN
+  at 1 Mbps with a ±6 Nm torque range. **RS05 CAN FD · MIT** uses the native
+  motion mode in the RS05CANFD manual 260826, §§4.1 and 4.3.1. The drive
+  exchanges 29-bit FD frames with 16-bit fields for joint position (±12.57 rad),
+  velocity (±50 rad/s) and torque (±5.5 Nm). The gs_usb profile uses 1 Mbps
+  arbitration, 5 Mbps data and BRS. Configure SocketCAN timing and enable FD
+  in the operating system. Enter the actual J3 motor CAN ID and, for the RS05,
+  the host ID (default `0xFD`).
   Use the 3D preview to align the supported, stopped assembly with a known URDF
   pose (default 0°), choose encoder direction and **Capture reference**. The
   backend binds that measured encoder position and URDF angle to this motor
-  session. Optional **Zero encoder** uses the MIT zero command and confirmed
-  delayed readback; it invalidates the reference and requires recapture.
-  Reconnects, motor selection and feedback gaps also require recapture.
+  session. For the RS05 the backend also verifies the drive's MCU UID.
+  Optional **Zero encoder** uses the selected drive's zero command and checks
+  its position readback. Capture a new reference after zeroing, switching
+  protocols or motors, reconnecting, or a feedback gap.
+
+  For a suspended test weight, enter its mass in kg and the vertical distance
+  from the hook to the weight's center in mm. A cord tied at the fingertip
+  uses zero hook offset. For a different attachment point, enter its signed
+  offset along the gripper in mm, positive toward the fingertips and beyond.
+  The preview shows the hook and suspended weight at the selected pose.
+  Under static gravity the weight pulls down at the hook. Moving the hook
+  changes its moment arm. Lengthening the vertical cord lowers the weight.
+  A mass of 0 kg selects the unloaded assembly. Edit the load between runs.
 
   The app sends `Kp=Kd=0`, with
   `q = q_ref + direction × (encoder − encoder_ref)` and
   `torque = direction × scale × G(q) − damping × encoder_velocity`.
-  Gravity support ramps in; torque limiting and URDF angle, velocity,
-  temperature, feedback and client-heartbeat guards run in the backend.
-  Defaults: scale 1, damping 0.1 Nm·s/rad, torque limit 1.5 Nm, speed limit
-  1 rad/s, temperature limit 60°C and ramp 2 s. The original URDF's 0–3.14 rad
-  range is enforced. The base must remain fixed; enter base-frame gravity if
-  it is tilted. Motor position/torque must use joint-output rad/Nm. Additional
-  payload and moving upstream joints are outside this assembly model. Stop,
-  leaving the app and window close use the Standard MIT stop lifecycle.
+  The backend checks the loaded peak torque before enabling and ramps in
+  gravity support. J3 uses speed feedback for damping at all speeds. Output
+  torque is limited, and joint angle, drive faults, temperature, feedback
+  loss and client-heartbeat loss can stop the drive. The default scale is 1,
+  damping is 0.1 Nm·s/rad, torque limit is 1.5 Nm, temperature limit is 60°C
+  and ramp time is 2 s. The original URDF's 0–3.14 rad range is enforced.
+  Keep the base and upstream joints fixed and enter base-frame gravity if
+  the base is tilted. Motor position/torque must use joint-output rad/Nm. Stop,
+  leaving the app and window close send the selected drive's stop command.
   **Support the mechanism before stopping: Stop immediately removes support
   torque.** See [model provenance and computed parameters](public/axis3/README.md).
 

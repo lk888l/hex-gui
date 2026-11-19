@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Result};
 use can_transport::{CanFrame, CanId, FrameKind};
 
-use super::El05Target;
+use super::{El05Protocol, El05Target};
 
 const STOP: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd];
 const ENABLE: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc];
@@ -47,7 +47,11 @@ pub(super) fn parameter_frame(id: u8, index: u16, value: Option<f64>) -> Result<
     let mut payload = [0; 8];
     payload[..2].copy_from_slice(&index.to_le_bytes());
     if let Some(value) = value {
-        payload[4..].copy_from_slice(&super::encode_parameter(index, value)?);
+        payload[4..].copy_from_slice(&super::encode_parameter(
+            El05Protocol::StandardMit,
+            index,
+            value,
+        )?);
     }
     CanFrame::new_data(
         CanId::Standard((if value.is_some() { 4 } else { 3 } << 8) | u16::from(id)),
@@ -57,7 +61,7 @@ pub(super) fn parameter_frame(id: u8, index: u16, value: Option<f64>) -> Result<
 }
 
 pub(super) fn extended_target_frame(id: u8, target: El05Target) -> Result<CanFrame> {
-    super::validate_target(target)?;
+    super::validate_target(El05Protocol::StandardMit, target)?;
     let (mode, first, second) = match target {
         El05Target::Mit { .. } => return target_frame(id, target),
         El05Target::PositionCsp {
@@ -110,7 +114,7 @@ pub(super) fn target_frame(id: u8, target: El05Target) -> Result<CanFrame> {
     else {
         bail!("standard MIT compatibility supports MIT targets only");
     };
-    super::validate_target(target)?;
+    super::validate_target(El05Protocol::StandardMit, target)?;
     let p = pack(position_rad, -12.57, 12.57, 16);
     let v = pack(velocity_rad_s, -50.0, 50.0, 12);
     let kp = pack(kp, 0.0, 500.0, 12);

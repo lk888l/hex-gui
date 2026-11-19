@@ -2,6 +2,8 @@
 //! Run explicitly: cargo run --example el05_smoke -- can0 1 --motion
 //! Sends small targets in all five modes, then stops and restores volatile settings.
 
+#[path = "../src/arm_axis3.rs"]
+mod arm_axis3;
 #[path = "../src/backend.rs"]
 mod backend;
 #[path = "../src/can_lease.rs"]
