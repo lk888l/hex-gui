@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, App, Button, Card, Descriptions, Input, InputNumber, Progress, Segmented, Space, Tag, Typography } from "antd";
 import { api, errMsg, type PullCordStatus } from "../pullCordApi";
 import { useI18n } from "../i18n";
-import type { A1CurrentConfig, A2SpeedConfig, PullCordConfig, PullCordMode, PullCordState } from "../pullCordTypes";
+import type { A1CurrentConfig, A2SpeedConfig, CordEndpoint, PullCordConfig, PullCordMode, PullCordState, TrajectoryCursor } from "../pullCordTypes";
 import { PullCordChart as CordChart, type CordSample } from "./PullCordChart";
 import { PullCordEncoder } from "./PullCordEncoder";
+import { PullCordTrajectory } from "./PullCordTrajectory";
 import { PullChassisPanel } from "./PullChassisPanel";
 import "./PullCordPanel.css";
 
@@ -27,6 +28,10 @@ export function PullCordPanel() {
   const [stopping, setStopping] = useState(false);
   const samples = useRef<CordSample[]>([]);
   const [chartVersion, setChartVersion] = useState(0);
+  const trajectoryCursor = useRef<TrajectoryCursor>();
+  const [trail, setTrail] = useState<CordEndpoint[]>([]);
+  const [endpoint, setEndpoint] = useState<CordEndpoint | null>(null);
+  const [clearingTrail, setClearingTrail] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -48,12 +53,31 @@ export function PullCordPanel() {
   useEffect(() => {
     let alive = true;
     let pending = false;
+    let lastReply = performance.now();
     const tick = async () => {
-      if (pending) return;
+      if (pending) {
+        if (performance.now() - lastReply > 150) setEndpoint(null);
+        return;
+      }
       pending = true;
       try {
-        const next = await api.status();
+        const after = trajectoryCursor.current;
+        const next = await api.status(after);
         if (!alive) return;
+        lastReply = performance.now();
+        // A clear can advance the cursor while this status request is in flight.
+        if (trajectoryCursor.current === after) {
+          const update = next.trajectory;
+          trajectoryCursor.current = update?.cursor;
+          setEndpoint(update?.latest ?? null);
+          if (after?.frame_id !== update?.cursor.frame_id || after?.seq !== update?.cursor.seq) {
+            setTrail(previous => {
+              if (!update || !update.retained_points) return [];
+              if (update.points.length === update.retained_points) return update.points;
+              return previous.concat(update.points).slice(-update.retained_points);
+            });
+          }
+        }
         const state = next.run;
         setStatus(next);
         setRun(state);
@@ -78,13 +102,37 @@ export function PullCordPanel() {
           while (samples.current.length && samples.current[0].t < now - 120_000) samples.current.shift();
           setChartVersion(n => n + 1);
         }
-      } catch (error) { if (alive) setPollError(errMsg(error)); }
+      } catch (error) {
+        if (alive) {
+          setEndpoint(null);
+          setPollError(errMsg(error));
+        }
+      }
       finally { pending = false; }
     };
     void tick();
     const timer = window.setInterval(tick, POLL_MS);
     return () => { alive = false; window.clearInterval(timer); };
   }, []);
+
+  const clearTrail = async () => {
+    const displayed = trajectoryCursor.current;
+    if (!displayed || clearingTrail) return;
+    setClearingTrail(true);
+    try {
+      const cleared = await api.pullCordClearTrajectory(displayed);
+      const current = trajectoryCursor.current;
+      // A newer poll may already include points recorded after the clear.
+      if (cleared && current?.frame_id === cleared.frame_id && current.seq < cleared.seq) {
+        trajectoryCursor.current = cleared;
+        setTrail([]);
+      }
+    } catch (error) {
+      message.error(errMsg(error));
+    } finally {
+      setClearingTrail(false);
+    }
+  };
 
   const action = async (label: string, fn: () => Promise<unknown>) => {
     actions.current += 1;
@@ -258,6 +306,9 @@ export function PullCordPanel() {
         const result = await api.encoderZero();
         if (!result.applied_live) message.warning(tr("零点已写入；尚未检测到新零点反馈，请重启编码器后核对。", "Zero was written; no fresh zero feedback yet. Restart the encoder and verify."));
       })} />
+
+    <PullCordTrajectory points={trail} phase={run?.phase ?? "idle"} onClear={clearTrail} clearing={clearingTrail}
+      latest={controlActive && run?.phase === "running" && !stopping ? endpoint : null} />
 
     <PullChassisPanel status={status?.chassis} unavailable={!status || !!pollError || stopping} cordMode={mode}
       retractTargetSpeedMps={running ? run.config.retract_speed_m_s : draft?.retract_speed_m_s ?? null}

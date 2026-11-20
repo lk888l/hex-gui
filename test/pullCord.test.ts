@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test, { type TestContext } from "node:test";
 import ts from "typescript";
-import type { PullCordConfig, PullCordMode } from "../src/pullCordTypes.ts";
+import type { CordEndpoint, PullCordConfig, PullCordMode, TrajectoryCursor } from "../src/pullCordTypes.ts";
 
 const require = createRequire(import.meta.url);
 const React = require("react");
@@ -34,6 +34,7 @@ async function mount(t: TestContext) {
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: { userAgent: "Windows" } });
   const host = (name: string) => (props: any) => React.createElement(name, props, props.children);
   const antd: any = Object.fromEntries(["Alert", "Button", "Card", "Descriptions", "Input", "InputNumber", "Progress", "Segmented", "Space", "Tag"].map(name => [name, host(name)]));
+  antd.Card = ({ extra, children, ...props }: any) => React.createElement("Card", props, extra, children);
   antd.Descriptions.Item = host("Description");
   antd.Typography = { Text: host("Text"), Paragraph: host("Paragraph") };
   const errors: string[] = [];
@@ -45,7 +46,15 @@ async function mount(t: TestContext) {
   let failStop = false;
   let startWait: Promise<never> | null = null;
   const api = {
-    async status() { return structuredClone(status); },
+    async status(_after?: TrajectoryCursor) { return structuredClone(status); },
+    async pullCordClearTrajectory(displayed: TrajectoryCursor): Promise<TrajectoryCursor | null> {
+      calls.push(["clearTrail", displayed]);
+      const trace = status.trajectory;
+      if (trace?.cursor.frame_id !== displayed.frame_id) return null;
+      const cursor = { frame_id: displayed.frame_id, seq: trace.cursor.seq + 1 };
+      status.trajectory = { ...trace, cursor, points: [], retained_points: 0 };
+      return cursor;
+    },
     async settingsGet() { return structuredClone(saved); },
     async chassisSettingsGet() { return structuredClone(chassisDefaults); },
     async settingsSave(config: PullCordConfig) { calls.push(["save", config]); saved = structuredClone(config); return structuredClone(saved); },
@@ -72,11 +81,15 @@ async function mount(t: TestContext) {
     async pullCordSetConfig(config: PullCordConfig) { calls.push(["apply", config]); status.run.config = structuredClone(config); },
     async pullCordRehome() { calls.push(["rehome"]); },
   };
+  const i18n = { useI18n: () => ({ lang: "en" }) };
+  const Trajectory = component("PullCordTrajectory", {
+    antd, "../i18n": i18n, "echarts-for-react": { __esModule: true, default: host("XYChart") },
+  });
   const Panel = component("PullCordPanel", {
-    antd, "../pullCordApi": { api, errMsg: String },
-    "../i18n": { useI18n: () => ({ lang: "en" }) },
+    antd, "../pullCordApi": { api, errMsg: String }, "../i18n": i18n,
     "./PullCordChart": { PullCordChart: host("Chart") },
     "./PullCordEncoder": { PullCordEncoder: host("Encoder") },
+    "./PullCordTrajectory": { PullCordTrajectory: Trajectory },
     "./PullChassisPanel": { PullChassisPanel: host("Chassis") },
   });
   let renderer: any;
@@ -97,6 +110,7 @@ async function mount(t: TestContext) {
       act(() => modeSelector().onChange(mode));
     },
     get chartProps() { return renderer.root.findByType("Chart").props; },
+    get trajectoryProps() { return renderer.root.findByType(Trajectory).props; },
     get status() { return status; },
     get chassisProps() { return renderer.root.findByType("Chassis").props; },
     failStop(value: boolean) { failStop = value; },
@@ -111,7 +125,7 @@ async function mount(t: TestContext) {
     },
     value(label: string) { return renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label).props.value; },
     max(label: string) { return renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label).props.max; },
-    async poll() { await act(async () => { await tick?.(); }); },
+    async poll() { await act(async () => { void tick?.(); }); },
   };
 }
 
@@ -299,5 +313,111 @@ test("homing chart samples without length feedback do not produce infinite axis 
     assert.ok(axis.min == null || Number.isFinite(axis.min));
     assert.ok(axis.max == null || Number.isFinite(axis.max));
   }
+  act(() => renderer.unmount());
+});
+
+function endpoint(seq: number, segment = 1, frame_id = 1): CordEndpoint {
+  return { frame_id, segment, time_us: seq * 40_000, x_m: seq / 10, y_m: 0.25,
+    length_m: Math.hypot(seq / 10, 0.25), bearing_rad: Math.atan2(0.25, seq / 10),
+    radial_speed_m_s: 0, velocity_m_s: null };
+}
+
+test("trajectory polling retains missed plot points, expires the marker and replaces a rehomed trace", async t => {
+  const h = await mount(t);
+  await h.click("Connect Classic CAN 1 Mbps");
+  await h.click("Start / home");
+  const [a, b, c] = [endpoint(1), endpoint(2), endpoint(3)];
+  h.status.trajectory = { cursor: { frame_id: 1, seq: 2 }, retained_points: 2, points: [a, b], latest: b };
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, [a, b]);
+  assert.deepEqual(h.trajectoryProps.latest, b);
+  h.status.trajectory = { cursor: { frame_id: 1, seq: 3 }, retained_points: 2, points: [c], latest: null };
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, [b, c]);
+  assert.equal(h.trajectoryProps.latest, null);
+  const newFrame = endpoint(4, 1, 2);
+  h.status.trajectory = { cursor: { frame_id: 2, seq: 1 }, retained_points: 1, points: [newFrame], latest: newFrame };
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, [newFrame]);
+  await h.click("Stop and close motor");
+  assert.equal(h.trajectoryProps.latest, null);
+  assert.deepEqual(h.trajectoryProps.points, [newFrame]);
+  assert.deepEqual(h.calls.map(c => c[0]), ["connect", "start", "stop"]);
+});
+
+test("Clear trail keeps live feedback, rejects a delayed poll and can clear a stopped run", async t => {
+  const h = await mount(t);
+  assert.equal(h.button("Clear trail").props.disabled, true);
+  await h.click("Connect Classic CAN 1 Mbps");
+  await h.click("Start / home");
+  const [a, b, c] = [endpoint(1), endpoint(2), endpoint(3)];
+  const cursor = { frame_id: 1, seq: 2 };
+  h.status.trajectory = { cursor, retained_points: 2, points: [a, b], latest: b };
+  await h.poll();
+
+  const readStatus = h.api.status;
+  const oldReply = await readStatus();
+  let release!: (status: typeof oldReply) => void;
+  h.api.status = () => new Promise(resolve => { release = resolve; });
+  await h.poll();
+  await h.click("Clear trail");
+  assert.deepEqual(h.calls.at(-1), ["clearTrail", cursor]);
+  assert.deepEqual(h.trajectoryProps.points, []);
+  assert.deepEqual(h.trajectoryProps.latest, b);
+  await act(async () => { release(oldReply); });
+  assert.deepEqual(h.trajectoryProps.points, []);
+
+  const cleared = h.status.trajectory.cursor;
+  h.api.status = async after => {
+    assert.deepEqual(after, cleared);
+    return readStatus(after);
+  };
+  h.status.trajectory = { cursor: { frame_id: 1, seq: 4 }, retained_points: 1, points: [c], latest: c };
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, [c]);
+  h.api.status = readStatus;
+  await h.click("Stop and close motor");
+  await h.click("Clear trail");
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, []);
+  assert.equal(h.trajectoryProps.latest, null);
+  assert.equal(h.button("Clear trail").props.disabled, true);
+  assert.deepEqual(h.calls.map(call => call[0]), ["connect", "start", "clearTrail", "stop", "clearTrail"]);
+});
+
+test("a failed clear keeps the path and an external clear is observed even without new samples", async t => {
+  const h = await mount(t);
+  const p = endpoint(1);
+  h.status.trajectory = { cursor: { frame_id: 1, seq: 1 }, retained_points: 1, points: [p], latest: null };
+  await h.poll();
+  h.api.pullCordClearTrajectory = async () => { throw new Error("unavailable"); };
+  await h.click("Clear trail");
+  assert.deepEqual(h.trajectoryProps.points, [p]);
+  assert.equal(h.button("Clear trail").props.disabled, false);
+  assert.ok(h.errors.some(e => e.includes("unavailable")));
+  h.status.trajectory = { cursor: { frame_id: 1, seq: 2 }, retained_points: 0, points: [], latest: null };
+  await h.poll();
+  assert.deepEqual(h.trajectoryProps.points, []);
+});
+
+test("the XY view breaks lines at feedback gaps and draws the cord only for a live endpoint", () => {
+  const host = (name: string) => (props: any) => React.createElement(name, props, props.children);
+  const Descriptions = Object.assign(host("dl"), { Item: host("dd") });
+  const View = component("PullCordTrajectory", {
+    antd: { Button: host("button"), Card: host("section"), Descriptions, Space: host("div"), Tag: host("span"), Typography: { Text: host("p") } },
+    "../i18n": { useI18n: () => ({ lang: "en" }) },
+    "echarts-for-react": { __esModule: true, default: host("chart") },
+  });
+  const points = [endpoint(1), endpoint(2), endpoint(3, 2)];
+  const latest = endpoint(4, 2);
+  let renderer: any;
+  act(() => { renderer = create(React.createElement(View, { points, latest, phase: "running" })); });
+  const option = () => renderer.root.findByType("chart").props.option;
+  assert.equal(option().xAxis.max, option().yAxis.max);
+  assert.deepEqual(option().series[0].data, [[0.1, 0.25], [0.2, 0.25], null, [0.3, 0.25], [0.4, 0.25]]);
+  assert.deepEqual(option().series[1].data, [[0, 0], [0.4, 0.25]]);
+  act(() => renderer.update(React.createElement(View, { points, latest: null, phase: "idle" })));
+  assert.deepEqual(option().series[1].data, []);
+  assert.deepEqual(option().series[3].data, []);
   act(() => renderer.unmount());
 });

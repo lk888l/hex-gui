@@ -94,10 +94,13 @@ pub struct EncoderSnapshot {
     pub communication: CommunicationState,
     pub monitor_age: Duration,
     pub position: Option<PositionSample>,
+    /// Monotonic host arrival time of this position frame.
+    pub position_received_at: Option<Instant>,
     pub position_age: Option<Duration>,
     pub status: Option<StatusSample>,
     pub status_age: Option<Duration>,
     pub status_is_fresh: bool,
+    pub status_valid_until: Option<Instant>,
     pub heartbeat: Option<HeartbeatSample>,
     pub heartbeat_age: Option<Duration>,
     pub heartbeat_frames: u64,
@@ -319,10 +322,15 @@ impl SharedState {
             communication,
             monitor_age: now.saturating_duration_since(self.started_at),
             position: self.position.as_ref().map(|sample| sample.value),
+            position_received_at: self.position.as_ref().map(|sample| sample.received_at),
             position_age,
             status: self.status.as_ref().map(|sample| sample.value),
             status_age,
             status_is_fresh,
+            status_valid_until: self
+                .status
+                .as_ref()
+                .and_then(|s| s.received_at.checked_add(config.status_stale_after)),
             heartbeat: self.heartbeat.as_ref().map(|sample| sample.value),
             heartbeat_age,
             heartbeat_frames: self.heartbeat_frames,

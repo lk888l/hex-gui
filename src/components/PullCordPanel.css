@@ -25,3 +25,16 @@
 .pull-chassis .simulator-wide-control { grid-column: 1 / -1; }
 .pull-chassis { width: 100%; min-width: 0; }
 .pull-chassis .ant-alert { margin-bottom: 10px; }
+
+.cord-trajectory-layout { display: grid; grid-template-columns: minmax(0, 420px) minmax(220px, 1fr); align-items: center; gap: 24px; }
+.cord-trajectory-plot { width: 100%; aspect-ratio: 1; min-width: 0; }
+.cord-trajectory-legend { display: flex; flex-wrap: wrap; gap: 16px; }
+.cord-trajectory-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.cord-trajectory-legend i { display: inline-block; }
+.cord-trajectory-legend .outlet { width: 7px; height: 7px; background: #bbc4cc; }
+.cord-trajectory-legend .trail { width: 16px; height: 2px; background: #62c6c4; }
+.cord-trajectory-legend .endpoint { width: 9px; height: 9px; border-radius: 50%; background: #ff895e; }
+@media (max-width: 720px) {
+  .cord-trajectory-layout { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .cord-trajectory-plot { max-width: 420px; justify-self: center; }
+}

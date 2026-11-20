@@ -506,8 +506,8 @@ const STRINGS = {
   toolHopeA3: { en: "HopeA3(Raw Motor)", zh: "HopeA3(原始电机)" },
   toolPullCord: { en: "Cord Follow (HopeA3)", zh: "拉线底盘（HopeA3）" },
   toolPullCordDesc: {
-    en: "MHF5010 cord and direction encoder driving the HexMeow HopeA3 base: live follow, ahead guidance, pace matching and manual bench control.",
-    zh: "MHF5010 拉线与方向编码器驱动 HexMeow HopeA3 底盘：实时跟随、身前引导、步速同步和手动台架。",
+    en: "Map the MHF5010 cord endpoint from motor and encoder feedback. The HopeA3 base supports live follow, ahead guidance, pace matching and manual bench control.",
+    zh: "用 MHF5010 电机和方向编码器反馈绘制拉线末端轨迹。HopeA3 底盘支持实时跟随、身前引导、步速同步和手动台架。",
   },
   chartLength: { en: "Length (m)", zh: "线长 (m)" },
   chartRaw: { en: "Raw counts", zh: "原始值" },

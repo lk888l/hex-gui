@@ -249,6 +249,8 @@ pub fn run() {
             pull_cord_app::pull_cord_connect,
             pull_cord_app::pull_cord_disconnect,
             pull_cord_app::pull_cord_status,
+            pull_cord_app::pull_cord_endpoint,
+            pull_cord_app::pull_cord_clear_trajectory,
             pull_cord_app::pull_cord_start,
             pull_cord_app::pull_cord_stop,
             pull_cord_app::pull_cord_rehome,

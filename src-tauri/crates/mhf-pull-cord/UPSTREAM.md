@@ -13,7 +13,7 @@ the original file hashes. No sibling path or network dependency is required.
 | `defaults.json` | `crates/control-server/defaults/settings.json`, `pull_cord` field | Same JSON object |
 | `src/chassis_model.rs`, `src/chassis_model/pace.rs`, associated `*_tests.rs` and fixtures | `crates/control-core/src/chassis_model*`, follow tests and `test/fixtures` | Ahead switching also applies during pace tracking; fixture include paths adjusted |
 | `chassis-defaults.json` | `crates/control-server/defaults/settings.json`, `chassis` field | Same JSON object; hardware-specific fields are not executed |
-| `../magnetic-encoder` | `crates/magnetic-encoder` | Copied unchanged |
+| `../magnetic-encoder` | `crates/magnetic-encoder` | Exposes position-frame arrival time and the magnet status freshness deadline |
 
 `lib.rs` provides the transport-independent desktop entry points, validates the
 embedded deployed defaults, and exposes the existing confirmed-close operation
@@ -22,6 +22,8 @@ upstream `(value + 180).rem_euclid(360) - 180` expression.
 
 `src-tauri/src/pull_cord_app.rs` owns the desktop CAN lease, cancellation,
 confirmed disconnect, encoder DTO/zero adapter, and atomic local settings file.
+The desktop-only `src/trajectory.rs` computes outlet-relative endpoint feedback
+from homed drum length, measured payout speed and the calibrated direction.
 The desktop uses the existing SocketCAN/gs_usb backend, checks Classic 1 Mbps,
 and does not include the Linux HTTP server or board power switching.
 The desktop also supports A1 using the length profile and host command ceiling

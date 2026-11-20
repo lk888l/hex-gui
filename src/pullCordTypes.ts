@@ -81,6 +81,32 @@ export interface PullCordConfig {
 export type Zone = "near_origin" | "ramp_up" | "alert";
 export type Phase = "idle" | "homing" | "running" | "fault";
 
+/** Planar feedback relative to the outlet. +X points out along the calibrated
+ * centre line, +Y to its left. time_us is monotonic within a motor run. */
+export interface CordEndpoint {
+  frame_id: number;
+  segment: number;
+  time_us: number;
+  x_m: number;
+  y_m: number;
+  length_m: number;
+  bearing_rad: number;
+  radial_speed_m_s: number;
+  velocity_m_s: [number, number] | null;
+}
+
+export interface TrajectoryCursor {
+  frame_id: number;
+  seq: number;
+}
+
+export interface TrajectoryUpdate {
+  cursor: TrajectoryCursor;
+  latest: CordEndpoint | null;
+  retained_points: number;
+  points: CordEndpoint[];
+}
+
 export interface PullCordState {
   running: boolean;
   node_id: number | null;

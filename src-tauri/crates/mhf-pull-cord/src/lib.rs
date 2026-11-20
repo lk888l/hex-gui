@@ -6,6 +6,7 @@ mod lingkong_pull;
 pub mod chassis_model;
 pub mod motion;
 pub mod pull_cord;
+pub mod trajectory;
 // Retain the upstream diagnostic layout, including fields used only by its
 // chassis application, so future upstream changes stay easy to compare.
 #[allow(dead_code)]

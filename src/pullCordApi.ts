@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { PullCordConfig, PullCordMode, PullCordState } from "./pullCordTypes";
+import type { CordEndpoint, PullCordConfig, PullCordMode, PullCordState, TrajectoryCursor, TrajectoryUpdate } from "./pullCordTypes";
 import type { FollowInput, PullChassisConfig, PullChassisStatus } from "./pullChassisTypes";
 export { errMsg } from "./api";
 
@@ -28,6 +28,7 @@ export interface PullCordStatus {
   run: PullCordState | null;
   encoder: PullCordEncoderState | null;
   encoder_center_deg: number;
+  trajectory: TrajectoryUpdate | null;
 }
 
 export const api = {
@@ -40,7 +41,11 @@ export const api = {
   chassisDefaultConfig: () => invoke<PullChassisConfig>("pull_chassis_default_config"),
   chassisSettingsGet: () => invoke<PullChassisConfig>("pull_chassis_settings_get"),
   chassisSettingsSave: (config: PullChassisConfig) => invoke<void>("pull_chassis_settings_save", { config }),
-  status: () => invoke<PullCordStatus>("pull_cord_status"),
+  status: (trajectoryAfter?: TrajectoryCursor) =>
+    invoke<PullCordStatus>("pull_cord_status", { trajectoryAfter }),
+  pullCordEndpoint: () => invoke<CordEndpoint | null>("pull_cord_endpoint"),
+  pullCordClearTrajectory: (cursor: TrajectoryCursor) =>
+    invoke<TrajectoryCursor | null>("pull_cord_clear_trajectory", { cursor }),
   pullMotorConnect: (iface: string, encoderNode: number, encoderCenterDeg: number) =>
     invoke<void>("pull_cord_connect", { iface, encoderNode, encoderCenterDeg }),
   pullMotorDisconnect: () => invoke<void>("pull_cord_disconnect"),

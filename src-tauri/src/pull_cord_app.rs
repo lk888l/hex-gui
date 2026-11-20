@@ -11,6 +11,7 @@ use std::time::Duration;
 use can_transport::{CanBus, CanLinkConfig};
 use hex_motor::canopen::sdo;
 use magnetic_encoder::{EncoderConfig, EncoderMonitor, EncoderSnapshot};
+use mhf_pull_cord::trajectory::{CordEndpoint, CordTrajectory, TrajectoryCursor, TrajectoryUpdate};
 use mhf_pull_cord::{
     LingkongPull, Phase, PullCordConfig, PullCordEncoder, PullCordMode, PullCordState,
 };
@@ -41,6 +42,8 @@ struct Runtime {
     iface: Option<String>,
     encoder: PullCordEncoder,
     control: Option<LingkongPull>,
+    // Keep the completed trace available for inspection after a confirmed stop.
+    trajectory: Option<CordTrajectory>,
     // A failed startup/stop must remain recoverable even without a live task.
     pending_motor: Option<(u8, PullCordMode)>,
     last_fault: Option<String>,
@@ -109,6 +112,7 @@ pub struct PullCordStatus {
     run: Option<PullCordState>,
     encoder: Option<EncoderStatus>,
     encoder_center_deg: f64,
+    trajectory: Option<TrajectoryUpdate>,
     chassis: chassis::ChassisStatus,
 }
 
@@ -195,6 +199,7 @@ pub async fn pull_cord_connect(
     *runtime.encoder.center_deg.lock().unwrap() = encoder_center_deg;
     runtime.bus = Some(bus);
     runtime.iface = Some(iface.trim().to_owned());
+    runtime.trajectory = None;
     Ok(())
 }
 
@@ -206,7 +211,10 @@ pub async fn pull_cord_disconnect(state: State<'_, AppState>) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub async fn pull_cord_status(state: State<'_, AppState>) -> Result<PullCordStatus, String> {
+pub async fn pull_cord_status(
+    state: State<'_, AppState>,
+    trajectory_after: Option<TrajectoryCursor>,
+) -> Result<PullCordStatus, String> {
     let runtime = state.pull_cord.runtime.lock().await;
     let encoder = runtime
         .encoder
@@ -225,8 +233,31 @@ pub async fn pull_cord_status(state: State<'_, AppState>) -> Result<PullCordStat
         run: runtime.control.as_ref().map(LingkongPull::snapshot),
         encoder,
         encoder_center_deg,
+        trajectory: runtime
+            .trajectory
+            .as_ref()
+            .map(|trace| trace.since(trajectory_after)),
         chassis: runtime.chassis.status(),
     })
+}
+
+/// Lightweight read-only endpoint feedback for consumers that do not need the plot.
+#[tauri::command]
+pub async fn pull_cord_endpoint(state: State<'_, AppState>) -> Result<Option<CordEndpoint>, String> {
+    let runtime = state.pull_cord.runtime.lock().await;
+    Ok(runtime.trajectory.as_ref().and_then(CordTrajectory::latest))
+}
+
+#[tauri::command]
+pub async fn pull_cord_clear_trajectory(
+    state: State<'_, AppState>,
+    cursor: TrajectoryCursor,
+) -> Result<Option<TrajectoryCursor>, String> {
+    let runtime = state.pull_cord.runtime.lock().await;
+    Ok(runtime
+        .trajectory
+        .as_ref()
+        .and_then(|trajectory| trajectory.clear_history(cursor)))
 }
 
 #[tauri::command]
@@ -269,6 +300,7 @@ pub async fn pull_cord_start(
     {
         Ok(control) => {
             let snapshot = control.snapshot();
+            runtime.trajectory = Some(control.trajectory());
             runtime.control = Some(control);
             Ok(snapshot)
         }

@@ -16,9 +16,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::runtime_support::{CordMotionReceiver, MotionPublisher, PullCordCommandDiagnostics};
+use crate::trajectory::{CordTrajectory, DirectionSample, TrajectoryRecorder};
 
 const PERIOD: Duration = Duration::from_millis(5);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_millis(150);
+const STATUS_TIMEOUT: Duration = Duration::from_millis(400);
 const SETUP_TIMEOUT: Duration = Duration::from_millis(300);
 const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 const SHUTDOWN_REPLY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -28,7 +30,7 @@ const PEAK_TORQUE_NM: f64 = 0.53;
 const HOMING_STALL_SPEED_M_S: f64 = 0.02;
 const HOMING_STALL_HOLD: Duration = Duration::from_millis(600);
 
-/// Read encoder offset for diagnostics only; it never changes the pull current.
+/// Read the outlet direction for telemetry and endpoint mapping.
 /// Shared slots also follow reconnects, independently of UI/chassis operation.
 #[derive(Clone, Default)]
 pub struct PullCordEncoder {
@@ -37,7 +39,7 @@ pub struct PullCordEncoder {
 }
 
 impl PullCordEncoder {
-    async fn offset_deg(&self) -> Option<f64> {
+    async fn direction(&self) -> Option<DirectionSample> {
         let snapshot = self.monitor.lock().await.as_ref()?.snapshot();
         if !snapshot.angle_is_usable()
             || snapshot
@@ -48,8 +50,14 @@ impl PullCordEncoder {
         }
         let center = *self.center_deg.lock().unwrap();
         let angle = snapshot.position?.angle_degrees;
-        (angle.is_finite() && center.is_finite())
-            .then(|| crate::signed_degrees(angle - center))
+        let at = snapshot.position_received_at?;
+        let valid_until = (at + FEEDBACK_TIMEOUT).min(snapshot.status_valid_until?);
+        (angle.is_finite() && center.is_finite()).then(|| DirectionSample {
+            offset_deg: crate::signed_degrees(angle - center),
+            center_deg: center,
+            at,
+            valid_until,
+        })
     }
 }
 
@@ -375,6 +383,7 @@ pub struct LingkongPull {
     rehome: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
     motion: CordMotionReceiver,
+    trajectory: CordTrajectory,
     diagnostics: Arc<Mutex<PullCordCommandDiagnostics>>,
 }
 
@@ -508,6 +517,8 @@ impl LingkongPull {
         let config = Arc::new(Mutex::new(config));
         let rehome = Arc::new(AtomicBool::new(false));
         let (motion_tx, motion) = MotionPublisher::new();
+        let (recorder, trajectory) =
+            TrajectoryRecorder::new(Instant::now(), stop.clone(), rehome.clone());
         let task = tokio::spawn(run_loop(Loop {
             bus: bus.clone(),
             rx,
@@ -519,6 +530,7 @@ impl LingkongPull {
             rehome: rehome.clone(),
             diagnostics: diagnostics.clone(),
             motion: motion_tx,
+            trajectory: recorder,
             initial_angle,
             initial_feedback,
             running_state,
@@ -534,6 +546,7 @@ impl LingkongPull {
             rehome,
             task: Some(task),
             motion,
+            trajectory,
             diagnostics,
         })
     }
@@ -546,6 +559,10 @@ impl LingkongPull {
     }
     pub fn subscribe_motion(&self) -> CordMotionReceiver {
         self.motion.clone()
+    }
+    /// Per-run endpoint feedback for local consumers, independent of GUI polling.
+    pub fn trajectory(&self) -> CordTrajectory {
+        self.trajectory.clone()
     }
     pub fn set_config(&self, mut config: PullCordConfig) -> Result<(), String> {
         if self.state.lock().unwrap().phase == Phase::Fault
@@ -684,6 +701,7 @@ struct Loop {
     rehome: Arc<AtomicBool>,
     diagnostics: Arc<Mutex<PullCordCommandDiagnostics>>,
     motion: MotionPublisher,
+    trajectory: TrajectoryRecorder,
     initial_angle: i64,
     initial_feedback: (Status2, Instant),
     running_state: u8,
@@ -917,7 +935,10 @@ async fn run_loop(mut ctx: Loop) {
             }
             _ = ticker.tick() => {
                 ticks += 1;
-                if ctx.rehome.swap(false, Ordering::AcqRel) {
+                if ctx.rehome.load(Ordering::Acquire) {
+                    // Readers reject the pending request until the old frame is gone.
+                    ctx.trajectory.reset_frame();
+                    ctx.rehome.store(false, Ordering::Release);
                     phase = Phase::Homing;
                     origin = None;
                     homing_started = Instant::now();
@@ -925,7 +946,7 @@ async fn run_loop(mut ctx: Loop) {
                     ctx.motion.unavailable();
                 }
                 let cfg = *ctx.config.lock().unwrap();
-                let encoder_offset = ctx.encoder.offset_deg().await;
+                let direction = ctx.encoder.direction().await;
                 let now = Instant::now();
                 if now.duration_since(status2_at) > FEEDBACK_TIMEOUT {
                     break Some(format!("MHF {:02X} feedback timed out", mode.opcode()));
@@ -933,7 +954,7 @@ async fn run_loop(mut ctx: Loop) {
                 if now.duration_since(angle_at) > FEEDBACK_TIMEOUT {
                     break Some("MHF angle feedback timed out".into());
                 }
-                if now.duration_since(status1_at) > Duration::from_millis(400) {
+                if now.duration_since(status1_at) > STATUS_TIMEOUT {
                     break Some("MHF status feedback timed out".into());
                 }
                 if status_error != 0 {
@@ -981,7 +1002,7 @@ async fn run_loop(mut ctx: Loop) {
                 s.length_m = length;
                 s.cord_speed_m_s = Some(cord_speed);
                 s.zone = output.zone;
-                s.encoder_offset_deg = encoder_offset;
+                s.encoder_offset_deg = direction.map(|d| d.offset_deg);
                 s.stationary_current_raw = cfg.a1_current
                     .filter(|_| mode == PullCordMode::A1Current && phase == Phase::Running)
                     .map(|a1| f64::from(a1.near_raw));
@@ -1004,6 +1025,8 @@ async fn run_loop(mut ctx: Loop) {
                 s.homing_progress = homing_stall.progress();
                 drop(s);
                 ctx.motion.publish(phase, length, Some(cord_speed), cfg.retract_positive, cfg.retract_speed_m_s);
+                let motor_valid_until = (angle_at.min(status2_at) + FEEDBACK_TIMEOUT).min(status1_at + STATUS_TIMEOUT);
+                ctx.trajectory.record(now, length, angle_at, cord_speed, motor_valid_until, direction);
                 let mut d = ctx.diagnostics.lock().unwrap();
                 if d.run_id == ctx.run_id {
                     d.updated_at = Some(now);
@@ -1020,6 +1043,7 @@ async fn run_loop(mut ctx: Loop) {
         }
     };
     ctx.motion.unavailable();
+    ctx.trajectory.gap();
     let fault = if let Some(error) = fault {
         log::warn!("MHF pull-cord node {}: {error}", ctx.node_id);
         Some(
@@ -1093,7 +1117,7 @@ mod tests {
         corrupt_ram_reply: AtomicBool,
         cancel_on_ram: Mutex<Option<Arc<AtomicBool>>>,
         speed_on_ram: Mutex<Option<i16>>,
-        reply: Mutex<Vec<mpsc::UnboundedSender<CanFrame>>>,
+        reply: Mutex<Vec<(CanFilter, mpsc::UnboundedSender<CanFrame>)>>,
         state: Mutex<u8>,
         lose_running_status: bool,
         fail_close_once: AtomicBool,
@@ -1104,6 +1128,13 @@ mod tests {
         feedback: Mutex<ScriptFeedback>,
     }
     impl ScriptBus {
+        fn emit(&self, frame: CanFrame) {
+            self.reply
+                .lock()
+                .unwrap()
+                .retain(|(filter, tx)| !filter.matches(&frame) || tx.send(frame).is_ok());
+        }
+
         fn new(lose_running_status: bool) -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
@@ -1233,16 +1264,13 @@ mod tests {
                     }
                 }
                 let frame = CanFrame::new_data(can_id(1), &data).unwrap();
-                self.reply
-                    .lock()
-                    .unwrap()
-                    .retain(|tx| tx.send(frame).is_ok());
+                self.emit(frame);
             }
             Ok(())
         }
-        async fn subscribe(&self, _: CanFilter) -> Result<Box<dyn CanRx>, CanIoError> {
+        async fn subscribe(&self, filter: CanFilter) -> Result<Box<dyn CanRx>, CanIoError> {
             let (tx, rx) = mpsc::unbounded_channel();
-            self.reply.lock().unwrap().push(tx);
+            self.reply.lock().unwrap().push((filter, tx));
             Ok(Box::new(ScriptRx(rx)))
         }
         fn capabilities(&self) -> CanCapabilities {
@@ -1408,6 +1436,69 @@ mod tests {
                 assert!(payout.speed_m_s.unwrap() > 0.0);
                 assert_eq!(payout.retract_positive, retract_positive);
                 app.stop().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_uses_homed_motor_and_live_magnetic_feedback_in_both_modes() {
+        for mode in [PullCordMode::A1Current, PullCordMode::A2Speed] {
+            let bus = Arc::new(ScriptBus::new(false));
+            let encoder = PullCordEncoder::default();
+            let setup = magnetic_encoder::EncoderConfig {
+                auto_start_node: false,
+                ..Default::default()
+            };
+            *encoder.monitor.lock().await =
+                Some(EncoderMonitor::start(bus.clone(), setup).await.unwrap());
+            *encoder.center_deg.lock().unwrap() = 90.0;
+            let config = PullCordConfig {
+                control_mode: mode,
+                retract_positive: false,
+                ..crate::default_config()
+            };
+            let mut app = crate::start(bus.clone(), 1, config, Default::default(), encoder)
+                .await
+                .unwrap();
+            let trace = app.trajectory();
+            let mut motion = app.subscribe_motion();
+            wait_for_motion(&mut motion, |m| m.permit == MotionPermit::Ready).await;
+            assert!(trace.latest().is_none());
+
+            *bus.feedback.lock().unwrap() = ScriptFeedback {
+                angle: 36000,
+                speed_dps: 90,
+                ..Default::default()
+            };
+            let position = |counts: u32| {
+                let mut data = [0; 8];
+                data[..4].copy_from_slice(&counts.to_le_bytes());
+                CanFrame::new_data(setup.protocol.position_cob_id(), &data).unwrap()
+            };
+            let magnet =
+                |status: u8| CanFrame::new_data(setup.protocol.status_cob_id(), &[status, 0]).unwrap();
+            bus.emit(position(2048)); // 180° magnetic angle, 90° clockwise from centre.
+            bus.emit(magnet(0));
+            wait_for_motion(&mut motion, |_| trace.latest().is_some_and(|p| p.y_m < -0.1)).await;
+            let p = trace.latest().unwrap();
+            assert!(p.x_m.abs() < 1e-9);
+            assert!((p.radial_speed_m_s - config.metres_per_rev() / 4.0).abs() < 1e-9);
+            bus.emit(magnet(3));
+            wait_for_motion(&mut motion, |_| trace.latest().is_none()).await;
+            bus.emit(position(0));
+            bus.emit(magnet(0));
+            wait_for_motion(&mut motion, |_| trace.latest().is_some_and(|p| p.y_m > 0.1)).await;
+            assert_ne!(trace.latest().unwrap().segment, p.segment);
+            if mode == PullCordMode::A2Speed {
+                app.rehome();
+                assert!(trace.latest().is_none());
+                wait_for_motion(&mut motion, |m| m.permit == MotionPermit::Unavailable).await;
+                assert!(trace.since(None).points.is_empty());
+            }
+            app.stop().await.unwrap();
+            assert!(trace.latest().is_none());
+            if mode == PullCordMode::A1Current {
+                assert!(!trace.since(None).points.is_empty());
             }
         }
     }
