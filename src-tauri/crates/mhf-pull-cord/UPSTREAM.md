@@ -6,8 +6,8 @@ the original file hashes. No sibling path or network dependency is required.
 
 | Local source | Upstream source | Adaptation |
 |---|---|---|
-| `src/pull_cord.rs`, `src/pull_cord/{a1,a2,friction}.rs` | `crates/control-core/src/pull_cord*` | Copied unchanged, including tests and legacy configuration compatibility |
-| `src/lingkong_pull.rs` | `crates/control-runtime/src/lingkong_pull.rs` | Import paths and adapter visibility; publishes the applied retract target with motion; historical default helper is test-only |
+| `src/pull_cord.rs`, `src/pull_cord/{a1,a2,friction}.rs` | `crates/control-core/src/pull_cord*` | Desktop mode selection, live-edit guards and shared payout/stationary/retract selection for A1 and A2 |
+| `src/lingkong_pull.rs` | `crates/control-runtime/src/lingkong_pull.rs` | Selectable A1/A2 transactions, shared homing and feedback supervision, applied retraction speed for chassis braking |
 | `src/motion.rs` | `crates/control-runtime/src/pull_cord/motion.rs` | Includes the applied retract target for the desktop chassis brake |
 | `src/runtime_support.rs` | Diagnostic struct/default in `crates/control-runtime/src/pull_cord.rs` | Extracted without the historical HEX4310 runtime |
 | `defaults.json` | `crates/control-server/defaults/settings.json`, `pull_cord` field | Same JSON object |
@@ -24,7 +24,13 @@ upstream `(value + 180).rem_euclid(360) - 180` expression.
 confirmed disconnect, encoder DTO/zero adapter, and atomic local settings file.
 The desktop uses the existing SocketCAN/gs_usb backend, checks Classic 1 Mbps,
 and does not include the Linux HTTP server or board power switching.
-Motor wire commands, control loop, homing and live torque policy are unchanged.
+The desktop also supports A1 using the length profile and host command ceiling
+from `crates/control-core/src/pull_cord/a1.rs` at main commit
+`5b3e7581da6ab6e792726a8ec7fe2d9ba8cbf6d5`. That revision runs A2 upstream.
+Its A1 profile varies with cord length only. The desktop extends it with the
+A2 measured-speed thresholds and end-zone adjustment, using independent A1 current settings.
+The A1 frame layout, homing speed taper and confirmed shutdown follow its parent
+`ebaa3bf`. The selected mode is fixed from startup through shutdown retries.
 
 `src-tauri/src/pull_chassis.rs` runs the adapted follow state machine at 100 Hz with
 native cord/encoder samples and measured HopeA3 motion. It adapts steering to

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test, { type TestContext } from "node:test";
 import ts from "typescript";
-import type { PullCordConfig } from "../src/pullCordTypes.ts";
+import type { PullCordConfig, PullCordMode } from "../src/pullCordTypes.ts";
 
 const require = createRequire(import.meta.url);
 const React = require("react");
@@ -53,9 +53,9 @@ async function mount(t: TestContext) {
     async pullMotorConnect(iface: string, encoderNode: number, centre: number) {
       calls.push(["connect", iface, encoderNode, centre]); status.connected = true; status.iface = iface;
     },
-    async pullMotorDisconnect() { calls.push(["disconnect"]); status = { ...status, connected: false, pending_node: null, run: null }; },
+    async pullMotorDisconnect() { calls.push(["disconnect"]); status = { ...status, connected: false, pending_node: null, pending_mode: null, run: null }; },
     async pullCordStart(node: number, config: PullCordConfig) {
-      calls.push(["start", node, config]); status.pending_node = node;
+      calls.push(["start", node, config]); status.pending_node = node; status.pending_mode = config.control_mode;
       if (startWait) return startWait;
       status.run = { running: true, phase: "running", node_id: node, config: structuredClone(config), homing_progress: 1 };
       return structuredClone(status.run);
@@ -67,7 +67,7 @@ async function mount(t: TestContext) {
         status.fault = "Close not acknowledged";
         throw new Error(status.fault);
       }
-      status.run = null; status.pending_node = null; status.fault = null;
+      status.run = null; status.pending_node = null; status.pending_mode = null; status.fault = null;
     },
     async pullCordSetConfig(config: PullCordConfig) { calls.push(["apply", config]); status.run.config = structuredClone(config); },
     async pullCordRehome() { calls.push(["rehome"]); },
@@ -88,8 +88,15 @@ async function mount(t: TestContext) {
     }
   });
   const button = (label: string) => renderer.root.findAllByType("Button").find((node: any) => node.props.children === label);
+  const modeSelector = () => renderer.root.findAllByType("Segmented").find((node: any) => node.props["aria-label"] === "Cord control mode").props;
+  const field = (label: string) => renderer.root.findAllByType("InputNumber").find((node: any) => node.props["aria-label"] === label)?.props;
   return {
-    calls, errors, button, api,
+    calls, errors, button, api, field, modeSelector,
+    chooseMode(mode: PullCordMode) {
+      assert.ok(!modeSelector().disabled, "mode selector is locked");
+      act(() => modeSelector().onChange(mode));
+    },
+    get chartProps() { return renderer.root.findByType("Chart").props; },
     get status() { return status; },
     get chassisProps() { return renderer.root.findByType("Chassis").props; },
     failStop(value: boolean) { failStop = value; },
@@ -132,6 +139,84 @@ test("homing and retraction speed inputs allow 1000 rpm for the configured drum"
     }
   }
   assert.deepEqual(h.calls, []);
+});
+
+test("select, tune and start A1, then switch to the retained A2 profile after a confirmed stop", async t => {
+  const h = await mount(t);
+  assert.equal(h.modeSelector().value, "a2_speed");
+  h.edit("Speed-loop Kp", 30);
+  h.chooseMode("a1_current");
+  assert.deepEqual(["Payout current", "Stationary current", "Retract current"].map(label => h.value(label)),
+    [100, 150, 200]);
+  h.edit("Payout current", 80);
+  h.edit("Stationary current", 127);
+  h.edit("Current command ceiling", 500);
+  assert.equal(h.field("Speed-loop Kp"), undefined);
+  assert.equal(h.field("Retract target speed"), undefined);
+  assert.deepEqual(h.calls, []);
+  await h.click("Connect Classic CAN 1 Mbps");
+  assert.equal(h.modeSelector().disabled, false);
+  h.edit("Retract current", 126);
+  assert.equal(h.button("Start / home").props.disabled, true);
+  assert.equal(h.button("Save locally").props.disabled, true);
+  h.edit("Retract current", 190);
+  await h.click("Save locally");
+  const saved = h.calls.at(-1)?.[1] as PullCordConfig;
+  assert.equal(saved.control_mode, "a1_current");
+  assert.equal(saved.a1_current?.payout_current_raw, 80);
+  assert.equal(saved.a1_current?.retract_current_raw, 190);
+  await h.click("Start / home");
+  assert.equal(h.status.run.config.control_mode, "a1_current");
+  assert.equal(h.status.run.config.a1_current.near_raw, 127);
+  assert.equal(h.modeSelector().disabled, true);
+  assert.equal(h.field("Current command ceiling").disabled, true);
+  h.status.run.current_command_raw = -127;
+  h.status.run.measured_current_raw = -89;
+  await h.poll();
+  const sample = h.chartProps.samples.current.at(-1);
+  assert.equal(h.chartProps.mode, "a1_current");
+  assert.equal(sample.current_command_raw, -127);
+  assert.equal(sample.feedback_raw, -89);
+  assert.equal(sample.target_speed_m_s, null);
+  assert.equal(sample.torque_limit_raw, null);
+  h.edit("Payout current", 130);
+  assert.equal(h.button("Apply to run").props.disabled, true);
+  h.edit("Payout current", 73);
+  h.edit("Stationary current", 103);
+  h.edit("Retract current", 215);
+  await h.click("Apply to run");
+  assert.equal(h.status.run.config.a1_current.near_raw, 103);
+  assert.equal(h.status.run.config.a1_current.payout_current_raw, 73);
+  assert.equal(h.status.run.config.a1_current.retract_current_raw, 215);
+  h.failStop(true);
+  await h.click("Stop and close motor");
+  assert.equal(h.modeSelector().disabled, true);
+  h.failStop(false);
+  await h.click("Stop and close motor");
+  h.chooseMode("a2_speed");
+  assert.equal(h.field("Payout current"), undefined);
+  assert.equal(h.field("Retract current"), undefined);
+  assert.equal(h.value("Payout torque limit (raw)"), defaults.a2_speed!.payout_raw);
+  assert.equal(h.value("Retract torque limit (raw)"), defaults.a2_speed!.retract_raw);
+  assert.equal(h.value("Speed-loop Kp"), 30);
+  await h.click("Start / home");
+  assert.equal(h.status.run.config.control_mode, "a2_speed");
+  assert.equal(h.status.run.config.a1_current.near_raw, 103);
+});
+
+test("resetting an A1 draft during a run preserves the mode and setup-only current ceiling", async t => {
+  const h = await mount(t);
+  h.chooseMode("a1_current");
+  h.edit("Current command ceiling", 200);
+  await h.click("Connect Classic CAN 1 Mbps");
+  await h.click("Start / home");
+  h.edit("Stationary current", 171);
+  await h.click("Reset defaults");
+  assert.equal(h.modeSelector().value, "a1_current");
+  assert.equal(h.value("Current command ceiling"), 200);
+  assert.equal(h.value("Stationary current"), defaults.a1_current!.near_raw);
+  await h.click("Apply to run");
+  assert.equal(h.status.run.config.control_mode, "a1_current");
 });
 
 test("save, apply and reset keep the draft, saved template and running settings separate", async t => {
@@ -187,6 +272,7 @@ test("Stop remains available while Start is waiting for motor initialization", a
   let rejectStart!: (error: Error) => void;
   h.deferStart(new Promise<never>((_, reject) => { rejectStart = reject; }));
   await h.click("Start / home");
+  assert.equal(h.modeSelector().disabled, true);
   assert.equal(h.button("Stop and close motor").props.disabled, false);
   await h.click("Stop and close motor");
   assert.equal(h.button("Start / home").props.disabled, true, "pending startup must still keep actions busy");
@@ -201,10 +287,15 @@ test("homing chart samples without length feedback do not produce infinite axis 
   });
   let renderer: any;
   act(() => { renderer = create(React.createElement(Chart, {
-    samples: { current: [{ t: 1, length_m: null, torque_limit_raw: null, global_torque_limit_raw: null, feedback_raw: null, speed_m_s: null, target_speed_m_s: null }] },
-    chartVersion: 1, windowSec: 20,
+    samples: { current: [{ t: 1, control_mode: "a1_current", length_m: null, current_command_raw: -150, torque_limit_raw: null, global_torque_limit_raw: null, feedback_raw: null, speed_m_s: null, target_speed_m_s: null }] },
+    mode: "a1_current", chartVersion: 1, windowSec: 20,
   })); });
-  for (const axis of renderer.root.findByType("chart").props.option.yAxis) {
+  const { legend, series, yAxis } = renderer.root.findByType("chart").props.option;
+  assert.ok(legend.data.includes("chartCurrentCommand"));
+  assert.ok(!legend.data.includes("chartTorqueLimit"));
+  assert.ok(!legend.data.includes("chartTargetSpeed"));
+  assert.deepEqual(series.find((s: any) => s.name === "chartCurrentCommand").data, [[0, -150]]);
+  for (const axis of yAxis) {
     assert.ok(axis.min == null || Number.isFinite(axis.min));
     assert.ok(axis.max == null || Number.isFinite(axis.max));
   }

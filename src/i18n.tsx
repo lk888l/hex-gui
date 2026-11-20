@@ -511,6 +511,7 @@ const STRINGS = {
   },
   chartLength: { en: "Length (m)", zh: "线长 (m)" },
   chartRaw: { en: "Raw counts", zh: "原始值" },
+  chartCurrentCommand: { en: "A1 current command", zh: "A1 电流指令" },
   chartTorqueLimit: { en: "A2 limit target", zh: "A2 帧内限矩目标" },
   chartGlobalTorqueLimit: { en: "Confirmed global limit", zh: "已确认全局限矩" },
   chartCurrentFeedback: { en: "Current feedback", zh: "电流反馈" },

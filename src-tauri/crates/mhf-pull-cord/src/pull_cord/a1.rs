@@ -1,5 +1,5 @@
 //! A1 command counts are independent of the drive's current feedback scale.
-use super::{zone_profile, PullCordConfig, Zone};
+use super::{directional_target_raw, zone_profile, PullCordConfig, Zone};
 use serde::{Deserialize, Serialize};
 
 pub const A1_PROTOCOL_MAX_RAW: u16 = 2048;
@@ -8,8 +8,11 @@ pub const A1_PROTOCOL_MAX_RAW: u16 = 2048;
 #[serde(from = "A1CurrentConfigWire")]
 pub struct A1CurrentConfig {
     pub homing_raw: u16,
-    /// Uniform near-zone pull, independent of speed, motion and encoder angle.
+    /// Stationary current in the near zone.
     pub near_raw: u16,
+    pub payout_current_raw: u16,
+    pub retract_current_raw: u16,
+    /// Stationary current at the alert boundary.
     pub alert_raw: u16,
     /// Host command ceiling, independent of the saturation calibration point.
     pub max_raw: u16,
@@ -23,11 +26,13 @@ pub struct A1CurrentConfig {
 struct A1CurrentConfigWire {
     homing_raw: u16,
     near_raw: u16,
+    payout_current_raw: Option<u16>,
+    retract_current_raw: Option<u16>,
     alert_raw: u16,
     max_raw: u16,
     full_current_raw: u16,
-    // Read retired controls from saved templates/older clients, then discard
-    // them. They cannot override the retained near/alert targets.
+    // Older templates used these keys for a different control law. Keep
+    // accepting them without turning previously ignored values into commands.
     #[serde(default, rename = "near_90_raw")]
     _retired_near_90_raw: Option<serde::de::IgnoredAny>,
     #[serde(default, rename = "payout_raw")]
@@ -43,6 +48,8 @@ impl From<A1CurrentConfigWire> for A1CurrentConfig {
         Self {
             homing_raw: wire.homing_raw,
             near_raw: wire.near_raw,
+            payout_current_raw: wire.payout_current_raw.unwrap_or(wire.near_raw / 2),
+            retract_current_raw: wire.retract_current_raw.unwrap_or(wire.near_raw),
             alert_raw: wire.alert_raw,
             max_raw: wire.max_raw,
             full_current_raw: wire.full_current_raw,
@@ -59,9 +66,12 @@ impl A1CurrentConfig {
                 .round()
                 .clamp(0.0, f64::from(A1_PROTOCOL_MAX_RAW)) as u16
         };
+        let near_raw = raw(config.torque_near_nm);
         Self {
             homing_raw: raw(config.homing_torque_nm),
-            near_raw: raw(config.torque_near_nm),
+            near_raw,
+            payout_current_raw: near_raw / 2,
+            retract_current_raw: near_raw,
             alert_raw: raw(config.torque_alert_nm),
             max_raw: raw(0.53 * f64::from(config.max_torque_permille) / 1000.0),
             full_current_raw: A1_PROTOCOL_MAX_RAW,
@@ -72,6 +82,8 @@ impl A1CurrentConfig {
         for (field, value) in [
             ("homing_raw", self.homing_raw),
             ("near_raw", self.near_raw),
+            ("payout_current_raw", self.payout_current_raw),
+            ("retract_current_raw", self.retract_current_raw),
             ("alert_raw", self.alert_raw),
             ("max_raw", self.max_raw),
             ("full_current_raw", self.full_current_raw),
@@ -83,11 +95,16 @@ impl A1CurrentConfig {
         if self.full_current_raw == 0 {
             return Err("a1_current.full_current_raw must be 1..=2048".into());
         }
+        if self.payout_current_raw > self.near_raw || self.near_raw > self.retract_current_raw {
+            return Err(
+                "a1_current must satisfy payout_current_raw <= near_raw <= retract_current_raw"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
-    /// Normal running uses only cord length, with the same pull at rest,
-    /// during payout and during retraction. No velocity/angle input is needed.
+    /// Stationary current at this length before applying the host ceiling.
     pub fn zone_current(&self, length_m: f64, config: &PullCordConfig) -> (Zone, f64) {
         zone_profile(
             length_m,
@@ -95,6 +112,23 @@ impl A1CurrentConfig {
             f64::from(self.near_raw),
             f64::from(self.alert_raw),
         )
+    }
+
+    pub fn running_current(
+        &self,
+        length_m: f64,
+        cord_speed_m_s: f64,
+        config: &PullCordConfig,
+    ) -> (Zone, f64) {
+        let (zone, stationary) = self.zone_current(length_m, config);
+        let current = directional_target_raw(
+            stationary,
+            cord_speed_m_s,
+            self.payout_current_raw,
+            self.near_raw,
+            self.retract_current_raw,
+        );
+        (zone, current)
     }
 
     /// Quantize once, enforce the raw host/protocol ceilings, then set polarity.
@@ -124,6 +158,8 @@ mod tests {
         A1CurrentConfig {
             homing_raw: 990,
             near_raw: 100,
+            payout_current_raw: 40,
+            retract_current_raw: 200,
             alert_raw: 300,
             max_raw: 1200,
             full_current_raw: 950,
@@ -151,19 +187,51 @@ mod tests {
     }
 
     #[test]
-    fn uniform_pull_preserves_length_zones_without_legacy_torque_conversion() {
+    fn measured_direction_and_length_select_current_before_command_clipping() {
         let mut config = PullCordConfig::default();
         config.zone_near_end_m = 1.0;
         config.zone_alert_start_m = 2.0;
-        let a1 = raw_config();
-        assert_eq!(a1.zone_current(0.0, &config), (Zone::NearOrigin, 100.0));
-        assert_eq!(a1.zone_current(1.5, &config), (Zone::RampUp, 200.0));
-        assert_eq!(a1.zone_current(2.5, &config), (Zone::Alert, 300.0));
         config.torque_near_nm = 5.0;
         config.retract_boost_torque_nm = 5.0;
         config.max_torque_permille = 0;
-        assert_eq!(a1.zone_current(0.0, &config).1, 100.0);
-        assert_eq!(a1.zone_current(f64::NAN, &config).1, 100.0);
+        let a1 = raw_config();
+        for (length, zone, payout, stationary, retract) in [
+            (0.0, Zone::NearOrigin, 40.0, 100.0, 200.0),
+            (1.5, Zone::RampUp, 140.0, 200.0, 300.0),
+            (2.5, Zone::Alert, 240.0, 300.0, 400.0),
+        ] {
+            assert_eq!(a1.running_current(length, 0.0051, &config), (zone, payout));
+            assert_eq!(
+                a1.running_current(length, -0.0051, &config),
+                (zone, retract)
+            );
+            for speed in [
+                -0.005,
+                0.0,
+                0.005,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ] {
+                assert_eq!(
+                    a1.running_current(length, speed, &config),
+                    (zone, stationary)
+                );
+            }
+        }
+        assert_eq!(
+            a1.running_current(f64::NAN, 0.1, &config),
+            (Zone::NearOrigin, 40.0)
+        );
+        let decreasing = A1CurrentConfig {
+            alert_raw: 10,
+            ..a1
+        };
+        let (_, outward) = decreasing.running_current(2.5, 0.1, &config);
+        assert_eq!(decreasing.command(outward, false), 0);
+        let capped = A1CurrentConfig { max_raw: 275, ..a1 };
+        let (_, inward) = capped.running_current(1.5, -0.1, &config);
+        assert_eq!(capped.command(inward, false), -275);
     }
 
     #[test]
@@ -188,10 +256,13 @@ mod tests {
     #[test]
     fn raw_bounds_and_setup_only_values_are_validated() {
         let mut config = PullCordConfig::default();
+        config.control_mode = crate::PullCordMode::A1Current;
         config.a1_current = Some(raw_config());
         let mut next = config;
         next.a1_current.as_mut().unwrap().homing_raw = 1100;
         next.a1_current.as_mut().unwrap().near_raw = 150;
+        next.a1_current.as_mut().unwrap().payout_current_raw = 50;
+        next.a1_current.as_mut().unwrap().retract_current_raw = 175;
         next.a1_current.as_mut().unwrap().alert_raw = 350;
         validate_live_config(&config, &next).unwrap();
         next.a1_current.as_mut().unwrap().full_current_raw = 850;
@@ -202,6 +273,8 @@ mod tests {
         for field in [
             "homing_raw",
             "near_raw",
+            "payout_current_raw",
+            "retract_current_raw",
             "alert_raw",
             "max_raw",
             "full_current_raw",
@@ -216,5 +289,13 @@ mod tests {
         let mut a1 = raw_config();
         a1.full_current_raw = 0;
         assert!(a1.validate().is_err());
+        for (payout, retract, valid) in [(101, 200, false), (40, 99, false), (100, 100, true)] {
+            let a1 = A1CurrentConfig {
+                payout_current_raw: payout,
+                retract_current_raw: retract,
+                ..raw_config()
+            };
+            assert_eq!(a1.validate().is_ok(), valid);
+        }
     }
 }

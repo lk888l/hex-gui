@@ -1,7 +1,9 @@
-// Mirrored from string_chassis main (20133ac).
+// Desktop pull-cord configuration and telemetry, adapted from string_chassis main.
 export interface A1CurrentConfig {
   homing_raw: number;
   near_raw: number;
+  payout_current_raw: number;
+  retract_current_raw: number;
   alert_raw: number;
   max_raw: number;
   full_current_raw: number;
@@ -22,8 +24,10 @@ export interface A2SpeedConfig {
   speed_ramp_dps2: number;
 }
 
-/** MHF uses a2_speed; A1 and Nm fields are retained for legacy templates. */
+export type PullCordMode = "a1_current" | "a2_speed";
+
 export interface PullCordConfig {
+  control_mode: PullCordMode;
   drum_radius_m: number;
   cord_total_length_m: number;
   retract_positive: boolean;

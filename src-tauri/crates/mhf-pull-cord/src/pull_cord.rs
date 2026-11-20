@@ -70,10 +70,18 @@ impl SpringCompensationConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullCordMode {
+    A1Current,
+    #[default]
+    A2Speed,
+}
+
 /// Everything the operator can tune, in cord-facing units.
 ///
-/// MHF A2 uses `a2_speed` raw torque limits, with velocity polarity from
-/// `retract_positive`. A1 and Nm fields remain for legacy model/templates.
+/// MHF uses the selected raw current or speed profile, with command polarity
+/// from `retract_positive`. Nm fields remain for legacy models/templates.
 /// Lengths are metres of cord, speeds metres per second of cord, torques N·m
 /// at the shaft. The GUI shows the equivalent cord force (`τ / R`) alongside
 /// each torque, since that is what a hand actually feels. Motor-producing
@@ -82,6 +90,9 @@ impl SpringCompensationConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullCordConfig {
+    /// Templates saved before mode selection always ran A2.
+    #[serde(default)]
+    pub control_mode: PullCordMode,
     /// Drum radius in metres. Cord length is `turns · 2πR`; layer build-up on
     /// the drum is not modelled, so keep the cord in a single layer or
     /// calibrate this against a tape measure.
@@ -169,6 +180,7 @@ impl Default for PullCordConfig {
         let zone_alert_start_m =
             zone_near_end_m + 37.0 * (cord_total_length_m - zone_near_end_m) / 49.0;
         Self {
+            control_mode: PullCordMode::default(),
             drum_radius_m: 0.0425,
             cord_total_length_m,
             retract_positive: true,
@@ -210,10 +222,16 @@ fn default_retract_boost_torque_nm() -> f64 {
 
 impl PullCordConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(a1) = self.a1_current {
+        if let Some(a1) = self
+            .a1_current
+            .filter(|_| self.control_mode == PullCordMode::A1Current)
+        {
             a1.validate()?;
         }
-        if let Some(a2) = self.a2_speed {
+        if let Some(a2) = self
+            .a2_speed
+            .filter(|_| self.control_mode == PullCordMode::A2Speed)
+        {
             a2.validate()?;
             let maximum_speed_m_s = A2_PROTOCOL_MAX_RPM / 60.0 * self.metres_per_rev();
             for (name, speed) in [
@@ -283,7 +301,8 @@ impl PullCordConfig {
 /// Geometry/direction are setup-time values. A2 limits, reference and PID
 /// tuning can change during a run; the legacy controllers retain their guards.
 pub fn validate_live_config(current: &PullCordConfig, next: &PullCordConfig) -> Result<(), String> {
-    if current.drum_radius_m != next.drum_radius_m
+    if current.control_mode != next.control_mode
+        || current.drum_radius_m != next.drum_radius_m
         || current.retract_positive != next.retract_positive
         || current.a2_speed.is_some() != next.a2_speed.is_some()
     {
@@ -291,7 +310,7 @@ pub fn validate_live_config(current: &PullCordConfig, next: &PullCordConfig) -> 
             "stop the pull-cord before changing drum radius, direction or control mode".into(),
         );
     }
-    if current.a2_speed.is_some() {
+    if current.control_mode == PullCordMode::A2Speed && current.a2_speed.is_some() {
         return Ok(());
     }
     let current_a1 = current
@@ -300,9 +319,7 @@ pub fn validate_live_config(current: &PullCordConfig, next: &PullCordConfig) -> 
     let next_a1 = next
         .a1_current
         .unwrap_or_else(|| A1CurrentConfig::from_legacy(next));
-    if current.drum_radius_m != next.drum_radius_m
-        || current.retract_positive != next.retract_positive
-        || current.max_torque_permille != next.max_torque_permille
+    if current.max_torque_permille != next.max_torque_permille
         || current_a1.max_raw != next_a1.max_raw
         || current_a1.full_current_raw != next_a1.full_current_raw
     {
@@ -448,7 +465,7 @@ pub struct PullCordState {
     pub measured_torque_nm: Option<f64>,
     /// Measured torque expressed as cord force, `τ / R`.
     pub measured_force_n: Option<f64>,
-    /// Legacy MHF5010 A1 current command; zero when A2 speed control is active.
+    /// Signed MHF5010 A1 current command; zero when A2 speed control is active.
     pub current_command_raw: i16,
     /// Effective nonnegative A2 speed-loop torque limit, in driver raw units.
     pub torque_limit_raw: u16,
@@ -460,7 +477,7 @@ pub struct PullCordState {
     /// Diagnostic magnetic encoder offset; never used to adjust pull current.
     /// None if encoder feedback is unusable.
     pub encoder_offset_deg: Option<f64>,
-    /// Uniform near-zone target, before length blending and caps.
+    /// Stationary near-zone A1 target, before length blending and caps.
     pub stationary_current_raw: Option<f64>,
     pub measured_current_raw: Option<i16>,
     pub motor_speed_dps: Option<i16>,
@@ -576,6 +593,26 @@ fn zone_profile(length_m: f64, config: &PullCordConfig, near: f64, alert: f64) -
     } else {
         (Zone::Alert, alert)
     }
+}
+
+/// Apply the same end-zone adjustment in every direction. Measured cord speed
+/// is positive during payout, regardless of the installed motor polarity.
+fn directional_target_raw(
+    stationary_at_length: f64,
+    cord_speed_m_s: f64,
+    payout_raw: u16,
+    near_raw: u16,
+    retract_raw: u16,
+) -> f64 {
+    const MOTION_THRESHOLD_M_S: f64 = 0.005;
+    let base = if cord_speed_m_s.is_finite() && cord_speed_m_s > MOTION_THRESHOLD_M_S {
+        payout_raw
+    } else if cord_speed_m_s.is_finite() && cord_speed_m_s < -MOTION_THRESHOLD_M_S {
+        retract_raw
+    } else {
+        near_raw
+    };
+    stationary_at_length + f64::from(base) - f64::from(near_raw)
 }
 
 /// Give a winding cord extra acceleration authority without making stationary

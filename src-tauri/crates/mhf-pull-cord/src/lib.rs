@@ -1,6 +1,5 @@
-//! MHF5010 A2 control from string_chassis main, pinned to 20133ac.
-//! The transport and desktop lifecycle belong to the caller. Wire transactions,
-//! homing, live limits and feedback supervision remain the upstream controller.
+//! MHF5010 current and speed control based on string_chassis main.
+//! The transport and desktop lifecycle belong to the caller.
 #![forbid(unsafe_code)]
 
 mod lingkong_pull;
@@ -14,7 +13,7 @@ mod runtime_support;
 
 use can_transport::CanBus;
 pub use lingkong_pull::{LingkongPull, PullCordEncoder};
-pub use pull_cord::{Phase, PullCordConfig, PullCordState};
+pub use pull_cord::{Phase, PullCordConfig, PullCordMode, PullCordState};
 
 pub fn chassis_defaults() -> chassis_model::ChassisConfig {
     serde_json::from_str(include_str!("../chassis-defaults.json"))
@@ -60,8 +59,8 @@ pub async fn start(
 }
 
 /// Also available after a failed startup, when no running handle was returned.
-pub async fn close_motor(bus: &dyn CanBus, node_id: u8) -> Result<(), String> {
-    lingkong_pull::disable_motor(bus, node_id).await
+pub async fn close_motor(bus: &dyn CanBus, node_id: u8, mode: PullCordMode) -> Result<(), String> {
+    lingkong_pull::disable_motor(bus, node_id, mode).await
 }
 
 #[cfg(test)]

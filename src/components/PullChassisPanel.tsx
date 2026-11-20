@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, App, Button, Card, Checkbox, Collapse, Descriptions, Input, InputNumber, Select, Space, Table, Tag, Typography } from "antd";
 import { api, errMsg } from "../pullCordApi";
 import type { FollowInput, FollowParameters, PullChassisConfig, PullChassisStatus } from "../pullChassisTypes";
+import type { PullCordMode } from "../pullCordTypes";
 import { useI18n } from "../i18n";
 import { BasePoseViewer } from "./BasePoseViewer";
 import { PaceFollowControls } from "./PaceFollowControls";
@@ -10,9 +11,10 @@ import { BehindSpeedControls } from "./BehindSpeedControls";
 // Retain the reference controller's 200 RPM tuning envelope, with HopeA3 wheels.
 const MAX_FOLLOW_MPS = 200 * Math.PI * 0.154 / 60;
 
-export function PullChassisPanel({ status, liveInput, retractTargetSpeedMps, pullReady, unavailable, refresh }: {
+export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpeedMps, pullReady, unavailable, refresh }: {
   status?: PullChassisStatus;
   liveInput: FollowInput;
+  cordMode: PullCordMode;
   retractTargetSpeedMps: number | null;
   pullReady: boolean;
   unavailable: boolean;
@@ -187,10 +189,10 @@ export function PullChassisPanel({ status, liveInput, retractTargetSpeedMps, pul
       </div>
       <Card size="small" title={tr("回收超速制动", "Retraction speed braking")} style={{ marginBottom: 12 }}>
         <Space wrap align="end">
-          <Checkbox aria-label="Use retract target speed" checked={config.retract_brake_speed_mps == null}
+          <Checkbox aria-label={cordMode === "a1_current" ? "Use cord brake reference" : "Use retract target speed"} checked={config.retract_brake_speed_mps == null}
             disabled={busy || (config.retract_brake_speed_mps == null && retractTargetSpeedMps == null)}
             onChange={event => set("retract_brake_speed_mps", event.target.checked ? null : retractTargetSpeedMps)}>
-            {tr("使用收线目标速度", "Use retract target speed")}
+            {cordMode === "a1_current" ? tr("使用拉线模块的制动参考速度", "Use cord brake reference") : tr("使用收线目标速度", "Use retract target speed")}
           </Checkbox>
           <label className="pull-chassis-field">{tr("回收制动速度 m/s", "Retraction brake threshold m/s")}
             <InputNumber aria-label="Retraction brake threshold m/s" min={0.01} step={0.05}
@@ -200,8 +202,8 @@ export function PullChassisPanel({ status, liveInput, retractTargetSpeedMps, pul
           </label>
         </Space>
         <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-          {tr("仅实时设备跟随生效。实测收线速率达到阈值时，以本 app 当前各项减速度的最大值制动，并停止转向。停稳且收线速率降至阈值的 95% 以下后，重新按当前线长和线速跟随。默认跟随拉线模块已应用的收线目标速度；取消勾选可自定义，修改后应用并保存。",
-            "Applies to live device follow. At the measured retraction threshold, brake using the largest configured deceleration and stop turning. Following resumes from current cord input after the chassis stops and retraction falls below 95% of the threshold. By default, track the cord module's applied retract target; uncheck to customize, then apply and save.")}
+          {tr("仅实时设备跟随生效。实测收线速率达到阈值时，以当前各项减速度的最大值制动，并停止转向。停稳且收线速率降至阈值的 95% 以下后恢复跟随。默认采用拉线模块已应用的速度设置，取消勾选可自定义。",
+            "During live follow, retraction at or above the threshold brakes the chassis at the largest configured deceleration and stops turning. Follow resumes once the chassis stops and retraction falls below 95% of the threshold. The default uses the cord module’s applied speed setting. Uncheck to set a separate threshold.")}
         </Typography.Paragraph>
       </Card>
       {config.mode === "behind" && <Space direction="vertical" style={{ width: "100%" }} size={12}>

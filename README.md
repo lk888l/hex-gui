@@ -16,8 +16,9 @@ explicit model selection for recovery, and prohibited Node-IDs 100/101.
 The independent **Cord Follow (HopeA3)** app is available under **Raw CAN Bus
 Application**. It combines the MHF5010 pull cord and direction encoder with the
 real three-motor HexMeow HopeA3 base, on separate Classic CAN and CAN-FD channels.
-Homing, follow behavior and explicit manual controls follow `string_chassis`
-main at `20133ac`. See [setup and operation](docs/pull-cord.md).
+Before starting the cord motor, select A2 speed control (the default) or A1
+current control. Stop and confirm motor closure to switch modes. The follow and
+manual controls derive from `string_chassis` main at `20133ac`. See [setup and operation](docs/pull-cord.md).
 First-run settings are embedded from `src-tauri/defaults/pull-cord.json` and
 `src-tauri/defaults/pull-chassis.json`; existing local settings take precedence.
 

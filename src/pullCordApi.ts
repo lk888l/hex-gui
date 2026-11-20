@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { PullCordConfig, PullCordState } from "./pullCordTypes";
+import type { PullCordConfig, PullCordMode, PullCordState } from "./pullCordTypes";
 import type { FollowInput, PullChassisConfig, PullChassisStatus } from "./pullChassisTypes";
 export { errMsg } from "./api";
 
@@ -23,6 +23,7 @@ export interface PullCordStatus {
   connected: boolean;
   iface: string | null;
   pending_node: number | null;
+  pending_mode: PullCordMode | null;
   fault: string | null;
   run: PullCordState | null;
   encoder: PullCordEncoderState | null;

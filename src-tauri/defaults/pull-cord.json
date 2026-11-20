@@ -1,10 +1,13 @@
 {
+  "control_mode": "a2_speed",
   "drum_radius_m": 0.026,
   "cord_total_length_m": 3.0,
   "retract_positive": false,
   "a1_current": {
     "homing_raw": 400,
     "near_raw": 150,
+    "payout_current_raw": 100,
+    "retract_current_raw": 200,
     "alert_raw": 600,
     "max_raw": 2048,
     "full_current_raw": 2048

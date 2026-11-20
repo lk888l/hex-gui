@@ -1,4 +1,4 @@
-//! MHF5010 pull-cord controller using Lingkong's classic-CAN A2 speed command.
+//! MHF5010 pull-cord controller using Lingkong's classic-CAN current and speed modes.
 //! Commands and feedback remain in protocol counts. Conflicting manuals and
 //! observed saturation do not establish either scale's physical torque.
 
@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use can_transport::{CanBus, CanFilter, CanFrame, CanIoError, CanRx, FrameKind};
 use crate::pull_cord::{
-    A1CurrentConfig, A2SpeedConfig, Phase, PullCordConfig, PullCordState, A2_PROTOCOL_MAX_RPM,
+    A1CurrentConfig, A2SpeedConfig, Phase, PullCordConfig, PullCordMode, PullCordState, Zone,
+    A2_PROTOCOL_MAX_RPM,
 };
+use can_transport::{CanBus, CanFilter, CanFrame, CanIoError, CanRx, FrameKind};
 use magnetic_encoder::EncoderMonitor;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -69,7 +70,9 @@ pub(crate) fn normalize_mhf_config(config: &mut PullCordConfig) {
         config.a1_current = Some(A1CurrentConfig::from_legacy(config));
     }
     if config.a2_speed.is_none() {
-        A2SpeedConfig::normalize_legacy_speeds(config);
+        if config.control_mode == PullCordMode::A2Speed {
+            A2SpeedConfig::normalize_legacy_speeds(config);
+        }
         config.a2_speed = Some(A2SpeedConfig::from_legacy(config));
     }
     config.spring_compensation.enabled = false;
@@ -121,7 +124,8 @@ pub(crate) fn validate_mhf_config(config: &PullCordConfig) -> Result<(), String>
             "MHF5010 homing speed target must not exceed the {A2_PROTOCOL_MAX_RPM} rpm protocol limit ({maximum_speed_m_s:.3} m/s at this drum radius)"
         ));
     }
-    if config.retract_speed_m_s > maximum_speed_m_s {
+    if config.control_mode == PullCordMode::A2Speed && config.retract_speed_m_s > maximum_speed_m_s
+    {
         return Err(format!(
             "MHF5010 retract speed target must not exceed the {A2_PROTOCOL_MAX_RPM} rpm protocol limit ({maximum_speed_m_s:.3} m/s at this drum radius)"
         ));
@@ -136,6 +140,21 @@ fn can_id(node: u8) -> u16 {
 fn command(code: u8) -> [u8; 8] {
     let mut bytes = [0; 8];
     bytes[0] = code;
+    bytes
+}
+
+impl PullCordMode {
+    fn opcode(self) -> u8 {
+        match self {
+            Self::A1Current => 0xA1,
+            Self::A2Speed => 0xA2,
+        }
+    }
+}
+
+fn a1_command(current_raw: i16) -> [u8; 8] {
+    let mut bytes = command(0xA1);
+    bytes[4..6].copy_from_slice(&current_raw.to_le_bytes());
     bytes
 }
 
@@ -240,8 +259,8 @@ struct Status2 {
     speed_dps: i16,
 }
 
-fn parse_status2(data: &[u8]) -> Option<Status2> {
-    (data.len() == 8 && data[0] == 0xA2).then(|| Status2 {
+fn parse_status2(data: &[u8], mode: PullCordMode) -> Option<Status2> {
+    (data.len() == 8 && data[0] == mode.opcode()).then(|| Status2 {
         temp_c: data[1] as i8,
         iq_raw: i16::from_le_bytes([data[2], data[3]]),
         speed_dps: i16::from_le_bytes([data[4], data[5]]),
@@ -289,7 +308,11 @@ impl MotorReplies {
 
 /// Attempt every shutdown command even if an earlier exchange failed, then
 /// confirm the drive is actually closed. The replies share the request CAN ID.
-pub(crate) async fn disable_motor(bus: &dyn CanBus, node: u8) -> Result<(), String> {
+pub(crate) async fn disable_motor(
+    bus: &dyn CanBus,
+    node: u8,
+    mode: PullCordMode,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     let mut rx = match MotorReplies::subscribe(bus, node).await {
         Ok(rx) => Some(rx),
@@ -298,12 +321,12 @@ pub(crate) async fn disable_motor(bus: &dyn CanBus, node: u8) -> Result<(), Stri
             None
         }
     };
-    for bytes in [
-        global_torque_command(0),
-        a2_command(0, 0),
-        command(0x81),
-        command(0x80),
-    ] {
+    let zero_limit = (mode == PullCordMode::A2Speed).then(|| global_torque_command(0));
+    for bytes in
+        zero_limit
+            .into_iter()
+            .chain([command(mode.opcode()), command(0x81), command(0x80)])
+    {
         let result = if let Some(rx) = rx.as_mut() {
             let timeout = if bytes[0] == 0xC1 {
                 SEND_TIMEOUT
@@ -370,6 +393,7 @@ impl LingkongPull {
         // MHF5010 has neither the old spring nor the HEX4310 factory friction table.
         normalize_mhf_config(&mut config);
         validate_mhf_config(&config)?;
+        let mode = config.control_mode;
         let mut replies = MotorReplies::subscribe(bus.as_ref(), node_id).await?;
         let status = request_reply(bus.as_ref(), &mut replies, node_id, 0x9A).await?;
         let status = parse_status1(&status).ok_or("invalid MHF status response")?;
@@ -405,10 +429,13 @@ impl LingkongPull {
                     status.state, closed[6], closed[7]
                 ));
             }
-            // Clear any retained high limit before enabling. The first loop
-            // tick applies the independently capped homing limit.
-            exchange(bus.as_ref(), &mut replies, node_id, global_torque_command(0), SEND_TIMEOUT).await?;
-            configure_ram(bus.as_ref(), &mut replies, node_id, &config, &stop).await?;
+            if mode == PullCordMode::A2Speed {
+                exchange(bus.as_ref(), &mut replies, node_id, global_torque_command(0), SEND_TIMEOUT).await?;
+                configure_ram(bus.as_ref(), &mut replies, node_id, &config, &stop).await?;
+            }
+            if stop.load(Ordering::Acquire) {
+                return Err("pull-cord start cancelled".into());
+            }
             request_reply(bus.as_ref(), &mut replies, node_id, 0x88).await?;
             let running = request_reply(bus.as_ref(), &mut replies, node_id, 0x9A).await?;
             if Some(running[6]) != expected_running || running[7] != 0 {
@@ -417,32 +444,39 @@ impl LingkongPull {
                     closed[6], running[6], running[7]
                 ));
             }
-            let zero = request_reply(bus.as_ref(), &mut replies, node_id, 0xA2).await?;
-            parse_status2(&zero).ok_or("invalid A2 status response")?;
+            let mut zero = request_reply(bus.as_ref(), &mut replies, node_id, mode.opcode()).await?;
+            let mut feedback_at = Instant::now();
             let angle = request_reply(bus.as_ref(), &mut replies, node_id, 0x92).await?;
             let angle = parse_angle(&angle).ok_or("invalid 0x92 angle response".to_string())?;
+            // An angle read can succeed on a retry after the first speed sample
+            // expired. Get fresh feedback at zero output before starting homing.
+            if feedback_at.elapsed() > FEEDBACK_TIMEOUT {
+                zero = request_reply(bus.as_ref(), &mut replies, node_id, mode.opcode()).await?;
+                feedback_at = Instant::now();
+            }
+            let feedback = parse_status2(&zero, mode).ok_or("invalid MHF motion response")?;
             // A second subscriber processes feedback while the transaction
             // subscriber retains the last reply's turnaround deadline.
             let rx = bus
                 .subscribe(CanFilter::exact_standard(can_id(node_id)))
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok((angle, running[6], rx))
+            Ok((angle, (feedback, feedback_at), running[6], rx))
         }
         .await;
-        let (initial_angle, running_state, rx) = match setup {
+        let (initial_angle, initial_feedback, running_state, rx) = match setup {
             Ok(value) => value,
             Err(error) => {
                 // A lost 0x9A reply does not prove Run was rejected. Close
                 // even when a setup step failed before it could be verified.
-                return Err(match disable_motor(bus.as_ref(), node_id).await {
+                return Err(match disable_motor(bus.as_ref(), node_id, mode).await {
                     Ok(()) => error,
                     Err(stop_error) => format!("{error}; {stop_error}"),
                 });
             }
         };
         if stop.load(Ordering::Acquire) {
-            return Err(match disable_motor(bus.as_ref(), node_id).await {
+            return Err(match disable_motor(bus.as_ref(), node_id, mode).await {
                 Ok(()) => "pull-cord start cancelled".into(),
                 Err(stop_error) => format!("pull-cord start cancelled; {stop_error}"),
             });
@@ -458,7 +492,7 @@ impl LingkongPull {
             state.motor_temp_c = Some(f32::from(status.temp_c));
             state.bus_voltage_v = Some(status.voltage_v);
             state.peak_torque_nm = Some(PEAK_TORQUE_NM as f32);
-            state.global_torque_limit_raw = Some(0);
+            state.global_torque_limit_raw = (mode == PullCordMode::A2Speed).then_some(0);
         }
         let run_id = {
             let mut d = diagnostics.lock().unwrap();
@@ -486,6 +520,7 @@ impl LingkongPull {
             diagnostics: diagnostics.clone(),
             motion: motion_tx,
             initial_angle,
+            initial_feedback,
             running_state,
             run_id,
             encoder,
@@ -538,7 +573,10 @@ impl LingkongPull {
         } else {
             None
         };
-        let stop_error = disable_motor(self.bus.as_ref(), self.node_id).await.err();
+        let mode = self.state.lock().unwrap().config.control_mode;
+        let stop_error = disable_motor(self.bus.as_ref(), self.node_id, mode)
+            .await
+            .err();
         self.diagnostics.lock().unwrap().active = false;
         let result = match (task_error, stop_error) {
             (None, None) => Ok(()),
@@ -647,281 +685,368 @@ struct Loop {
     diagnostics: Arc<Mutex<PullCordCommandDiagnostics>>,
     motion: MotionPublisher,
     initial_angle: i64,
+    initial_feedback: (Status2, Instant),
     running_state: u8,
     run_id: u64,
     encoder: PullCordEncoder,
 }
 
-async fn run_loop(ctx: Loop) {
-    let Loop {
-        bus,
-        mut rx,
-        mut ack_rx,
-        node_id,
-        state,
-        config,
-        stop,
-        rehome,
-        diagnostics,
-        motion,
-        initial_angle,
-        running_state,
-        run_id,
-        encoder,
-    } = ctx;
+impl Loop {
+    async fn exchange(&mut self, bytes: [u8; 8]) -> Result<(), String> {
+        exchange(
+            self.bus.as_ref(),
+            &mut self.ack_rx,
+            self.node_id,
+            bytes,
+            SEND_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn write_global_limit(&mut self, raw: u16) -> Result<(), String> {
+        self.state.lock().unwrap().global_torque_limit_raw = None;
+        self.exchange(global_torque_command(raw)).await?;
+        self.state.lock().unwrap().global_torque_limit_raw = Some(raw);
+        Ok(())
+    }
+}
+
+enum MotorControl {
+    A1Current,
+    A2Speed {
+        ram: [[u8; 8]; 3],
+        last_speed_raw: i32,
+    },
+}
+
+#[derive(Default)]
+struct MotorOutput {
+    zone: Option<Zone>,
+    current_raw: i16,
+    limit_raw: u16,
+    speed_raw: i32,
+}
+
+impl MotorControl {
+    /// No length is available while homing. Both modes send a zero command on
+    /// the tick that establishes the origin. None asks the loop to resample.
+    async fn step(
+        &mut self,
+        ctx: &mut Loop,
+        cfg: &PullCordConfig,
+        length: Option<f64>,
+        cord_speed: f64,
+        just_homed: bool,
+    ) -> Result<Option<MotorOutput>, String> {
+        if ctx.stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match self {
+            Self::A1Current => {
+                let a1 = cfg.a1_current.expect("normalized A1 config");
+                let profile = length.map(|m| a1.running_current(m, cord_speed, cfg));
+                let requested = match profile {
+                    _ if just_homed => 0.0,
+                    Some((_, raw)) => raw,
+                    None => {
+                        // Taper homing current over the last 0.2 m/s of inward speed.
+                        let inward_speed = -cord_speed;
+                        let scale = ((cfg.homing_speed_m_s - inward_speed) / 0.2).clamp(0.0, 1.0);
+                        f64::from(a1.homing_raw) * scale
+                    }
+                };
+                let current_raw = a1.command(requested, cfg.retract_positive);
+                ctx.exchange(a1_command(current_raw)).await?;
+                Ok(Some(MotorOutput {
+                    zone: profile.map(|(zone, _)| zone),
+                    current_raw,
+                    ..Default::default()
+                }))
+            }
+            Self::A2Speed {
+                ram,
+                last_speed_raw,
+            } => {
+                let a2 = cfg.a2_speed.expect("normalized A2 config");
+                let profile = length.map(|m| a2.zone_limit_raw(m, cord_speed, cfg));
+                let (limit_raw, target_m_s) = match profile {
+                    _ if just_homed => (0, 0.0),
+                    Some((_, limit)) => (limit, cfg.retract_speed_m_s),
+                    None => (a2.limit_raw(f64::from(a2.homing_raw)), cfg.homing_speed_m_s),
+                };
+                let signed_speed = if cfg.retract_positive {
+                    target_m_s
+                } else {
+                    -target_m_s
+                };
+                let target_raw = if limit_raw == 0 {
+                    0
+                } else {
+                    speed_raw(signed_speed, cfg)
+                };
+                let next_ram = ram_settings(cfg);
+                if next_ram != *ram {
+                    // Drop the actual RAM limit before zero speed and reacquire
+                    // speed feedback before selecting the next directional limit.
+                    let result = async {
+                        ctx.write_global_limit(0).await?;
+                        ctx.exchange(a2_command(0, 0)).await?;
+                        *last_speed_raw = 0;
+                        configure_ram(
+                            ctx.bus.as_ref(),
+                            &mut ctx.ack_rx,
+                            ctx.node_id,
+                            cfg,
+                            &ctx.stop,
+                        )
+                        .await?;
+                        ctx.exchange(a2_command(0, 0)).await
+                    }
+                    .await;
+                    result.map_err(|e| format!("MHF A2 RAM configuration failed: {e}"))?;
+                    *ram = next_ram;
+                    return Ok(None);
+                }
+                let previous_limit = ctx.state.lock().unwrap().global_torque_limit_raw;
+                if let Some(old) =
+                    previous_limit.filter(|old| *old < limit_raw && target_raw != *last_speed_raw)
+                {
+                    // Install a new speed under the previous lower RAM limit.
+                    ctx.exchange(a2_command(old, target_raw))
+                        .await
+                        .map_err(|e| {
+                            format!("MHF speed update before torque increase failed: {e}")
+                        })?;
+                }
+                if ctx.stop.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                if previous_limit != Some(limit_raw) {
+                    ctx.write_global_limit(limit_raw)
+                        .await
+                        .map_err(|e| format!("MHF global torque limit update failed: {e}"))?;
+                }
+                if ctx.stop.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                ctx.exchange(a2_command(limit_raw, target_raw)).await?;
+                *last_speed_raw = target_raw;
+                Ok(Some(MotorOutput {
+                    zone: profile.map(|(zone, _)| zone),
+                    limit_raw,
+                    speed_raw: target_raw,
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+}
+
+async fn run_loop(mut ctx: Loop) {
+    // Read the acknowledged startup configuration, even if a live edit has
+    // already reached the separate configuration mailbox.
+    let initial_config = ctx.state.lock().unwrap().config;
+    let mode = initial_config.control_mode;
+    let mut motor = match mode {
+        PullCordMode::A1Current => MotorControl::A1Current,
+        PullCordMode::A2Speed => MotorControl::A2Speed {
+            ram: ram_settings(&initial_config),
+            last_speed_raw: 0,
+        },
+    };
     let started = Instant::now();
     let mut ticker = tokio::time::interval(PERIOD);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut ticks = 0u64;
     let mut phase = Phase::Homing;
     let mut origin = None::<i64>;
-    let mut angle = initial_angle;
+    let mut angle = ctx.initial_angle;
     let mut angle_at = Instant::now();
-    let mut last_angle = initial_angle;
+    let mut last_angle = angle;
     let mut angle_sign = None::<f64>;
-    let mut status2 = None::<Status2>;
-    let mut status2_at = Some(Instant::now());
+    let (mut status2, mut status2_at) = ctx.initial_feedback;
     let mut status1_at = Instant::now();
     let mut status_error = 0u8;
     let mut voltage_v = None::<f64>;
     let mut homing_started = Instant::now();
     let mut homing_stall = HomingStall::default();
-    let mut fault = None::<String>;
-    let mut applied_ram = ram_settings(&state.lock().unwrap().config);
-    let mut applied_global_limit = Some(0_u16);
-    let mut last_target_raw = 0_i32;
-
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
+    let fault = loop {
+        if ctx.stop.load(Ordering::Acquire) {
+            break None;
         }
         tokio::select! {
             // Drain queued feedback before a new control tick, particularly
             // after an online RAM update paused the transaction stream.
             biased;
-            frame = rx.recv() => {
+            frame = ctx.rx.recv() => {
                 match frame {
                     Ok(frame) => {
                         let data = frame.data();
-                        if let Some(s) = parse_status2(data) {
+                        if let Some(s) = parse_status2(data, mode) {
                             let received = Instant::now();
                             if phase == Phase::Homing {
-                                let cfg = *config.lock().unwrap();
-                                let speed_m_s = f64::from(s.speed_dps) / 360.0 * cfg.metres_per_rev();
+                                let speed_m_s = f64::from(s.speed_dps) / 360.0 * initial_config.metres_per_rev();
                                 homing_stall.observe(speed_m_s, received);
                             }
-                            status2 = Some(s);
-                            status2_at = Some(received);
+                            status2 = s;
+                            status2_at = received;
                         } else if let Some(s) = parse_status1(data) {
                             status1_at = Instant::now();
                             status_error = s.error;
                             voltage_v = Some(s.voltage_v);
-                            if s.state != running_state {
-                                fault = Some(format!(
-                                    "MHF motor left confirmed running state: 0x{:02X} (expected 0x{running_state:02X})",
-                                    s.state
+                            if s.state != ctx.running_state {
+                                break Some(format!(
+                                    "MHF motor left confirmed running state: 0x{:02X} (expected 0x{:02X})",
+                                    s.state, ctx.running_state
                                 ));
                             }
                         } else if let Some(next) = parse_angle(data) {
                             let delta = next - last_angle;
                             // Direction may first be observed after a stationary home.
-                            if angle_sign.is_none() && delta.abs() >= 50 {
-                                if let Some(s) = status2.filter(|s| s.speed_dps.abs() >= 20) {
-                                    angle_sign = Some(if delta.signum() == i64::from(s.speed_dps.signum()) { 1.0 } else { -1.0 });
-                                }
+                            if angle_sign.is_none() && delta.abs() >= 50 && status2.speed_dps.unsigned_abs() >= 20 {
+                                angle_sign = Some(if delta.signum() == i64::from(status2.speed_dps.signum()) { 1.0 } else { -1.0 });
                             }
                             last_angle = next;
                             angle = next;
                             angle_at = Instant::now();
                         }
                     }
-                    Err(e) => { fault = Some(format!("MHF CAN receive failed: {e}")); }
+                    Err(e) => break Some(format!("MHF CAN receive failed: {e}")),
                 }
             }
             _ = ticker.tick() => {
                 ticks += 1;
-                if rehome.swap(false, Ordering::AcqRel) {
-                    phase = Phase::Homing; origin = None;
-                    homing_started = Instant::now(); homing_stall = HomingStall::default();
-                    motion.unavailable();
+                if ctx.rehome.swap(false, Ordering::AcqRel) {
+                    phase = Phase::Homing;
+                    origin = None;
+                    homing_started = Instant::now();
+                    homing_stall = HomingStall::default();
+                    ctx.motion.unavailable();
                 }
-                let cfg = *config.lock().unwrap();
-                let encoder_offset = encoder.offset_deg().await;
+                let cfg = *ctx.config.lock().unwrap();
+                let encoder_offset = ctx.encoder.offset_deg().await;
                 let now = Instant::now();
-                if status2_at.is_none_or(|at| now.duration_since(at) > FEEDBACK_TIMEOUT) {
-                    fault = Some("MHF A2 feedback timed out".into());
+                if now.duration_since(status2_at) > FEEDBACK_TIMEOUT {
+                    break Some(format!("MHF {:02X} feedback timed out", mode.opcode()));
                 }
-                if now.duration_since(angle_at) > FEEDBACK_TIMEOUT { fault = Some("MHF angle feedback timed out".into()); }
-                if now.duration_since(status1_at) > Duration::from_millis(400) { fault = Some("MHF status feedback timed out".into()); }
-                if status_error != 0 { fault = Some(format!("MHF motor error 0x{status_error:02X}")); }
+                if now.duration_since(angle_at) > FEEDBACK_TIMEOUT {
+                    break Some("MHF angle feedback timed out".into());
+                }
+                if now.duration_since(status1_at) > Duration::from_millis(400) {
+                    break Some("MHF status feedback timed out".into());
+                }
+                if status_error != 0 {
+                    break Some(format!("MHF motor error 0x{status_error:02X}"));
+                }
                 if phase == Phase::Homing && now.duration_since(homing_started).as_secs_f64() > cfg.homing_timeout_s {
-                    fault = Some("homing timed out; release the handle and check that it can settle at the magnetic stop before retrying".into());
+                    break Some("homing timed out; release the handle and check that it can settle at the magnetic stop before retrying".into());
                 }
-                if let Some(error) = fault.take() {
-                    log::warn!("MHF pull-cord node {node_id}: {error}");
-                    let error = match disable_motor(bus.as_ref(), node_id).await {
-                        Ok(()) => error,
-                        Err(stop_error) => format!("{error}; {stop_error}"),
-                    };
-                    motion.unavailable();
-                    let mut s = state.lock().unwrap();
-                    s.phase = Phase::Fault; s.fault = Some(error); s.online = false;
-                    s.commanded_torque_nm = None; s.current_command_raw = 0;
-                    s.encoder_offset_deg = None; s.stationary_current_raw = None;
-                    let mut d = diagnostics.lock().unwrap();
-                    d.phase = Phase::Fault; d.active = false; d.send_ok = false;
-                    break;
-                }
+
                 let shaft_sign = if cfg.retract_positive { 1.0 } else { -1.0 };
-                let speed_dps = status2.map_or(0.0, |s| f64::from(s.speed_dps));
-                let cord_speed = -speed_dps / 360.0 * cfg.metres_per_rev() * shaft_sign;
-                // The connected MHF reports angle and speed with the same sign.
-                // Use that convention until motion confirms the direction.
-                let mut length = origin.map(|origin| {
+                let cord_speed = -f64::from(status2.speed_dps) / 360.0 * cfg.metres_per_rev() * shaft_sign;
+                let just_homed = phase == Phase::Homing && homing_stall.confirmed();
+                if just_homed {
+                    origin = Some(angle);
+                    phase = Phase::Running;
+                }
+                // Use the observed MHF angle convention until motion confirms its sign.
+                let length = origin.map(|origin| {
                     -(angle - origin) as f64 / 36000.0 * angle_sign.unwrap_or(1.0) * cfg.metres_per_rev() * shaft_sign
                 });
-                let a2 = cfg.a2_speed.expect("MHF config normalized before start/apply");
-                let mut limit_raw;
-                let mut target_m_s;
-                if phase == Phase::Homing {
-                    limit_raw = a2.limit_raw(f64::from(a2.homing_raw));
-                    target_m_s = cfg.homing_speed_m_s;
-                    if homing_stall.confirmed() {
-                        origin = Some(angle); phase = Phase::Running;
-                        length = Some(0.0);
-                        limit_raw = 0;
-                        target_m_s = 0.0;
-                    }
-                } else {
-                    limit_raw = a2.zone_limit_raw(length.unwrap_or(0.0), cord_speed, &cfg).1;
-                    target_m_s = cfg.retract_speed_m_s;
-                }
-                // A zero requested ceiling also requests zero speed.
-                if limit_raw == 0 { target_m_s = 0.0; }
-                let target_raw = speed_raw(target_m_s * shaft_sign, &cfg);
-                let next_ram = ram_settings(&cfg);
-                if next_ram != applied_ram {
-                    let result = async {
-                        // A2's limit may be ignored by the firmware: lower the
-                        // actual RAM limit before requesting zero velocity.
-                        applied_global_limit = None;
-                        state.lock().unwrap().global_torque_limit_raw = None;
-                        exchange(bus.as_ref(), &mut ack_rx, node_id, global_torque_command(0), SEND_TIMEOUT).await?;
-                        applied_global_limit = Some(0);
-                        state.lock().unwrap().global_torque_limit_raw = Some(0);
-                        exchange(bus.as_ref(), &mut ack_rx, node_id, a2_command(0, 0), SEND_TIMEOUT).await?;
-                        last_target_raw = 0;
-                        configure_ram(bus.as_ref(), &mut ack_rx, node_id, &cfg, &stop).await?;
-                        // Sample speed again after the configuration pause.
-                        exchange(bus.as_ref(), &mut ack_rx, node_id, a2_command(0, 0), SEND_TIMEOUT).await?;
-                        Ok::<(), String>(())
-                    }.await;
-                    if let Err(error) = result {
-                        fault = Some(format!("MHF A2 RAM configuration failed: {error}"));
-                    } else {
-                        applied_ram = next_ram;
-                    }
-                    // A configuration pause must not count toward stationary home.
-                    if phase == Phase::Homing { homing_stall = HomingStall::default(); }
-                    // Consume the fresh response before selecting a direction
-                    // and limit. Do not reuse the pre-configuration target.
-                    if fault.is_none() { continue; }
-                }
-                if stop.load(Ordering::Acquire) { break; }
-                if fault.is_none() && target_raw != last_target_raw {
-                    if let Some(old_limit) = applied_global_limit.filter(|old| *old < limit_raw) {
-                        // Rehome/live edits can lower speed while raising torque.
-                        // Install the new speed under the old, lower RAM limit
-                        // so the old speed never gets the new higher allowance.
-                        match exchange(bus.as_ref(), &mut ack_rx, node_id, a2_command(old_limit, target_raw), SEND_TIMEOUT).await {
-                            Ok(_) => last_target_raw = target_raw,
-                            Err(error) => fault = Some(format!("MHF speed update before torque increase failed: {error}")),
+                let output = match motor.step(&mut ctx, &cfg, length, cord_speed, just_homed).await {
+                    Ok(Some(output)) => output,
+                    Ok(None) => {
+                        if phase == Phase::Homing {
+                            homing_stall = HomingStall::default();
                         }
+                        continue;
+                    }
+                    Err(error) => break Some(error),
+                };
+                // Offset angle and status polls to avoid three transactions in one tick.
+                if ticks % 4 == 0 {
+                    if let Err(error) = ctx.exchange(command(0x92)).await {
+                        break Some(error);
                     }
                 }
-                if stop.load(Ordering::Acquire) { break; }
-                if fault.is_none() && applied_global_limit != Some(limit_raw) {
-                    // Ordinary direction/length changes only touch the RAM
-                    // torque limit. Keep the speed target and PID continuous.
-                    applied_global_limit = None;
-                    state.lock().unwrap().global_torque_limit_raw = None;
-                    match exchange(bus.as_ref(), &mut ack_rx, node_id, global_torque_command(limit_raw), SEND_TIMEOUT).await {
-                        Ok(_) => {
-                            applied_global_limit = Some(limit_raw);
-                            state.lock().unwrap().global_torque_limit_raw = Some(limit_raw);
-                        }
-                        Err(error) => fault = Some(format!("MHF global torque limit update failed: {error}")),
+                if ticks % 20 == 2 {
+                    if let Err(error) = ctx.exchange(command(0x9A)).await {
+                        break Some(error);
                     }
                 }
-                if stop.load(Ordering::Acquire) { break; }
-                let sent = fault.is_none() && exchange(bus.as_ref(), &mut ack_rx, node_id, a2_command(limit_raw, target_raw), SEND_TIMEOUT).await.is_ok();
-                if sent { last_target_raw = target_raw; }
-                if fault.is_none() && !sent { fault = Some("MHF A2 command/reply failed".into()); }
-                if fault.is_none() && ticks % 4 == 0 && exchange(bus.as_ref(), &mut ack_rx, node_id, command(0x92), SEND_TIMEOUT).await.is_err() {
-                    fault = Some("MHF angle command/reply failed".into());
-                }
-                // Offset status polling from angle polling to avoid three
-                // transactions (and two turnaround waits) in one 5 ms tick.
-                if fault.is_none() && ticks % 20 == 2 && exchange(bus.as_ref(), &mut ack_rx, node_id, command(0x9A), SEND_TIMEOUT).await.is_err() {
-                    fault = Some("MHF status command/reply failed".into());
-                }
-                if let Some(error) = fault.take() {
-                    let error = match disable_motor(bus.as_ref(), node_id).await {
-                        Ok(()) => error,
-                        Err(stop_error) => format!("{error}; {stop_error}"),
-                    };
-                    motion.unavailable();
-                    let mut s = state.lock().unwrap();
-                    s.phase = Phase::Fault; s.fault = Some(error); s.online = false;
-                    s.commanded_torque_nm = None; s.current_command_raw = 0;
-                    s.encoder_offset_deg = None; s.stationary_current_raw = None;
-                    let mut d = diagnostics.lock().unwrap();
-                    d.phase = Phase::Fault; d.active = false; d.send_ok = false;
-                    break;
-                }
-                let mut s = state.lock().unwrap();
-                s.phase = phase; s.config = cfg; s.length_m = length; s.cord_speed_m_s = Some(cord_speed);
-                s.zone = length.map(|x| a2.zone_limit_raw(x, cord_speed, &cfg).0);
+                let mut s = ctx.state.lock().unwrap();
+                s.phase = phase;
+                s.config = cfg;
+                s.length_m = length;
+                s.cord_speed_m_s = Some(cord_speed);
+                s.zone = output.zone;
                 s.encoder_offset_deg = encoder_offset;
-                s.stationary_current_raw = None;
-                s.commanded_torque_nm = None; s.commanded_force_n = None;
-                s.measured_torque_nm = None; s.measured_force_n = None;
-                s.measured_current_raw = status2.map(|x| x.iq_raw);
-                s.current_command_raw = 0;
-                s.torque_limit_raw = limit_raw;
-                s.global_torque_limit_raw = applied_global_limit;
-                s.speed_command_dps = f64::from(target_raw) / 100.0;
-                s.motor_speed_dps = status2.map(|x| x.speed_dps);
+                s.stationary_current_raw = cfg.a1_current
+                    .filter(|_| mode == PullCordMode::A1Current && phase == Phase::Running)
+                    .map(|a1| f64::from(a1.near_raw));
+                s.measured_current_raw = Some(status2.iq_raw);
+                s.current_command_raw = output.current_raw;
+                s.torque_limit_raw = output.limit_raw;
+                s.speed_command_dps = f64::from(output.speed_raw) / 100.0;
+                s.motor_speed_dps = Some(status2.speed_dps);
                 s.position_angle_deg = Some(angle as f64 / 100.0);
                 s.bus_voltage_v = voltage_v;
-                s.a1_feedback_age_ms = status2_at.map(|at| now.duration_since(at).as_millis() as u64);
-                s.a2_feedback_age_ms = s.a1_feedback_age_ms;
+                let feedback_age = now.duration_since(status2_at).as_millis() as u64;
+                s.a1_feedback_age_ms = Some(feedback_age); // Also the legacy motion-feedback age in A2.
+                s.a2_feedback_age_ms = (mode == PullCordMode::A2Speed).then_some(feedback_age);
                 s.angle_feedback_age_ms = Some(now.duration_since(angle_at).as_millis() as u64);
                 s.motor_status_age_ms = Some(now.duration_since(status1_at).as_millis() as u64);
-                s.motor_temp_c = status2.map(|x| f32::from(x.temp_c));
+                s.motor_temp_c = Some(f32::from(status2.temp_c));
                 s.online = true;
-                let vdes = f64::from(target_raw) / 36000.0;
+                let vdes = f64::from(output.speed_raw) / 36000.0;
                 s.vdes_rev_per_s = vdes;
-                // The legacy Nm/permille ceiling is inactive in raw A2 mode.
-                s.limit_permille = 0;
                 s.homing_progress = homing_stall.progress();
                 drop(s);
-                motion.publish(phase, length, Some(cord_speed), cfg.retract_positive, cfg.retract_speed_m_s);
-                let mut d = diagnostics.lock().unwrap();
-                if d.run_id == run_id {
-                    d.updated_at = Some(now); d.generation = d.generation.wrapping_add(1);
+                ctx.motion.publish(phase, length, Some(cord_speed), cfg.retract_positive, cfg.retract_speed_m_s);
+                let mut d = ctx.diagnostics.lock().unwrap();
+                if d.run_id == ctx.run_id {
+                    d.updated_at = Some(now);
+                    d.generation = d.generation.wrapping_add(1);
                     d.run_elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                    d.phase = phase; d.zone = length.map(|x| a2.zone_limit_raw(x, cord_speed, &cfg).0);
-                    d.length_m = length; d.cord_speed_m_s = Some(cord_speed);
-                    d.base_torque_nm = None; d.vdes_rev_per_s = vdes as f32;
-                    d.limit_permille = 0; d.send_ok = sent;
+                    d.phase = phase;
+                    d.zone = output.zone;
+                    d.length_m = length;
+                    d.cord_speed_m_s = Some(cord_speed);
+                    d.vdes_rev_per_s = vdes as f32;
+                    d.send_ok = true;
                 }
             }
         }
+    };
+    ctx.motion.unavailable();
+    let fault = if let Some(error) = fault {
+        log::warn!("MHF pull-cord node {}: {error}", ctx.node_id);
+        Some(
+            match disable_motor(ctx.bus.as_ref(), ctx.node_id, mode).await {
+                Ok(()) => error,
+                Err(stop_error) => format!("{error}; {stop_error}"),
+            },
+        )
+    } else {
+        None
+    };
+    let mut d = ctx.diagnostics.lock().unwrap();
+    d.active = false;
+    if fault.is_some() {
+        d.phase = Phase::Fault;
+        d.send_ok = false;
     }
-    motion.unavailable();
-    diagnostics.lock().unwrap().active = false;
-    let mut s = state.lock().unwrap();
+    drop(d);
+    let mut s = ctx.state.lock().unwrap();
+    if let Some(error) = fault {
+        s.phase = Phase::Fault;
+        s.fault = Some(error);
+        s.online = false;
+        s.encoder_offset_deg = None;
+    }
+    s.current_command_raw = 0;
+    s.stationary_current_raw = None;
     s.torque_limit_raw = 0;
     s.global_torque_limit_raw = None;
     s.speed_command_dps = 0.0;
@@ -1036,11 +1161,6 @@ mod tests {
                     };
                 }
                 0x88 => {
-                    assert_eq!(
-                        *self.global_limit.lock().unwrap(),
-                        0,
-                        "enable must start with zero RAM limit"
-                    );
                     let mut state = self.state.lock().unwrap();
                     *state = if *state == 0x20 { 0x30 } else { 0x00 };
                 }
@@ -1059,17 +1179,20 @@ mod tests {
                     data[6] = *self.state.lock().unwrap();
                     Some(data)
                 }
-                0xA2 => {
-                    assert_eq!(
-                        u16::from_le_bytes(frame.data()[2..4].try_into().unwrap()),
-                        *self.global_limit.lock().unwrap(),
-                        "A2 may only follow a matching RAM limit"
-                    );
-                    self.a2_sent.lock().unwrap().push((
-                        u16::from_le_bytes(frame.data()[2..4].try_into().unwrap()),
-                        i32::from_le_bytes(frame.data()[4..8].try_into().unwrap()),
-                    ));
-                    let mut data = command(0xA2);
+                0xA1 | 0xA2 => {
+                    if code == 0xA2 {
+                        let limit = u16::from_le_bytes(frame.data()[2..4].try_into().unwrap());
+                        assert_eq!(
+                            limit,
+                            *self.global_limit.lock().unwrap(),
+                            "A2 may only follow a matching RAM limit"
+                        );
+                        self.a2_sent.lock().unwrap().push((
+                            limit,
+                            i32::from_le_bytes(frame.data()[4..8].try_into().unwrap()),
+                        ));
+                    }
+                    let mut data = command(code);
                     data[2..4].copy_from_slice(&self.feedback.lock().unwrap().iq_raw.to_le_bytes());
                     data[4..6]
                         .copy_from_slice(&self.feedback.lock().unwrap().speed_dps.to_le_bytes());
@@ -1338,6 +1461,7 @@ mod tests {
             &sent[..11],
             &[0x9A, 0x80, 0x9A, 0xC1, 0xC1, 0xC1, 0xC1, 0x88, 0x9A, 0xA2, 0x92]
         );
+        assert_eq!(bus.frames.lock().unwrap()[3], global_torque_command(0));
         assert_eq!(&sent[sent.len() - 5..], &[0xC1, 0xA2, 0x81, 0x80, 0x9A]);
     }
 
@@ -1384,6 +1508,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // The last angle reply arrived after the original motion sample expired.
+        assert_eq!(bus.frames.lock().unwrap().last(), Some(&a2_command(0, 0)));
         app.stop().await.unwrap();
         let sent = bus.sent.lock().unwrap();
         assert_eq!(sent.iter().filter(|&&code| code == 0x92).count(), 3);
@@ -1394,25 +1520,40 @@ mod tests {
 
     #[tokio::test]
     async fn lost_motion_reply_is_not_retried_and_startup_closes_the_drive() {
-        let bus = Arc::new(ScriptBus::new(false));
-        bus.lost_replies.lock().unwrap().insert(0xA2, 1);
-        let error = LingkongPull::start(
-            bus.clone(),
-            1,
-            default_config(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(error.contains("did not reply to 0xA2"), "{error}");
-        let sent = bus.sent.lock().unwrap();
-        // One initial target and the distinct zero-current shutdown command.
-        assert_eq!(sent.iter().filter(|&&code| code == 0xA2).count(), 2);
-        assert_eq!(sent.iter().filter(|&&code| code == 0x88).count(), 1);
-        assert_eq!(*bus.state.lock().unwrap(), 0x10);
+        for mode in [PullCordMode::A2Speed, PullCordMode::A1Current] {
+            let bus = Arc::new(ScriptBus::new(false));
+            bus.lost_replies.lock().unwrap().insert(mode.opcode(), 1);
+            let cfg = PullCordConfig {
+                control_mode: mode,
+                ..default_config()
+            };
+            let error = LingkongPull::start(
+                bus.clone(),
+                1,
+                cfg,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(
+                error.contains(&format!("did not reply to 0x{:02X}", mode.opcode())),
+                "{error}"
+            );
+            let sent = bus.sent.lock().unwrap();
+            // One initial target and the distinct zero command during shutdown.
+            assert_eq!(
+                sent.iter().filter(|&&code| code == mode.opcode()).count(),
+                2
+            );
+            assert_eq!(sent.iter().filter(|&&code| code == 0x88).count(), 1);
+            assert_eq!(*bus.state.lock().unwrap(), 0x10);
+            if mode == PullCordMode::A1Current {
+                assert!(!sent.contains(&0xC1) && !sent.contains(&0xA2));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1537,13 +1678,23 @@ mod tests {
 
     #[test]
     fn replies_decode_signed_values_and_reject_other_commands() {
-        let s = parse_status2(&[0xA2, 25, 0x9c, 0xff, 0x38, 0xff, 0, 0]).unwrap();
-        assert_eq!((s.iq_raw, s.speed_dps), (-100, -200));
+        for mode in [PullCordMode::A1Current, PullCordMode::A2Speed] {
+            let mut frame = [mode.opcode(), 25, 0x9c, 0xff, 0x38, 0xff, 0, 0];
+            let s = parse_status2(&frame, mode).unwrap();
+            assert_eq!((s.iq_raw, s.speed_dps), (-100, -200));
+            frame[0] = if mode == PullCordMode::A1Current {
+                0xA2
+            } else {
+                0xA1
+            };
+            assert!(parse_status2(&frame, mode).is_none());
+        }
         assert_eq!(
             parse_angle(&[0x92, 0x60, 0x79, 0xff, 0xff, 0xff, 0xff, 0xff]),
             Some(-34464)
         );
-        assert!(parse_status2(&[0xA1; 8]).is_none());
+        assert_eq!(a1_command(-990), [0xA1, 0, 0, 0, 0x22, 0xfc, 0, 0]);
+        assert_eq!(a1_command(2048), [0xA1, 0, 0, 0, 0x00, 0x08, 0, 0]);
     }
 
     #[test]
@@ -1576,6 +1727,159 @@ mod tests {
         })
         .await
         .expect("expected MHF state")
+    }
+
+    #[tokio::test]
+    async fn a1_uses_signed_homing_and_zoned_current_then_allows_an_a2_restart() {
+        for sign in [-1_i16, 1] {
+            let bus = Arc::new(ScriptBus::new(false));
+            let mut cfg = crate::default_config();
+            cfg.control_mode = PullCordMode::A1Current;
+            cfg.retract_positive = sign > 0;
+            cfg.zone_near_end_m = cfg.metres_per_rev();
+            cfg.zone_alert_start_m = 3.0 * cfg.metres_per_rev();
+            cfg.homing_speed_m_s = 0.4;
+            cfg.a1_current = Some(A1CurrentConfig {
+                homing_raw: 400,
+                near_raw: 100,
+                payout_current_raw: 40,
+                retract_current_raw: 200,
+                alert_raw: 500,
+                max_raw: 350,
+                full_current_raw: 200,
+            });
+            // Already retracting faster than the homing soft limit at startup.
+            bus.feedback.lock().unwrap().speed_dps = sign * 1000;
+            bus.feedback.lock().unwrap().iq_raw = -72;
+            let mut app = crate::start(bus.clone(), 1, cfg, Default::default(), Default::default())
+                .await
+                .unwrap();
+            let state = wait_for_state(&app, |s| s.measured_current_raw == Some(-72)).await;
+            assert_eq!(state.current_command_raw, 0);
+            assert_eq!(state.speed_command_dps, 0.0);
+            assert_eq!(state.global_torque_limit_raw, None);
+            assert!(state.a1_feedback_age_ms.is_some() && state.a2_feedback_age_ms.is_none());
+            assert!(bus
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f[0] == 0xA1)
+                .all(|f| *f == a1_command(0)));
+            let mut next = cfg;
+            next.control_mode = PullCordMode::A2Speed;
+            assert!(app.set_config(next).is_err());
+            next = cfg;
+            next.a1_current.as_mut().unwrap().max_raw += 1;
+            assert!(app.set_config(next).is_err());
+
+            bus.feedback.lock().unwrap().speed_dps = 0;
+            wait_for_state(&app, |s| {
+                s.phase == Phase::Homing && s.current_command_raw == sign * 350
+            })
+            .await;
+            let running = wait_for_state(&app, |s| {
+                s.phase == Phase::Running && s.current_command_raw == sign * 100
+            })
+            .await;
+            assert_eq!(running.length_m, Some(0.0));
+            let motion =
+                crate::motion::read_motion(&app.subscribe_motion(), Instant::now()).unwrap();
+            assert_eq!(motion.retract_target_speed_m_s, cfg.retract_speed_m_s);
+            // Change only the measured speed. Every frame must still pull inward
+            // with the selected magnitude on either motor installation.
+            for (speed_dps, expected) in [(-100 * sign, 40), (100 * sign, 200), (0, 100)] {
+                bus.feedback.lock().unwrap().speed_dps = speed_dps;
+                let sample = wait_for_state(&app, |s| {
+                    s.motor_speed_dps == Some(speed_dps) && s.current_command_raw == sign * expected
+                })
+                .await;
+                assert_eq!(sample.length_m, Some(0.0));
+                assert!(bus
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .contains(&a1_command(sign * expected)));
+            }
+            bus.feedback.lock().unwrap().angle = -72_000 * i64::from(sign);
+            wait_for_state(&app, |s| {
+                s.zone == Some(Zone::RampUp) && s.current_command_raw == sign * 300
+            })
+            .await;
+            bus.feedback.lock().unwrap().angle = -144_000 * i64::from(sign);
+            wait_for_state(&app, |s| {
+                s.zone == Some(Zone::Alert) && s.current_command_raw == sign * 350
+            })
+            .await;
+            cfg.a1_current.as_mut().unwrap().alert_raw = 275;
+            app.set_config(cfg).unwrap();
+            wait_for_state(&app, |s| {
+                s.current_command_raw == sign * 275 && s.config == cfg
+            })
+            .await;
+            bus.feedback.lock().unwrap().speed_dps = -100 * sign;
+            wait_for_state(&app, |s| s.current_command_raw == sign * 215).await;
+            cfg.a1_current.as_mut().unwrap().payout_current_raw = 65;
+            app.set_config(cfg).unwrap();
+            wait_for_state(&app, |s| {
+                s.current_command_raw == sign * 240 && s.config == cfg
+            })
+            .await;
+            app.rehome();
+            wait_for_state(&app, |s| {
+                s.phase == Phase::Homing && s.current_command_raw == sign * 350
+            })
+            .await;
+            app.stop().await.unwrap();
+            {
+                let frames = bus.frames.lock().unwrap();
+                assert!(frames.contains(&a1_command(sign * 275)));
+                assert!(frames.contains(&a1_command(sign * 215)));
+                assert!(frames.contains(&a1_command(sign * 240)));
+                assert!(frames.iter().all(|f| !matches!(f[0], 0xA2 | 0xC1)));
+                assert_eq!(
+                    &frames[frames.len() - 4..],
+                    &[a1_command(0), command(0x81), command(0x80), command(0x9A)]
+                );
+            }
+
+            cfg.control_mode = PullCordMode::A2Speed;
+            let mut app = crate::start(bus.clone(), 1, cfg, Default::default(), Default::default())
+                .await
+                .unwrap();
+            wait_for_state(&app, |s| {
+                s.torque_limit_raw == cfg.a2_speed.unwrap().homing_raw
+            })
+            .await;
+            cfg.control_mode = PullCordMode::A1Current;
+            assert!(app.set_config(cfg).is_err());
+            app.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_running_a1_reply_closes_with_zero_current_and_invalidates_motion() {
+        let bus = Arc::new(ScriptBus::new(false));
+        let cfg = PullCordConfig {
+            control_mode: PullCordMode::A1Current,
+            ..crate::default_config()
+        };
+        let mut app = crate::start(bus.clone(), 1, cfg, Default::default(), Default::default())
+            .await
+            .unwrap();
+        wait_for_state(&app, |s| {
+            s.phase == Phase::Running && s.current_command_raw < 0
+        })
+        .await;
+        let motion = app.subscribe_motion();
+        bus.lost_replies.lock().unwrap().insert(0xA1, 1);
+        let failed = wait_for_state(&app, |s| s.phase == Phase::Fault).await;
+        assert!(failed.fault.unwrap().contains("0xA1"));
+        assert_eq!(failed.current_command_raw, 0);
+        assert!(crate::motion::read_motion(&motion, Instant::now()).is_err());
+        assert_eq!(*bus.state.lock().unwrap(), 0x10);
+        assert!(!bus.sent.lock().unwrap().contains(&0xA2));
+        app.stop().await.unwrap();
     }
 
     #[tokio::test]

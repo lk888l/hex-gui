@@ -1,13 +1,16 @@
 import { useMemo, type MutableRefObject } from "react";
 import ReactECharts from "echarts-for-react";
 import { useI18n, type I18nKey } from "../i18n";
+import type { PullCordMode } from "../pullCordTypes";
 
 /** One polled snapshot of the cord, kept in a ref so the chart redraw is
  *  decoupled from the poll loop. */
 export interface CordSample {
   /** ms since page load (`performance.now`). */
   t: number;
+  control_mode: PullCordMode;
   length_m: number | null;
+  current_command_raw: number | null;
   torque_limit_raw: number | null;
   global_torque_limit_raw: number | null;
   feedback_raw: number | null;
@@ -17,13 +20,14 @@ export interface CordSample {
 
 // Three stacked sub-plots sharing a rolling time axis: one ECharts instance,
 // each signal auto-scaled so different units stay readable side by side.
-const SIGNALS: { key: keyof CordSample; nameKey: I18nKey; color: string; axis: number }[] = [
+const SIGNALS: { key: Exclude<keyof CordSample, "t" | "control_mode">; nameKey: I18nKey; color: string; axis: number; mode?: PullCordMode }[] = [
   { key: "length_m", nameKey: "chartLength", color: "#4f8cff", axis: 0 },
-  { key: "torque_limit_raw", nameKey: "chartTorqueLimit", color: "#f39c12", axis: 1 },
-  { key: "global_torque_limit_raw", nameKey: "chartGlobalTorqueLimit", color: "#06a7b2", axis: 1 },
+  { key: "current_command_raw", nameKey: "chartCurrentCommand", color: "#f39c12", axis: 1, mode: "a1_current" },
+  { key: "global_torque_limit_raw", nameKey: "chartGlobalTorqueLimit", color: "#06a7b2", axis: 1, mode: "a2_speed" },
+  { key: "torque_limit_raw", nameKey: "chartTorqueLimit", color: "#f39c12", axis: 1, mode: "a2_speed" },
   { key: "feedback_raw", nameKey: "chartCurrentFeedback", color: "#ab7bff", axis: 1 },
   { key: "speed_m_s", nameKey: "chartSpeed", color: "#2ecc71", axis: 2 },
-  { key: "target_speed_m_s", nameKey: "chartTargetSpeed", color: "#e76f51", axis: 2 },
+  { key: "target_speed_m_s", nameKey: "chartTargetSpeed", color: "#e76f51", axis: 2, mode: "a2_speed" },
 ];
 
 // Minimum y span. A cord held still has millimetre-scale noise; without a floor
@@ -37,10 +41,12 @@ const AXES: { nameKey: I18nKey; minSpan: number }[] = [
 
 export function PullCordChart({
   samples,
+  mode,
   chartVersion,
   windowSec,
 }: {
   samples: MutableRefObject<CordSample[]>;
+  mode: PullCordMode;
   chartVersion: number;
   windowSec: number;
 }) {
@@ -51,13 +57,14 @@ export function PullCordChart({
     const cutoff = lastT - windowSec * 1000;
 
     const ranges: ({ min: number; max: number } | null)[] = AXES.map(() => null);
-    const series = SIGNALS.map(signal => {
+    const signals = SIGNALS.filter(signal => !signal.mode || signal.mode === mode);
+    const series = signals.map(signal => {
       const data: [number, number | null][] = [];
       let low = Infinity;
       let high = -Infinity;
       for (const sample of buffer) {
-        if (sample.t < cutoff) continue;
-        const value = sample[signal.key] as number | null;
+        if (sample.t < cutoff || sample.control_mode !== mode) continue;
+        const value = sample[signal.key];
         if (value == null || !Number.isFinite(value)) {
           data.push([(sample.t - lastT) / 1000, null]);
           continue;
@@ -93,7 +100,7 @@ export function PullCordChart({
     return {
       backgroundColor: "transparent",
       animation: false,
-      legend: { data: [t("chartGlobalTorqueLimit"), t("chartTorqueLimit"), t("chartCurrentFeedback"), t("chartSpeed"), t("chartTargetSpeed")], textStyle: { color: "#888" } },
+      legend: { data: signals.filter(signal => signal.key !== "length_m").map(signal => t(signal.nameKey)), textStyle: { color: "#888" } },
       tooltip: { trigger: "axis" as const },
       axisPointer: { link: [{ xAxisIndex: "all" }] },
       grid: AXES.map((_, index) => ({
@@ -139,7 +146,7 @@ export function PullCordChart({
     // `chartVersion` is the redraw trigger: `samples` is a ref, so React cannot
     // see its mutations.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartVersion, windowSec, t]);
+  }, [chartVersion, windowSec, mode, t]);
 
   return (
     <ReactECharts

@@ -1,12 +1,11 @@
 //! A2 velocity-loop limits are raw driver values, independent of current
 //! feedback scaling and the separately adjustable full-torque reference.
-use super::{zone_profile, A1CurrentConfig, PullCordConfig, Zone};
+use super::{directional_target_raw, zone_profile, A1CurrentConfig, PullCordConfig, Zone};
 use serde::{Deserialize, Serialize};
 
 pub const A2_PROTOCOL_MAX_RAW: u16 = 2000;
 /// CAN V2.36 p. 15: Speed Limit (0x20) allows 600000 × 0.01 °/s = 1000 rpm.
 pub const A2_PROTOCOL_MAX_RPM: f64 = 1000.0;
-const MOTION_THRESHOLD_M_S: f64 = 0.005;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,14 +136,13 @@ impl A2SpeedConfig {
         config: &PullCordConfig,
     ) -> (Zone, u16) {
         let (zone, stationary) = self.stationary_limit_raw(length_m, config);
-        let base = if speed_m_s.is_finite() && speed_m_s > MOTION_THRESHOLD_M_S {
-            self.payout_raw
-        } else if speed_m_s.is_finite() && speed_m_s < -MOTION_THRESHOLD_M_S {
-            self.retract_raw
-        } else {
-            self.near_raw
-        };
-        let requested = stationary + f64::from(base) - f64::from(self.near_raw);
+        let requested = directional_target_raw(
+            stationary,
+            speed_m_s,
+            self.payout_raw,
+            self.near_raw,
+            self.retract_raw,
+        );
         (zone, self.limit_raw(requested))
     }
 
@@ -242,6 +240,8 @@ mod tests {
         config.a1_current = Some(A1CurrentConfig {
             homing_raw: 2048,
             near_raw: 123,
+            payout_current_raw: 35,
+            retract_current_raw: 190,
             alert_raw: 80,
             max_raw: 2048,
             full_current_raw: 950,

@@ -11,7 +11,9 @@ use std::time::Duration;
 use can_transport::{CanBus, CanLinkConfig};
 use hex_motor::canopen::sdo;
 use magnetic_encoder::{EncoderConfig, EncoderMonitor, EncoderSnapshot};
-use mhf_pull_cord::{LingkongPull, Phase, PullCordConfig, PullCordEncoder, PullCordState};
+use mhf_pull_cord::{
+    LingkongPull, Phase, PullCordConfig, PullCordEncoder, PullCordMode, PullCordState,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
@@ -40,7 +42,7 @@ struct Runtime {
     encoder: PullCordEncoder,
     control: Option<LingkongPull>,
     // A failed startup/stop must remain recoverable even without a live task.
-    pending_node: Option<u8>,
+    pending_motor: Option<(u8, PullCordMode)>,
     last_fault: Option<String>,
     chassis: chassis::ChassisConnection,
 }
@@ -50,15 +52,15 @@ impl Runtime {
         let chassis_result = self.chassis.stop().await;
         let result = if let Some(control) = self.control.as_mut() {
             control.stop().await
-        } else if let (Some(bus), Some(node)) = (&self.bus, self.pending_node) {
-            mhf_pull_cord::close_motor(bus.as_ref(), node).await
+        } else if let (Some(bus), Some((node, mode))) = (&self.bus, self.pending_motor) {
+            mhf_pull_cord::close_motor(bus.as_ref(), node, mode).await
         } else {
             Ok(())
         };
         let pull_result = match result {
             Ok(()) => {
                 self.control = None;
-                self.pending_node = None;
+                self.pending_motor = None;
                 self.last_fault = None;
                 Ok(())
             }
@@ -102,6 +104,7 @@ pub struct PullCordStatus {
     connected: bool,
     iface: Option<String>,
     pending_node: Option<u8>,
+    pending_mode: Option<PullCordMode>,
     fault: Option<String>,
     run: Option<PullCordState>,
     encoder: Option<EncoderStatus>,
@@ -216,7 +219,8 @@ pub async fn pull_cord_status(state: State<'_, AppState>) -> Result<PullCordStat
     Ok(PullCordStatus {
         connected: runtime.bus.is_some(),
         iface: runtime.iface.clone(),
-        pending_node: runtime.pending_node,
+        pending_node: runtime.pending_motor.map(|(node, _)| node),
+        pending_mode: runtime.pending_motor.map(|(_, mode)| mode),
         fault: runtime.last_fault.clone(),
         run: runtime.control.as_ref().map(LingkongPull::snapshot),
         encoder,
@@ -241,7 +245,7 @@ pub async fn pull_cord_start(
         return Err("application is closing".into());
     }
     let mut runtime = state.pull_cord.runtime.lock().await;
-    if runtime.pending_node.is_some() {
+    if runtime.pending_motor.is_some() {
         return Err("stop and confirm the previous motor is closed before restarting".into());
     }
     let bus = runtime.bus.clone().ok_or("connect pull-cord CAN first")?;
@@ -252,7 +256,7 @@ pub async fn pull_cord_start(
         state.pull_cord.cancel.store(true, Ordering::Release);
         return Err("pull-cord start cancelled by a stop request".into());
     }
-    runtime.pending_node = Some(node_id);
+    runtime.pending_motor = Some((node_id, config.control_mode));
     runtime.last_fault = None;
     match mhf_pull_cord::start(
         bus,
@@ -409,7 +413,7 @@ pub async fn pull_cord_encoder_zero(
     let _operation = state.extension_op.lock().await;
     let _settings = state.device_settings_operation.acquire().await;
     let runtime = state.pull_cord.runtime.lock().await;
-    if runtime.pending_node.is_some() {
+    if runtime.pending_motor.is_some() {
         return Err("stop the pull-cord motor before changing encoder zero".into());
     }
     let snapshot = runtime
@@ -520,6 +524,7 @@ mod tests {
     struct CloseBus {
         fail: AtomicBool,
         receiver: StdMutex<Option<mpsc::UnboundedSender<CanFrame>>>,
+        sent: StdMutex<Vec<u8>>,
     }
 
     struct CloseRx(mpsc::UnboundedReceiver<CanFrame>);
@@ -541,6 +546,7 @@ mod tests {
                 return Err(CanIoError::Disconnected);
             }
             let mut reply = frame.data().to_vec();
+            self.sent.lock().unwrap().push(reply[0]);
             if reply[0] == 0x9A {
                 reply[6] = 0x10;
             }
@@ -571,21 +577,22 @@ mod tests {
             let mut runtime = app.runtime.lock().await;
             runtime.bus = Some(bus.clone());
             runtime.iface = Some("test".into());
-            runtime.pending_node = Some(1); // also covers failed startup without a handle
+            runtime.pending_motor = Some((1, PullCordMode::A1Current)); // failed startup without a handle
         }
         assert!(app.disconnect().await.is_err());
         assert!(app.cancel.load(Ordering::Acquire));
         {
             let runtime = app.runtime.lock().await;
             assert!(runtime.bus.is_some());
-            assert_eq!(runtime.pending_node, Some(1));
+            assert_eq!(runtime.pending_motor, Some((1, PullCordMode::A1Current)));
             assert!(runtime.last_fault.is_some());
         }
         bus.fail.store(false, Ordering::Release);
         app.disconnect().await.unwrap();
+        assert_eq!(*bus.sent.lock().unwrap(), [0xA1, 0x81, 0x80, 0x9A]);
         let runtime = app.runtime.lock().await;
         assert!(runtime.bus.is_none());
-        assert!(runtime.pending_node.is_none());
+        assert!(runtime.pending_motor.is_none());
         assert!(runtime.last_fault.is_none());
     }
 
@@ -621,10 +628,38 @@ mod tests {
         let mut config = pull_cord_default_config();
         config.a2_speed.as_mut().unwrap().max_raw = 275;
         save_settings(&path, config).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["pull_cord"]
+            .as_object_mut()
+            .unwrap()
+            .remove("control_mode");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(config.control_mode, PullCordMode::A2Speed);
         assert_eq!(load_settings(&path).unwrap(), config);
         let mut bad = config;
         bad.a2_speed.as_mut().unwrap().max_raw = 2001;
         assert!(save_settings(&path, bad).is_err());
+        assert_eq!(load_settings(&path).unwrap(), config);
+        config.control_mode = PullCordMode::A1Current;
+        config.a1_current.as_mut().unwrap().near_raw = 117;
+        save_settings(&path, config).unwrap();
+        assert_eq!(load_settings(&path).unwrap(), config);
+        bad = config;
+        bad.a1_current.as_mut().unwrap().max_raw = 2049;
+        assert!(save_settings(&path, bad).is_err());
+        assert_eq!(load_settings(&path).unwrap(), config);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let old_current = legacy["pull_cord"]["a1_current"].as_object_mut().unwrap();
+        old_current.remove("payout_current_raw");
+        old_current.remove("retract_current_raw");
+        old_current.insert("retract_raw".into(), 1800.into()); // ignored by the previous release
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let a1 = config.a1_current.as_mut().unwrap();
+        a1.payout_current_raw = 58; // half of the saved stationary value of 117
+        a1.retract_current_raw = 117;
         assert_eq!(load_settings(&path).unwrap(), config);
         std::fs::write(&path, b"invalid").unwrap();
         assert!(load_settings(&path).is_err());
