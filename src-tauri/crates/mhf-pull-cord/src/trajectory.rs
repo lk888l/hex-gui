@@ -21,6 +21,8 @@ pub struct CordEndpoint {
     pub segment: u64,
     /// Monotonic microseconds since this pull-cord run started.
     pub time_us: u64,
+    /// Encoder centre used to map this sample into the outlet frame.
+    pub center_deg: f64,
     pub x_m: f64,
     pub y_m: f64,
     pub length_m: f64,
@@ -260,6 +262,7 @@ impl TrajectoryRecorder {
             frame_id: trace.cursor.frame_id,
             segment: self.segment,
             time_us: now.duration_since(self.started).as_micros() as u64,
+            center_deg: direction.center_deg,
             x_m: length_m * cos,
             y_m: length_m * sin,
             length_m,
@@ -421,6 +424,7 @@ mod tests {
         let recentered = reader.since(Some(recovered.cursor));
         assert_ne!(recentered.cursor.frame_id, first.cursor.frame_id);
         assert_eq!(recentered.retained_points, 1);
+        near(recentered.latest.unwrap().center_deg, 30.0);
         assert!(recentered.latest.unwrap().velocity_m_s.is_none());
         recorder.reset_frame();
         assert!(reader.latest().is_none());

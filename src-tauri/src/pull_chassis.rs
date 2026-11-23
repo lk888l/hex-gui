@@ -18,10 +18,20 @@ use crate::hopea3::{Hopea3, Hopea3State};
 mod control;
 use control::ChassisFollowController;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaceMotionMode {
+    #[default]
+    Steering,
+    Omni,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullChassisConfig {
     pub follow: FollowParameters,
     pub mode: WalkMode,
+    #[serde(default)]
+    pub pace_motion: PaceMotionMode,
     pub source: InputSource,
     pub cord_exit_side: CordExitSide,
     pub direction_inverted: bool,
@@ -108,6 +118,7 @@ impl PullChassisConfig {
     fn structural_change(&self, next: &Self) -> bool {
         self.source != next.source
             || self.mode != next.mode
+            || self.pace_motion != next.pace_motion
             || self.cord_exit_side != next.cord_exit_side
             || self.direction_inverted != next.direction_inverted
     }
@@ -136,6 +147,7 @@ pub struct PullChassisRunState {
     pub input: FollowInput,
     pub manual_enabled: bool,
     pub follow_status: FollowStatus,
+    pub lateral_pace_active: bool,
     pub retract_braking: bool,
     pub retract_brake_speed_mps: Option<f64>,
     pub retract_brake_deceleration_mps2: f64,
@@ -232,6 +244,7 @@ pub(super) fn check_distinct_interfaces(
 
 struct LiveInput {
     motion: CordMotionReceiver,
+    trajectory: CordTrajectory,
     epoch: u64,
     encoder: PullCordEncoder,
 }
@@ -294,7 +307,7 @@ impl FollowRun {
     async fn set_config(&self, next: PullChassisConfig) -> Result<(), String> {
         next.validate()?;
         if self.config.lock().unwrap().structural_change(&next) {
-            return Err("请先停机，再更改实时/手动、身后/身前模式、出线侧或转向反相".into());
+            return Err("请先停机，再更改输入来源、跟随模式、步速同步方式、出线侧或方向反相".into());
         }
         if !self.snapshot().running {
             return Err("底盘已停止，请重新启动".into());
@@ -356,7 +369,7 @@ fn apply_limits(driver: &Hopea3, config: &PullChassisConfig) -> Result<(), Strin
         .map_err(|error| error.to_string())?;
     driver.set_max_torque(config.max_torque_permille);
     driver.set_limits(config.max_linear_mps, config.max_angular_rad_s);
-    // Longitudinal acceleration and braking come from the pinned state machine.
+    // The follow controller ramps translation, including diagonal motion and braking.
     driver.set_accel_limits(0.0, 6.0);
     Ok(())
 }
@@ -386,15 +399,17 @@ async fn follow_loop(
             if dt > 0.15 {
                 return Err("底盘跟随循环超过 150 ms 未更新".into());
             }
-            let config = config.lock().unwrap().clone();
-            let (enabled, input, retract_brake_speed_mps) = if let Some(live) = &live {
+            let (enabled, input, retract_target) = if let Some(live) = &live {
                 let (input, retract_target) = live.sample().await?;
-                (true, input, Some(config.retract_brake_limit(retract_target)))
+                (true, input, Some(retract_target))
             } else {
                 let (enabled, input) = *manual.lock().unwrap();
                 (enabled, input, None)
             };
             let driver = driver.lock().await;
+            let config = config.lock().unwrap().clone();
+            let retract_brake_speed_mps =
+                retract_target.map(|speed| config.retract_brake_limit(speed));
             let chassis = driver.state();
             if let Some(fault) = &chassis.fault {
                 return Err(fault.clone());
@@ -410,13 +425,11 @@ async fn follow_loop(
                 continue;
             }
             let command = if enabled {
-                controller.step(
-                    input,
-                    &chassis,
-                    dt,
-                    &config,
-                    retract_brake_speed_mps,
-                )
+                let endpoint = live
+                    .as_ref()
+                    .filter(|_| config.pace_motion == PaceMotionMode::Omni)
+                    .and_then(|live| live.trajectory.latest());
+                controller.step(input, endpoint, &chassis, dt, &config, retract_brake_speed_mps)
             } else {
                 controller.reset();
                 (0.0, 0.0, 0.0)
@@ -437,6 +450,7 @@ async fn follow_loop(
             state.input = input;
             state.manual_enabled = enabled && config.source == InputSource::Manual;
             state.follow_status = controller.status();
+            state.lateral_pace_active = controller.lateral_pace_active();
             state.retract_braking = controller.retract_braking;
             state.retract_brake_speed_mps = retract_brake_speed_mps;
             state.retract_brake_deceleration_mps2 = config.max_deceleration_mps2();
@@ -450,6 +464,7 @@ async fn follow_loop(
     let stopped = driver.stop().await;
     let mut state = state.lock().unwrap();
     state.running = false;
+    state.lateral_pace_active = false;
     state.manual_enabled = false;
     state.chassis = driver.state();
     state.stop_confirmed = stopped.is_ok();
@@ -594,6 +609,7 @@ pub async fn pull_chassis_start(
         }
         let live = LiveInput {
             motion,
+            trajectory: cord.trajectory(),
             epoch,
             encoder: runtime.encoder.clone(),
         };
@@ -642,6 +658,7 @@ pub async fn pull_chassis_start(
                 input: FollowInput::default(),
                 manual_enabled: false,
                 follow_status: FollowStatus::default(),
+                lateral_pace_active: false,
                 chassis: Hopea3State::default(),
             });
             return Err(error);
@@ -675,6 +692,7 @@ pub async fn pull_chassis_start(
         input,
         manual_enabled: false,
         follow_status: FollowStatus::default(),
+        lateral_pace_active: false,
         retract_braking: false,
         retract_brake_speed_mps: None,
         retract_brake_deceleration_mps2: config.max_deceleration_mps2(),
@@ -848,6 +866,21 @@ mod tests {
         assert!(check_distinct_interfaces(Some("gs_usb"), "gs_usb0").is_err());
         assert!(check_distinct_interfaces(Some("gsusb1"), "GS_USB:1").is_err());
         assert!(check_distinct_interfaces(Some("gs_usb0"), "gs_usb1").is_ok());
+    }
+
+    #[test]
+    fn legacy_settings_keep_steering_and_omni_is_a_persisted_startup_choice() {
+        let defaults = PullChassisConfig::default();
+        let mut legacy = serde_json::to_value(&defaults).unwrap();
+        legacy.as_object_mut().unwrap().remove("pace_motion");
+        let mut config: PullChassisConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.pace_motion, PaceMotionMode::Steering);
+        assert!(!config.structural_change(&defaults));
+        config.pace_motion = PaceMotionMode::Omni;
+        assert!(defaults.structural_change(&config));
+        let saved = serde_json::to_vec(&config).unwrap();
+        let restored: PullChassisConfig = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.pace_motion, PaceMotionMode::Omni);
     }
 
     #[test]

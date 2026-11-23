@@ -87,6 +87,7 @@ export interface CordEndpoint {
   frame_id: number;
   segment: number;
   time_us: number;
+  center_deg: number;
   x_m: number;
   y_m: number;
   length_m: number;

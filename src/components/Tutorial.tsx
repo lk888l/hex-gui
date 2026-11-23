@@ -389,8 +389,8 @@ export const TUTORIALS: Record<string, Slide[]> = {
     {
       title: { en: "3 · Start chassis follow", zh: "3 · 启动底盘跟随" },
       body: {
-        en: "Connect the HexMeow HopeA3 motors (21/22/23) on a separate CAN-FD interface, can0 or gs_usb1. After cord homing, select Live device and Start physical follow. Cord direction turns the body while it moves forward or backward. Behind/Ahead behavior, pace matching and retraction restart follow the reference project.",
-        zh: "将 HexMeow HopeA3 三电机（21/22/23）接入另一 CAN-FD 接口 can0 或 gs_usb1。拉线归零后，选择“实时设备”并“启动真机跟随”。方向偏角使车身转向，底盘前后行进；身后/身前、步速同步和收线重启行为对齐参考工程。",
+        en: "Connect the HopeA3 motors (21/22/23) on a separate CAN-FD interface, can0 or gs_usb1. After homing, select Live device and Behind follow. Choose longitudinal pace matching for cord steering or omnidirectional pace matching for sideways and diagonal travel. Start physical follow and use the usual launch gesture.",
+        zh: "将 HopeA3 三台电机（21/22/23）接入独立 CAN-FD 接口 can0 或 gs_usb1。拉线归零后，选择“实时设备”和“身后跟随”。纵向步速同步按拉线偏角转向，全向步速同步支持横移和斜行。点击“启动真机跟随”，按原动作发车。",
       },
     },
     {

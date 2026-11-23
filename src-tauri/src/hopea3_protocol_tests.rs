@@ -512,8 +512,8 @@ async fn follow_deadline_stops_all_wheels_and_rejects_late_commands() {
     let mut app = h.start().await.unwrap();
     wait_for(|| app.state().motors.len() == 3 && app.state().fault.is_none()).await;
     app.set_accel_limits(0.0, 0.0);
-    app.set_follow_cmd(0.4, 0.0, -0.2);
-    wait_for(|| app.state().cmd_vx > 0.0).await;
+    app.set_follow_cmd(0.4, -0.25, -0.2);
+    wait_for(|| app.state().cmd_vx > 0.0 && app.state().meas_vy < -0.2).await;
     wait_for(|| {
         app.state()
             .fault
@@ -522,10 +522,11 @@ async fn follow_deadline_stops_all_wheels_and_rejects_late_commands() {
     })
     .await;
     assert_eq!(h.bus.last_shared().data(), &[0; 24]);
-    app.set_follow_cmd(0.5, 0.0, 0.2);
+    app.set_follow_cmd(0.5, 0.25, 0.2);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(h.bus.last_shared().data(), &[0; 24]);
     assert_eq!(app.state().cmd_vx, 0.0);
+    assert_eq!(app.state().cmd_vy, 0.0);
     app.stop().await.unwrap();
     assert_disabled(&h.bus);
 }

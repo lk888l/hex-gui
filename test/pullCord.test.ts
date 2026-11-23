@@ -317,7 +317,7 @@ test("homing chart samples without length feedback do not produce infinite axis 
 });
 
 function endpoint(seq: number, segment = 1, frame_id = 1): CordEndpoint {
-  return { frame_id, segment, time_us: seq * 40_000, x_m: seq / 10, y_m: 0.25,
+  return { frame_id, segment, time_us: seq * 40_000, center_deg: 275, x_m: seq / 10, y_m: 0.25,
     length_m: Math.hypot(seq / 10, 0.25), bearing_rad: Math.atan2(0.25, seq / 10),
     radial_speed_m_s: 0, velocity_m_s: null };
 }

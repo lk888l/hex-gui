@@ -100,6 +100,9 @@ export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpe
     : follow?.travel_mode === "ahead" ? tr("身前引导", "Ahead guidance")
     : follow?.waiting_for_pull_back ? tr("等待收线重启", "Waiting for retraction")
     : follow?.retract_resume ? tr("收线重启", "Retraction restart")
+    : run?.lateral_pace_active ? tr("全向步速同步", "Omnidirectional pace matching")
+    : run?.config.pace_motion === "omni" && follow?.pace_active && follow.pace_tracking && !follow.pace_rotation_guard
+      ? tr("纵向同步 · 等待末端速度", "Matching forward pace · waiting for endpoint velocity")
     : follow?.pace_active ? tr("步速同步", "Pace matching")
     : tr("跟随运行", "Following");
 
@@ -117,8 +120,8 @@ export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpe
       <Button danger type="primary" loading={stopping} onClick={() => void stop()}>{tr("立即停机 / Esc", "STOP / Esc")}</Button>
     </Space>
     <Typography.Paragraph type="secondary" style={{ marginTop: 8 }}>
-      {tr("底盘与拉线使用不同 CAN 接口。先启动拉线并完成归零，再启动真机跟随；连接底盘不会使能电机。方向偏角控制车身转向，底盘前后行进，不横移。",
-        "Use separate CAN interfaces for chassis and cord. Home the cord before starting physical follow. Connecting does not arm motors. Cord direction turns the body while it travels forward or backward without strafing.")}
+      {tr("底盘与拉线使用不同 CAN 接口。先启动拉线并完成归零，再启动真机跟随。",
+        "Use separate CAN interfaces for chassis and cord. Home the cord before starting physical follow.")}
     </Typography.Paragraph>
     {unavailable && <Alert type="error" showIcon message={tr("运行状态未知，可按立即停机重试", "Run status unknown; STOP remains available")} />}
     {run?.fault && <Alert type="error" showIcon message={run.fault}
@@ -134,12 +137,18 @@ export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpe
           onChange={value => set("mode", value)} options={[
             { value: "behind", label: tr("身后跟随", "Behind follow") }, { value: "ahead", label: tr("身前引导", "Ahead guidance") },
           ]} />
+        {config.source === "live" && config.mode === "behind" &&
+          <Select aria-label="Pace motion mode" value={config.pace_motion ?? "steering"} disabled={structuralLocked || !config.follow.pace.enabled}
+            onChange={value => set("pace_motion", value)} options={[
+              { value: "steering", label: tr("纵向步速同步（原模式）", "Longitudinal pace matching (original)") },
+              { value: "omni", label: tr("全向步速同步", "Omnidirectional pace matching") },
+            ]} />}
         <Select aria-label="Cord exit side" value={config.cord_exit_side} disabled={structuralLocked}
           onChange={value => set("cord_exit_side", value)} options={[
             { value: "driven_axle", label: tr("前端出线", "Front cord exit") }, { value: "passive_axle", label: tr("后端出线", "Rear cord exit") },
           ]} />
         <Checkbox checked={config.direction_inverted} disabled={structuralLocked}
-          onChange={event => set("direction_inverted", event.target.checked)}>{tr("转向反相", "Invert turning")}</Checkbox>
+          onChange={event => set("direction_inverted", event.target.checked)}>{tr("左右方向反相", "Invert left/right")}</Checkbox>
       </Space>
       {config.source === "live" && !pullReady && <Alert type="info" showIcon message={tr("等待拉线归零完成及有效方向编码器反馈", "Waiting for homed cord and valid direction feedback")} />}
       <div className="pull-chassis-grid">
@@ -207,7 +216,7 @@ export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpe
         </Typography.Paragraph>
       </Card>
       {config.mode === "behind" && <Space direction="vertical" style={{ width: "100%" }} size={12}>
-        <PaceFollowControls value={config.follow.pace}
+        <PaceFollowControls value={config.follow.pace} omni={config.source === "live" && config.pace_motion === "omni"}
           stopLengthM={Math.max(config.follow.behindStopCordLengthM, config.follow.pace.targetLengthM + config.follow.pace.stopMarginM)}
           onChange={value => setFollow("pace", value)} />
         <BehindSpeedControls value={config.follow.behindSpeed} paceEnabled={config.follow.pace.enabled}
@@ -236,8 +245,8 @@ export function PullChassisPanel({ status, liveInput, cordMode, retractTargetSpe
         <Descriptions.Item label={tr("运行阶段", "Phase")}>{phase}</Descriptions.Item>
         <Descriptions.Item label={tr("估计步速", "Estimated pace")}>{fmt(follow?.pace_forward_speed_mps)} m/s</Descriptions.Item>
         <Descriptions.Item label={tr("距离修正", "Gap correction")}>{fmt(follow?.pace_correction_mps)} m/s</Descriptions.Item>
-        <Descriptions.Item label={tr("指令前进 / 转向", "Forward / yaw command")}>{fmt(feedback?.cmd_vx)} m/s · {fmt(feedback?.cmd_wz)} rad/s</Descriptions.Item>
-        <Descriptions.Item label={tr("实测前进 / 转向", "Measured forward / yaw")}>{fmt(feedback?.meas_vx)} m/s · {fmt(feedback?.meas_wz)} rad/s</Descriptions.Item>
+        <Descriptions.Item label={tr("指令前进 / 左移 / 转向", "Forward / left / yaw command")}>{fmt(feedback?.cmd_vx)} m/s · {fmt(feedback?.cmd_vy)} m/s · {fmt(feedback?.cmd_wz)} rad/s</Descriptions.Item>
+        <Descriptions.Item label={tr("实测前进 / 左移 / 转向", "Measured forward / left / yaw")}>{fmt(feedback?.meas_vx)} m/s · {fmt(feedback?.meas_vy)} m/s · {fmt(feedback?.meas_wz)} rad/s</Descriptions.Item>
         <Descriptions.Item label={tr("运行长线保护", "Running stop length")}>{fmt(follow?.pace_stop_length_m)} m</Descriptions.Item>
         <Descriptions.Item label={tr("运行回收制动阈值", "Running retraction brake threshold")}>{fmt(run.retract_brake_speed_mps)} m/s</Descriptions.Item>
         <Descriptions.Item label={tr("回收制动减速度", "Retraction brake deceleration")}>{fmt(run.retract_brake_speed_mps == null ? null : run.retract_brake_deceleration_mps2)} m/s²</Descriptions.Item>

@@ -4,6 +4,7 @@ import type { Hopea3State } from "./types";
 export interface PullChassisConfig {
   follow: FollowParameters;
   mode: "behind" | "ahead";
+  pace_motion: "steering" | "omni";
   source: "live" | "manual";
   cord_exit_side: "driven_axle" | "passive_axle";
   direction_inverted: boolean;
@@ -25,6 +26,7 @@ export interface PullChassisRunState {
   input: FollowInput;
   manual_enabled: boolean;
   follow_status: FollowStatus & { travel_mode: "behind" | "ahead" | null };
+  lateral_pace_active: boolean;
   retract_braking: boolean;
   retract_brake_speed_mps: number | null;
   retract_brake_deceleration_mps2: number;

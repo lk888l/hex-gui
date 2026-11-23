@@ -323,7 +323,8 @@ pub enum CordExitSide {
     DrivenAxle,
 }
 impl CordExitSide {
-    fn sign(self) -> f64 {
+    /// Outlet +X points forwards at the driven (front) axle and aft at the passive axle.
+    pub fn sign(self) -> f64 {
         match self {
             Self::PassiveAxle => -1.0,
             Self::DrivenAxle => 1.0,
@@ -1071,7 +1072,7 @@ impl FollowController {
         &mut self,
         length: f64,
         v0: f64,
-        measured_linear_mps: Option<f64>,
+        behind_motion: bool,
         stopped: bool,
         c: &ChassisConfig,
         pace_tracking: bool,
@@ -1081,11 +1082,6 @@ impl FollowController {
             return;
         }
         let p = &c.follow;
-        // Missing feedback cannot establish that the old direction stopped.
-        // An already moving Ahead chassis need not stop again at every tick.
-        let behind_motion = v0 * c.cord_exit_side.sign() > 0.0
-            || measured_linear_mps
-                .is_none_or(|v| !v.is_finite() || v * c.cord_exit_side.sign() > 0.02);
         let stop_length = if pace_tracking {
             p.pace.stop_length(c)
         } else {
@@ -1153,9 +1149,23 @@ impl FollowController {
 
     pub fn step_with_motion(
         &mut self,
+        input: FollowInput,
+        previous: f64,
+        measured_motion: Option<MeasuredMotion>,
+        dt: f64,
+        c: &ChassisConfig,
+    ) -> (ChassisCommand, f64) {
+        self.step_with_planar_motion(input, previous, measured_motion, true, dt, c)
+    }
+
+    /// An omni base also confirms its lateral command and wheel feedback have
+    /// settled before releasing a brake or authorizing a direction change.
+    pub fn step_with_planar_motion(
+        &mut self,
         mut input: FollowInput,
         previous: f64,
         measured_motion: Option<MeasuredMotion>,
+        lateral_stopped: bool,
         dt: f64,
         c: &ChassisConfig,
     ) -> (ChassisCommand, f64) {
@@ -1170,7 +1180,8 @@ impl FollowController {
         let raw_input = input;
         let retract_speed = input.retraction_speed();
         let v0 = previous;
-        let stopped = v0.abs() <= 0.01
+        let stopped = lateral_stopped
+            && v0.abs() <= 0.01
             && measured_linear_mps.is_some_and(|v| v.is_finite() && v.abs() <= 0.02);
         let pace_selected = c.pace_selected();
         let pace_tracking = pace_selected && self.pace.tracking(c);
@@ -1186,7 +1197,12 @@ impl FollowController {
         };
         let behind_region = length < p.behind_ahead_switch_cord_length_m;
         self.update_payout_stop(input, v0, stopped, dt, c);
-        self.update_braking(length, v0, measured_linear_mps, stopped, c, pace_tracking);
+        // A sideways-only Behind run must brake before handing over to Ahead.
+        let behind_motion = v0 * c.cord_exit_side.sign() > 0.0
+            || measured_linear_mps
+                .is_none_or(|v| !v.is_finite() || v * c.cord_exit_side.sign() > 0.02)
+            || (!lateral_stopped && self.status.travel_mode != Some(WalkMode::Ahead));
+        self.update_braking(length, v0, behind_motion, stopped, c, pace_tracking);
         let payout_stop = self.payout_stop_resume_length_m.is_some();
         let pace_can_take_over = pace_selected && behind_region && length < stop_length;
         let retracting = retract_speed > tuning.speed_deadband_mps.max(0.02);

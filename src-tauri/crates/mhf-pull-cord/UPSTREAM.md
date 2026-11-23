@@ -35,9 +35,10 @@ The A1 frame layout, homing speed taper and confirmed shutdown follow its parent
 `ebaa3bf`. The selected mode is fixed from startup through shutdown retries.
 
 `src-tauri/src/pull_chassis.rs` runs the adapted follow state machine at 100 Hz with
-native cord/encoder samples and measured HopeA3 motion. It adapts steering to
-body yaw with zero strafe, and drives the existing HexMeow HopeA3 controller at
-500 Hz on a separate CAN-FD interface. No DAMIAO hardware driver is imported.
+native cord/encoder samples and measured HopeA3 motion. The default maps steering
+to body yaw. During launched Behind pace matching, the optional omni mode combines
+the longitudinal target with lateral pace from the live endpoint and wheel feedback.
+It drives the existing HexMeow HopeA3 controller at 500 Hz on a separate CAN-FD interface.
 Live sessions retain the exact cord publication and invalidation epoch, reject
 stale feedback, and require explicit restart after stopping. A native command
 deadline prevents a stalled producer from retaining wheel motion.
@@ -53,7 +54,8 @@ desktop chassis settings; missing legacy fields select the automatic target.
 The desktop follow model applies `behindAheadSwitchCordLengthM` during an
 established pace session as well as before launch. Reaching it takes priority
 over pace matching and the running stop guard, but still requires a zero
-command and a measured stop before Ahead motion. Switch braking retains the
+command and a measured stop before Ahead motion. The omni adapter includes lateral
+command and feedback in this stop condition. Switch braking retains the
 pace stop rate when stronger, remains latched through cord bounce, and clears
 the previous pace estimate on Ahead takeover. Original fixture values remain
 unchanged; distance-hold tests place the switch beyond their working range,

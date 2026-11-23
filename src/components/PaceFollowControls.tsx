@@ -2,9 +2,10 @@ import { Card, Checkbox, Collapse, InputNumber, Typography } from "antd";
 import type { PaceFollowParameters } from "../pullChassisTypes";
 import { useI18n } from "../i18n";
 
-export function PaceFollowControls({ value, stopLengthM, onChange }: {
+export function PaceFollowControls({ value, stopLengthM, omni, onChange }: {
   value: PaceFollowParameters;
   stopLengthM: number;
+  omni: boolean;
   onChange: (next: PaceFollowParameters) => void;
 }) {
   const { lang } = useI18n();
@@ -35,14 +36,14 @@ export function PaceFollowControls({ value, stopLengthM, onChange }: {
       {tr("启用", "Enable")}
     </Checkbox>}>
     <Typography.Paragraph type="secondary">
-      {tr("保留原发车动作。发车后让绳长回到设定值附近：偏短时车稍快，偏长时车稍慢；进入允许浮动范围后维持步速同步。步速由动力轴实测速率和收放线计算，转向轴独立跟随拉线角度。人加快、收线就提速，人落后、出线就减速，人停止则停车。",
-        "Keep the existing launch gesture. A short gap adds a small speed correction and a long gap reduces speed. Within tolerance, match pace using drive wheel speed and cord motion. The steering axis follows cord angle independently. Retraction speeds up, payout slows down, and a stationary person stops the cart.")}
+      {tr("实时身后跟随沿用收线发车动作。发车后按轮速和收放线速度同步纵向步速。绳长偏短时车稍快，偏长时车稍慢。",
+        "During live Behind follow, use the usual retraction gesture to launch. Wheel feedback and cord speed determine forward pace. A short gap adds a small speed correction and a long gap reduces speed.")}
+      {" "}{omni
+        ? tr("全向模式同时跟随手柄的左右步速，并以接入同步时的侧向位置为基准。车头方向保持，斜走时两个方向可同时跟随。",
+            "Omnidirectional mode also matches the grip’s sideways pace and maintains its lateral offset at engagement. The base can move diagonally with zero commanded yaw.")
+        : tr("纵向模式下，拉线偏角控制车身转向。", "In longitudinal mode, cord deflection steers the base.")}
     </Typography.Paragraph>
     {controls(basic)}
-    <Typography.Paragraph type="secondary" className="simulator-card-hint">
-      {tr("动力轴跟随步速请求，转向轴围绕 180° 安装中心跟随拉线角差，支持连续多圈；转向限速按实测行进速度在舵轮面板设置的两个 rad/s 端点之间线性映射。",
-        "The drive axis follows the pace request. Steering follows cord angle around its 180° mounting center with continuous rotation. Its speed limit follows measured travel speed between the two rad/s endpoints in the module panel.")}
-    </Typography.Paragraph>
     <Typography.Paragraph type="secondary" className="simulator-card-hint">
       {tr(`发车后长线保护为 ${stopLengthM.toFixed(2)} m，取“保持线长＋保护余量”和原停止线长的较大值。运行中达到“切换身前线长”时，先制动至停稳，再按当前线长进入身前引导；该切换优先于步速同步和长线停车。停住时不为追求精确线长自行移动。修改后应用参数。`,
         `Running stop guard: ${stopLengthM.toFixed(2)} m, the larger of follow gap plus margin and the original stop length. Reaching the Ahead switch length during a run brakes to a confirmed stop, then enters Ahead guidance according to the current cord length. This takes priority over pace matching and long-cord stops. The cart does not move a stationary person to chase an exact gap. Apply edited parameters.`)}

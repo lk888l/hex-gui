@@ -890,14 +890,20 @@ fn feedback_error(live: &MeowMotorLiveState, parameters: MotorParameters) -> Opt
     }
 }
 
-fn clamp_twist(vx: f64, vy: f64, wz: f64, max_linear: f64, max_angular: f64) -> (f64, f64, f64) {
-    let mag = vx.hypot(vy);
-    let (vx, vy) = if mag > max_linear {
-        let s = max_linear / mag;
-        (vx * s, vy * s)
+/// Limit a body-frame velocity change by its Euclidean magnitude.
+pub(crate) fn slew_translation(from: (f64, f64), to: (f64, f64), max_step: f64) -> (f64, f64) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let distance = dx.hypot(dy);
+    if distance > max_step {
+        let scale = max_step / distance;
+        (from.0 + dx * scale, from.1 + dy * scale)
     } else {
-        (vx, vy)
-    };
+        to
+    }
+}
+
+fn clamp_twist(vx: f64, vy: f64, wz: f64, max_linear: f64, max_angular: f64) -> (f64, f64, f64) {
+    let (vx, vy) = slew_translation((0.0, 0.0), (vx, vy), max_linear);
     let wz = wz.clamp(-max_angular, max_angular);
     (vx, vy, wz)
 }
@@ -1007,17 +1013,7 @@ async fn control_loop(
             // A zero limit means "instant" (snap to target).
             let (tx, ty, tw) = (c.vx, c.vy, c.wz);
             if c.max_lin_acc > 0.0 {
-                let (dx, dy) = (tx - ax, ty - ay);
-                let dist = (dx * dx + dy * dy).sqrt();
-                let step = c.max_lin_acc * dt;
-                if dist > step {
-                    let s = step / dist;
-                    ax += dx * s;
-                    ay += dy * s;
-                } else {
-                    ax = tx;
-                    ay = ty;
-                }
+                (ax, ay) = slew_translation((ax, ay), (tx, ty), c.max_lin_acc * dt);
             } else {
                 ax = tx;
                 ay = ty;

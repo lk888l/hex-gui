@@ -80,6 +80,7 @@ async function mount(t: TestContext, settings = defaults) {
     async retractTarget(value: number) { retractTargetSpeedMps = value; await act(async () => { renderer.update(render()); }); },
     async refresh() { await act(async () => { renderer.update(render()); }); },
     phase() { return renderer.root.findAllByType("Description").find((node: any) => node.props.label === "Phase").props.children; },
+    metric(label: string) { return renderer.root.findAllByType("Description").find((node: any) => node.props.label === label).props.children.join(""); },
     failStop() { failStop = true; }, recoverStop() { failStop = false; },
     deferStart(promise: Promise<never>) { pendingStart = promise; },
     async click(label: string) {
@@ -137,6 +138,36 @@ test("runtime phase shows ahead switch braking and ahead guidance while the conf
   await h.refresh();
   assert.equal(h.phase(), "Ahead guidance");
   assert.equal(h.status.run.config.mode, "behind");
+});
+
+test("legacy pace defaults to steering and omni is saved, locked in a run and shown with signed lateral feedback", async t => {
+  const legacy = structuredClone(defaults);
+  delete legacy.pace_motion;
+  const h = await mount(t, legacy);
+  const mode = () => h.control("Select", "Pace motion mode");
+  assert.equal(mode().value, "steering");
+  h.edit("Select", "Pace motion mode", "omni");
+  assert.deepEqual(h.calls, []);
+  await h.click("Save configuration");
+  assert.equal(h.calls.at(-1)?.[1].pace_motion, "omni");
+  await h.click("Connect chassis");
+  await h.click("Start physical follow");
+  assert.equal(h.status.run.config.pace_motion, "omni");
+  assert.equal(mode().disabled, true);
+  h.status.run.follow_status = { travel_mode: "behind", pace_active: true, pace_tracking: true };
+  await h.refresh();
+  assert.match(h.phase(), /waiting for endpoint velocity/);
+  h.status.run.lateral_pace_active = true;
+  Object.assign(h.status.run.chassis, { cmd_vy: -0.25, meas_vy: -0.24 });
+  await h.refresh();
+  assert.equal(h.phase(), "Omnidirectional pace matching");
+  assert.match(h.metric("Forward / left / yaw command"), /-0.250 m\/s/);
+  assert.match(h.metric("Measured forward / left / yaw"), /-0.240 m\/s/);
+  await h.click("STOP / Esc");
+  assert.equal(mode().disabled, false);
+  h.edit("Select", "Pace motion mode", "steering");
+  await h.click("Start physical follow");
+  assert.equal(h.status.run.config.pace_motion, "steering");
 });
 
 test("Escape can stop the chassis while initialization is pending", async t => {

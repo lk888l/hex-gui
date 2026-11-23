@@ -54,6 +54,7 @@
     "smoothingMs": 180.0
   },
   "mode": "behind",
+  "pace_motion": "steering",
   "source": "live",
   "cord_exit_side": "passive_axle",
   "direction_inverted": false,
